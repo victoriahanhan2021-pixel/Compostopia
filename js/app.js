@@ -44,7 +44,10 @@ const App = {
         editingRecord: null,
         globalClickDelegationBound: false,
         batchGalleryPhotos: [],
-        batchInfoPanel: null
+        batchInfoPanel: null,
+        carbonReductionExpanded: false,
+        carbonCalculationDetailsExpanded: false,
+        carbonReductionDraft: {}
     },
 
     init() {
@@ -4006,65 +4009,45 @@ const App = {
         return `${this.formatNumber(value, maxDecimals)}${suffix}`;
     },
 
-    getOutputCarbonReductionState(batch) {
-        const saved = batch?.output?.carbonReduction || {};
+    getCarbonReductionDraftState() {
+        const draft = this.data.carbonReductionDraft || {};
         return {
-            totalOrganicWasteOverride: this.normalizeOptionalNumber(saved.totalOrganicWasteOverride),
-            municipalCollectionDistance: this.normalizeOptionalNumber(saved.municipalCollectionDistance),
-            municipalVehiclePayloadCapacityT: this.normalizeOptionalNumber(saved.municipalVehiclePayloadCapacityT),
-            municipalVehicleCo2EmissionFactor: this.normalizeOptionalNumber(saved.municipalVehicleCo2EmissionFactor),
-            municipalVehicleEnergyConsumptionFactor: this.normalizeOptionalNumber(saved.municipalVehicleEnergyConsumptionFactor),
-            commercialCompostSupplierDistance: this.normalizeOptionalNumber(saved.commercialCompostSupplierDistance),
-            passengerVehicleCo2EmissionFactor: this.normalizeOptionalNumber(saved.passengerVehicleCo2EmissionFactor),
-            commercialCompostPurchasedPerEvent: this.normalizeOptionalNumber(saved.commercialCompostPurchasedPerEvent) ?? 105
+            totalOrganicWaste: this.normalizeOptionalNumber(draft.totalOrganicWaste),
+            municipalCollectionDistance: this.normalizeOptionalNumber(draft.municipalCollectionDistance),
+            municipalVehiclePayloadCapacityT: this.normalizeOptionalNumber(draft.municipalVehiclePayloadCapacityT),
+            municipalVehicleCo2EmissionFactor: this.normalizeOptionalNumber(draft.municipalVehicleCo2EmissionFactor),
+            municipalVehicleEnergyConsumptionFactor: this.normalizeOptionalNumber(draft.municipalVehicleEnergyConsumptionFactor),
+            compostProduced: this.normalizeOptionalNumber(draft.compostProduced),
+            commercialCompostPurchasedPerEvent: this.normalizeOptionalNumber(draft.commercialCompostPurchasedPerEvent) ?? 105,
+            commercialCompostSupplierDistance: this.normalizeOptionalNumber(draft.commercialCompostSupplierDistance),
+            passengerVehicleCo2EmissionFactor: this.normalizeOptionalNumber(draft.passengerVehicleCo2EmissionFactor)
         };
     },
 
-    getCompostProducedForCarbon(batch, actualCompostInputValue) {
-        const estimatedOutput = batch?.output?.estimatedOutput != null
-            ? (parseFloat(batch.output.estimatedOutput) || 0)
-            : this.calculateEstimatedCompostOutput(batch);
-
-        if (actualCompostInputValue !== undefined) {
-            const draftActual = this.normalizeOptionalNumber(actualCompostInputValue);
-            return draftActual != null ? draftActual : estimatedOutput;
-        }
-
-        const storedActual = this.normalizeOptionalNumber(batch?.output?.compostOutput);
-        return storedActual != null ? storedActual : estimatedOutput;
+    setCarbonReductionDraftField(field, value) {
+        this.data.carbonReductionDraft = {
+            ...(this.data.carbonReductionDraft || {}),
+            [field]: value
+        };
     },
 
-    buildCarbonReductionMetrics(batch, overrides = {}) {
-        const materialTotals = this.calculateBatchMaterialTotals(batch);
-        const savedState = this.getOutputCarbonReductionState(batch);
-        const totalOrganicWasteOverride = Object.prototype.hasOwnProperty.call(overrides, 'totalOrganicWasteOverride')
-            ? this.normalizeOptionalNumber(overrides.totalOrganicWasteOverride)
-            : savedState.totalOrganicWasteOverride;
-        const municipalCollectionDistance = Object.prototype.hasOwnProperty.call(overrides, 'municipalCollectionDistance')
-            ? this.normalizeOptionalNumber(overrides.municipalCollectionDistance)
-            : savedState.municipalCollectionDistance;
-        const municipalVehiclePayloadCapacityT = Object.prototype.hasOwnProperty.call(overrides, 'municipalVehiclePayloadCapacityT')
-            ? this.normalizeOptionalNumber(overrides.municipalVehiclePayloadCapacityT)
-            : savedState.municipalVehiclePayloadCapacityT;
-        const municipalVehicleCo2EmissionFactor = Object.prototype.hasOwnProperty.call(overrides, 'municipalVehicleCo2EmissionFactor')
-            ? this.normalizeOptionalNumber(overrides.municipalVehicleCo2EmissionFactor)
-            : savedState.municipalVehicleCo2EmissionFactor;
-        const municipalVehicleEnergyConsumptionFactor = Object.prototype.hasOwnProperty.call(overrides, 'municipalVehicleEnergyConsumptionFactor')
-            ? this.normalizeOptionalNumber(overrides.municipalVehicleEnergyConsumptionFactor)
-            : savedState.municipalVehicleEnergyConsumptionFactor;
-        const commercialCompostSupplierDistance = Object.prototype.hasOwnProperty.call(overrides, 'commercialCompostSupplierDistance')
-            ? this.normalizeOptionalNumber(overrides.commercialCompostSupplierDistance)
-            : savedState.commercialCompostSupplierDistance;
-        const passengerVehicleCo2EmissionFactor = Object.prototype.hasOwnProperty.call(overrides, 'passengerVehicleCo2EmissionFactor')
-            ? this.normalizeOptionalNumber(overrides.passengerVehicleCo2EmissionFactor)
-            : savedState.passengerVehicleCo2EmissionFactor;
-        const commercialCompostPurchasedPerEvent = Object.prototype.hasOwnProperty.call(overrides, 'commercialCompostPurchasedPerEvent')
-            ? (this.normalizeOptionalNumber(overrides.commercialCompostPurchasedPerEvent) ?? 105)
-            : (savedState.commercialCompostPurchasedPerEvent ?? 105);
+    buildCarbonReductionMetrics(overrides = {}) {
+        const draft = {
+            ...this.getCarbonReductionDraftState(),
+            ...overrides
+        };
 
-        const autoTotalOrganicWaste = materialTotals.regularOrganicWaste + materialTotals.additionalOrganicMaterial;
-        const totalOrganicWaste = totalOrganicWasteOverride != null ? totalOrganicWasteOverride : autoTotalOrganicWaste;
-        const organicWasteTonnes = totalOrganicWaste / 1000;
+        const totalOrganicWaste = this.normalizeOptionalNumber(draft.totalOrganicWaste);
+        const municipalCollectionDistance = this.normalizeOptionalNumber(draft.municipalCollectionDistance);
+        const municipalVehiclePayloadCapacityT = this.normalizeOptionalNumber(draft.municipalVehiclePayloadCapacityT);
+        const municipalVehicleCo2EmissionFactor = this.normalizeOptionalNumber(draft.municipalVehicleCo2EmissionFactor);
+        const municipalVehicleEnergyConsumptionFactor = this.normalizeOptionalNumber(draft.municipalVehicleEnergyConsumptionFactor);
+        const compostProduced = this.normalizeOptionalNumber(draft.compostProduced);
+        const commercialCompostPurchasedPerEvent = this.normalizeOptionalNumber(draft.commercialCompostPurchasedPerEvent) ?? 105;
+        const commercialCompostSupplierDistance = this.normalizeOptionalNumber(draft.commercialCompostSupplierDistance);
+        const passengerVehicleCo2EmissionFactor = this.normalizeOptionalNumber(draft.passengerVehicleCo2EmissionFactor);
+
+        const organicWasteTonnes = totalOrganicWaste != null ? totalOrganicWaste / 1000 : null;
         const vehiclePayloadCapacityKg = municipalVehiclePayloadCapacityT != null
             ? municipalVehiclePayloadCapacityT * 1000
             : null;
@@ -4074,7 +4057,7 @@ const App = {
         const normalisedEnergyEf = municipalVehiclePayloadCapacityT != null && municipalVehiclePayloadCapacityT > 0 && municipalVehicleEnergyConsumptionFactor != null
             ? municipalVehicleEnergyConsumptionFactor / municipalVehiclePayloadCapacityT
             : null;
-        const transportationWorkload = municipalCollectionDistance != null
+        const transportationWorkload = organicWasteTonnes != null && municipalCollectionDistance != null
             ? organicWasteTonnes * municipalCollectionDistance
             : null;
         const impact1AvoidedCo2 = transportationWorkload != null && normalisedCo2Ef != null
@@ -4084,17 +4067,8 @@ const App = {
             ? transportationWorkload * normalisedEnergyEf
             : null;
 
-        const actualCompostOutputValue = Object.prototype.hasOwnProperty.call(overrides, 'actualCompostOutputValue')
-            ? overrides.actualCompostOutputValue
-            : undefined;
-        const estimatedCompostOutput = batch?.output?.estimatedOutput != null
-            ? (parseFloat(batch.output.estimatedOutput) || 0)
-            : this.calculateEstimatedCompostOutput(batch);
-        const compostProduced = this.getCompostProducedForCarbon(batch, actualCompostOutputValue);
-        const usesActualCompostOutput = this.normalizeOptionalNumber(actualCompostOutputValue) != null
-            || (actualCompostOutputValue === undefined && this.normalizeOptionalNumber(batch?.output?.compostOutput) != null);
         const equivalentCommercialCompostReplaced = compostProduced;
-        const procurementEvents = commercialCompostPurchasedPerEvent != null && commercialCompostPurchasedPerEvent > 0
+        const procurementEvents = equivalentCommercialCompostReplaced != null && commercialCompostPurchasedPerEvent > 0
             ? equivalentCommercialCompostReplaced / commercialCompostPurchasedPerEvent
             : null;
         const impact2AvoidedCo2 = procurementEvents != null
@@ -4109,9 +4083,7 @@ const App = {
 
         return {
             impact1: {
-                autoTotalOrganicWaste,
                 totalOrganicWaste,
-                totalOrganicWasteOverridden: totalOrganicWasteOverride != null,
                 municipalCollectionDistance,
                 municipalVehiclePayloadCapacityT,
                 vehiclePayloadCapacityKg,
@@ -4125,14 +4097,12 @@ const App = {
                 avoidedEnergy: impact1AvoidedEnergy
             },
             impact2: {
-                estimatedCompostOutput,
                 compostProduced,
-                usesActualCompostOutput,
-                commercialCompostSupplierDistance,
-                passengerVehicleCo2EmissionFactor,
                 commercialCompostPurchasedPerEvent,
                 equivalentCommercialCompostReplaced,
                 procurementEvents,
+                commercialCompostSupplierDistance,
+                passengerVehicleCo2EmissionFactor,
                 avoidedCo2: impact2AvoidedCo2
             },
             summary: {
@@ -4165,7 +4135,7 @@ const App = {
             { label: 'Compost Produced', value: this.formatCarbonMetric(metrics.impact2.compostProduced, 'kg', 2) },
             { label: 'Equivalent Commercial Compost Replaced', value: this.formatCarbonMetric(metrics.impact2.equivalentCommercialCompostReplaced, 'kg', 2) },
             { label: 'Commercial Compost Purchased per Procurement Event', value: this.formatCarbonMetric(metrics.impact2.commercialCompostPurchasedPerEvent, 'kg/event', 2) },
-            { label: 'Procurement Events', value: this.formatCarbonMetric(metrics.impact2.procurementEvents, '', 2) },
+            { label: 'Procurement Events', value: this.formatCarbonMetric(metrics.impact2.procurementEvents, 'events', 2) },
             { label: 'Commercial Compost Supplier Distance', value: this.formatCarbonMetric(metrics.impact2.commercialCompostSupplierDistance, 'km', 2) },
             { label: 'Passenger Vehicle CO2 Emission Factor', value: this.formatCarbonMetric(metrics.impact2.passengerVehicleCo2EmissionFactor, 'kg CO2/km', 3) },
             { label: 'Avoided CO2', value: this.formatCarbonMetric(metrics.impact2.avoidedCo2, 'kg CO2', 2) }
@@ -4217,9 +4187,6 @@ const App = {
                 <div class="carbon-detail-section">
                     <div class="carbon-detail-title">Impact 2</div>
                     <div class="carbon-detail-subtitle">Avoided Commercial Compost Procurement & Transportation</div>
-                    <div class="carbon-detail-meta">
-                        <div class="carbon-detail-meta-item">Compost Source: ${metrics.impact2.usesActualCompostOutput ? 'Actual Compost Output' : 'Estimated Compost Output'}</div>
-                    </div>
                     <div class="carbon-flow">
                         ${renderFlow(impact2Steps)}
                     </div>
@@ -4238,24 +4205,48 @@ const App = {
         `;
     },
 
-    renderCarbonReductionModule(batch) {
-        const savedState = this.getOutputCarbonReductionState(batch);
-        const metrics = this.buildCarbonReductionMetrics(batch, savedState);
-        const totalOrganicWasteInputValue = savedState.totalOrganicWasteOverride != null
-            ? savedState.totalOrganicWasteOverride
-            : metrics.impact1.autoTotalOrganicWaste;
+    renderCarbonInputField(id, label, unit, value, placeholder, helpText) {
+        const safeValue = value != null ? this.formatNumber(value, 6) : '';
+        return `
+            <div class="form-group carbon-form-group">
+                <label class="form-label">${label}</label>
+                <div class="carbon-input-with-unit">
+                    <input type="number" class="form-input carbon-input-field" id="${id}" step="any" value="${safeValue}" placeholder="${placeholder}">
+                    <span class="carbon-input-unit">${unit}</span>
+                </div>
+                ${helpText ? `<div class="carbon-field-help">${helpText}</div>` : ''}
+            </div>
+        `;
+    },
+
+    toggleCarbonReductionModule() {
+        this.data.carbonReductionExpanded = !this.data.carbonReductionExpanded;
+        if (!this.data.carbonReductionExpanded) {
+            this.data.carbonCalculationDetailsExpanded = false;
+        }
+        this.render();
+    },
+
+    renderCarbonReductionModule() {
+        const draft = this.getCarbonReductionDraftState();
+        const metrics = this.buildCarbonReductionMetrics(draft);
+        const expanded = !!this.data.carbonReductionExpanded;
 
         return `
             <div class="card carbon-module-card">
-                <div class="card-header carbon-module-header">
+                <div class="card-header carbon-module-header carbon-module-header-collapsible">
                     <div>
                         <h2 class="card-title">Carbon Emission Reduction</h2>
-                        <div class="carbon-module-subtitle">Transparent carbon accounting for avoided municipal collection and avoided commercial compost procurement.</div>
+                        <div class="carbon-module-subtitle">Independent carbon calculator for batch analysis. Inputs are temporary and do not modify any Batch data.</div>
                     </div>
+                    <button type="button" class="btn btn-secondary carbon-module-expand-btn" onclick="app.toggleCarbonReductionModule()">
+                        ${expanded ? '▼ Collapse' : '▶ Expand'}
+                    </button>
                 </div>
 
+                ${expanded ? `
                 <div class="alert alert-info carbon-module-intro">
-                    Results update automatically as Batch data or user-entered carbon parameters change. No separate calculate button is required.
+                    Results update automatically as you edit the carbon input fields below. These values are used only for the current carbon calculation and are not written back to the Batch.
                 </div>
 
                 <div class="carbon-impact-layout">
@@ -4263,111 +4254,64 @@ const App = {
                         <div class="carbon-impact-title">Impact 1</div>
                         <div class="carbon-impact-subtitle">Avoided Municipal Organic Waste Collection & Transportation</div>
                         <div class="carbon-input-grid">
-                            <div class="form-group carbon-form-group carbon-form-group-wide">
-                                <label class="form-label">Total Organic Waste</label>
-                                <input type="number" class="form-input" id="carbonTotalOrganicWaste" step="any" value="${totalOrganicWasteInputValue != null ? this.formatNumber(totalOrganicWasteInputValue, 3) : ''}" placeholder="${this.formatNumber(metrics.impact1.autoTotalOrganicWaste, 3)}">
-                                <div class="carbon-field-help">Auto-filled from Food Waste + Additional Organic Material. You may edit this value for this calculation only without changing the original Batch data.</div>
-                            </div>
-                            <div class="form-group carbon-form-group">
-                                <label class="form-label">Municipal Collection Distance</label>
-                                <input type="number" class="form-input" id="carbonMunicipalCollectionDistance" step="any" value="${savedState.municipalCollectionDistance != null ? this.formatNumber(savedState.municipalCollectionDistance, 3) : ''}" placeholder="km">
-                                <div class="carbon-field-help">One-way distance from the composting site to the municipal organic waste treatment facility.</div>
-                            </div>
-                            <div class="form-group carbon-form-group">
-                                <label class="form-label">Municipal Collection Vehicle Payload Capacity</label>
-                                <input type="number" class="form-input" id="carbonMunicipalVehiclePayloadCapacityT" step="any" value="${savedState.municipalVehiclePayloadCapacityT != null ? this.formatNumber(savedState.municipalVehiclePayloadCapacityT, 3) : ''}" placeholder="t">
-                                <div class="carbon-field-help">Payload capacity of the municipal organic waste collection vehicle.</div>
-                            </div>
-                            <div class="form-group carbon-form-group">
-                                <label class="form-label">Municipal Collection Vehicle CO2 Emission Factor</label>
-                                <input type="number" class="form-input" id="carbonMunicipalVehicleCo2Ef" step="any" value="${savedState.municipalVehicleCo2EmissionFactor != null ? this.formatNumber(savedState.municipalVehicleCo2EmissionFactor, 6) : ''}" placeholder="kg CO2/km">
-                                <div class="carbon-field-help">Please obtain an appropriate emission factor from your local LCA database, government guidance, or published literature.</div>
-                            </div>
-                            <div class="form-group carbon-form-group">
-                                <label class="form-label">Municipal Collection Vehicle Energy Consumption Factor</label>
-                                <input type="number" class="form-input" id="carbonMunicipalVehicleEnergyEf" step="any" value="${savedState.municipalVehicleEnergyConsumptionFactor != null ? this.formatNumber(savedState.municipalVehicleEnergyConsumptionFactor, 6) : ''}" placeholder="MJ/km">
-                                <div class="carbon-field-help">Please obtain an appropriate energy consumption factor from your local LCA database, government guidance, or published literature.</div>
-                            </div>
+                            ${this.renderCarbonInputField('carbonTotalOrganicWaste', 'Total Organic Waste', 'kg', draft.totalOrganicWaste, 'Enter value', '')}
+                            ${this.renderCarbonInputField('carbonMunicipalCollectionDistance', 'Municipal Collection Distance', 'km', draft.municipalCollectionDistance, 'Enter value', 'One-way distance from the composting site to the municipal organic waste treatment facility.')}
+                            ${this.renderCarbonInputField('carbonMunicipalVehiclePayloadCapacityT', 'Vehicle Payload Capacity', 't', draft.municipalVehiclePayloadCapacityT, 'Enter value', 'Payload capacity of the municipal organic waste collection vehicle.')}
+                            ${this.renderCarbonInputField('carbonMunicipalVehicleCo2Ef', 'Vehicle CO2 Emission Factor', 'kg CO2/km', draft.municipalVehicleCo2EmissionFactor, 'Enter value', 'Please obtain an appropriate emission factor from your local LCA database, government guidance, or published literature.')}
+                            ${this.renderCarbonInputField('carbonMunicipalVehicleEnergyEf', 'Vehicle Energy Consumption Factor', 'MJ/km', draft.municipalVehicleEnergyConsumptionFactor, 'Enter value', 'Please obtain an appropriate energy consumption factor from your local LCA database, government guidance, or published literature.')}
                         </div>
                     </section>
 
                     <section class="carbon-impact-section">
                         <div class="carbon-impact-title">Impact 2</div>
                         <div class="carbon-impact-subtitle">Avoided Commercial Compost Procurement & Transportation</div>
-                        <div class="carbon-readonly-box">
-                            <div class="carbon-readonly-label">Compost Produced</div>
-                            <div class="carbon-readonly-value" id="carbonCompostProducedValue">${this.formatCarbonMetric(metrics.impact2.compostProduced, 'kg', 2)}</div>
-                            <div class="carbon-field-help" id="carbonCompostProducedSource">${metrics.impact2.usesActualCompostOutput ? 'Uses Actual Compost Output' : 'Uses Estimated Compost Output'}</div>
-                        </div>
                         <div class="carbon-input-grid">
-                            <div class="form-group carbon-form-group">
-                                <label class="form-label">Commercial Compost Supplier Distance</label>
-                                <input type="number" class="form-input" id="carbonCommercialSupplierDistance" step="any" value="${savedState.commercialCompostSupplierDistance != null ? this.formatNumber(savedState.commercialCompostSupplierDistance, 3) : ''}" placeholder="km">
-                                <div class="carbon-field-help">Please enter the actual round-trip travel distance between the compost supplier and the compost application site.</div>
-                            </div>
-                            <div class="form-group carbon-form-group">
-                                <label class="form-label">Passenger Vehicle CO2 Emission Factor</label>
-                                <input type="number" class="form-input" id="carbonPassengerVehicleCo2Ef" step="any" value="${savedState.passengerVehicleCo2EmissionFactor != null ? this.formatNumber(savedState.passengerVehicleCo2EmissionFactor, 6) : ''}" placeholder="kg CO2/km">
-                                <div class="carbon-field-help">Please obtain the emission factor from your local database or published literature, for example <a href="https://coches.idae.es/base-datos/intervalo-de-emisiones" target="_blank" rel="noopener noreferrer">IDAE</a>.</div>
-                            </div>
-                            <div class="form-group carbon-form-group">
-                                <label class="form-label">Commercial Compost Purchased per Procurement Event</label>
-                                <input type="number" class="form-input" id="carbonCommercialCompostPerEvent" step="any" value="${savedState.commercialCompostPurchasedPerEvent != null ? this.formatNumber(savedState.commercialCompostPurchasedPerEvent, 3) : '105'}" placeholder="kg/event">
-                                <div class="carbon-field-help">Default value is 105 kg/event, and you can modify it to match your local procurement practice.</div>
-                            </div>
+                            ${this.renderCarbonInputField('carbonCompostProduced', 'Compost Produced', 'kg', draft.compostProduced, 'Enter value', 'Enter the amount of compost produced that will be used or applied. This amount is assumed to replace the same quantity of commercial compost.')}
+                            ${this.renderCarbonInputField('carbonCommercialCompostPerEvent', 'Commercial Compost Purchased per Procurement Event', 'kg/event', draft.commercialCompostPurchasedPerEvent, '105', 'Average amount of commercial compost purchased each procurement event.')}
+                            ${this.renderCarbonInputField('carbonCommercialSupplierDistance', 'Commercial Compost Supplier Distance', 'km', draft.commercialCompostSupplierDistance, 'Enter value', 'Round-trip travel distance between the compost supplier and the compost application site.')}
+                            ${this.renderCarbonInputField('carbonPassengerVehicleCo2Ef', 'Passenger Vehicle CO2 Emission Factor', 'kg CO2/km', draft.passengerVehicleCo2EmissionFactor, 'Enter value', 'Please obtain an appropriate emission factor from your local database or published literature.')}
                         </div>
                     </section>
                 </div>
 
                 <div id="carbonReductionCalculatedContent">
-                    ${this.renderCarbonReductionCalculatedContent(metrics, false)}
+                    ${this.renderCarbonReductionCalculatedContent(metrics, this.data.carbonCalculationDetailsExpanded)}
                 </div>
+                ` : ''}
             </div>
         `;
     },
 
-    getCarbonReductionDraftFromDom(batch) {
-        if (!batch) return {};
+    getCarbonReductionDraftFromDom() {
         const getValue = (id) => document.getElementById(id)?.value;
         return {
-            totalOrganicWasteOverride: this.normalizeOptionalNumber(getValue('carbonTotalOrganicWaste')),
+            totalOrganicWaste: this.normalizeOptionalNumber(getValue('carbonTotalOrganicWaste')),
             municipalCollectionDistance: this.normalizeOptionalNumber(getValue('carbonMunicipalCollectionDistance')),
             municipalVehiclePayloadCapacityT: this.normalizeOptionalNumber(getValue('carbonMunicipalVehiclePayloadCapacityT')),
             municipalVehicleCo2EmissionFactor: this.normalizeOptionalNumber(getValue('carbonMunicipalVehicleCo2Ef')),
             municipalVehicleEnergyConsumptionFactor: this.normalizeOptionalNumber(getValue('carbonMunicipalVehicleEnergyEf')),
+            compostProduced: this.normalizeOptionalNumber(getValue('carbonCompostProduced')),
             commercialCompostSupplierDistance: this.normalizeOptionalNumber(getValue('carbonCommercialSupplierDistance')),
             passengerVehicleCo2EmissionFactor: this.normalizeOptionalNumber(getValue('carbonPassengerVehicleCo2Ef')),
-            commercialCompostPurchasedPerEvent: this.normalizeOptionalNumber(getValue('carbonCommercialCompostPerEvent')) ?? 105,
-            actualCompostOutputValue: getValue('compostOutput')
+            commercialCompostPurchasedPerEvent: this.normalizeOptionalNumber(getValue('carbonCommercialCompostPerEvent')) ?? 105
         };
     },
 
     updateCarbonReductionPreview() {
-        const batch = this.data.currentBatch;
-        if (!batch || this.data.currentPage !== 'output') return;
+        if (this.data.currentPage !== 'output' || !this.data.carbonReductionExpanded) return;
         const container = document.getElementById('carbonReductionCalculatedContent');
         if (!container) return;
-
-        const detailsExpanded = document.getElementById('carbonCalculationDetails')?.dataset.expanded === 'true';
-        const metrics = this.buildCarbonReductionMetrics(batch, this.getCarbonReductionDraftFromDom(batch));
-        container.innerHTML = this.renderCarbonReductionCalculatedContent(metrics, detailsExpanded);
-
-        const compostProducedValue = document.getElementById('carbonCompostProducedValue');
-        if (compostProducedValue) compostProducedValue.textContent = this.formatCarbonMetric(metrics.impact2.compostProduced, 'kg', 2);
-        const compostProducedSource = document.getElementById('carbonCompostProducedSource');
-        if (compostProducedSource) compostProducedSource.textContent = metrics.impact2.usesActualCompostOutput
-            ? 'Uses Actual Compost Output'
-            : 'Uses Estimated Compost Output';
+        this.data.carbonReductionDraft = {
+            ...this.data.carbonReductionDraft,
+            ...this.getCarbonReductionDraftFromDom()
+        };
+        const metrics = this.buildCarbonReductionMetrics();
+        container.innerHTML = this.renderCarbonReductionCalculatedContent(metrics, this.data.carbonCalculationDetailsExpanded);
     },
 
     toggleCarbonCalculationDetails() {
-        const details = document.getElementById('carbonCalculationDetails');
-        const button = document.getElementById('carbonCalculationDetailsBtn');
-        if (!details || !button) return;
-        const expanded = details.dataset.expanded === 'true';
-        details.dataset.expanded = expanded ? 'false' : 'true';
-        details.style.display = expanded ? 'none' : '';
-        button.textContent = expanded ? 'Show Calculation Details' : 'Hide Calculation Details';
+        this.data.carbonCalculationDetailsExpanded = !this.data.carbonCalculationDetailsExpanded;
+        this.updateCarbonReductionPreview();
     },
 
     renderOutput() {
@@ -4463,10 +4407,6 @@ const App = {
                             </div>
                         </div>
 
-                        <div class="alert alert-info" style="margin-top: 18px;">
-                            If you record an Actual Compost Output, the Carbon Emission Reduction module will automatically use it as Compost Produced. Otherwise it will use the Estimated Compost Output.
-                        </div>
-
                         <div style="margin-top: 10px;">
                             <button type="button" class="btn btn-secondary" onclick="app.toggleHarvestForm()">
                                 ${harvestStatus === 'completed' ? '✏️ Edit Harvest' : '📝 Record Harvest'}
@@ -4491,12 +4431,12 @@ const App = {
                         </div>
                     </div>
 
-                    ${this.renderCarbonReductionModule(batch)}
+                    ${this.renderCarbonReductionModule()}
 
                     <div class="action-panel">
                         <div class="btn-group">
-                            <button type="submit" class="btn btn-primary" id="saveHarvestBtn">
-                                💾 Save Output Settings
+                            <button type="submit" class="btn btn-primary" id="saveHarvestBtn" style="${showHarvestForm ? '' : 'display:none;'}">
+                                💾 Save Harvest
                             </button>
                             <button type="button" class="btn btn-secondary"
                                 onclick="app.navigate('dashboard')">
@@ -4840,25 +4780,28 @@ const App = {
             }
 
             [
-                'compostOutput',
-                'carbonTotalOrganicWaste',
-                'carbonMunicipalCollectionDistance',
-                'carbonMunicipalVehiclePayloadCapacityT',
-                'carbonMunicipalVehicleCo2Ef',
-                'carbonMunicipalVehicleEnergyEf',
-                'carbonCommercialSupplierDistance',
-                'carbonPassengerVehicleCo2Ef',
-                'carbonCommercialCompostPerEvent'
-            ].forEach((id) => {
+                ['carbonTotalOrganicWaste', 'totalOrganicWaste'],
+                ['carbonMunicipalCollectionDistance', 'municipalCollectionDistance'],
+                ['carbonMunicipalVehiclePayloadCapacityT', 'municipalVehiclePayloadCapacityT'],
+                ['carbonMunicipalVehicleCo2Ef', 'municipalVehicleCo2EmissionFactor'],
+                ['carbonMunicipalVehicleEnergyEf', 'municipalVehicleEnergyConsumptionFactor'],
+                ['carbonCompostProduced', 'compostProduced'],
+                ['carbonCommercialCompostPerEvent', 'commercialCompostPurchasedPerEvent'],
+                ['carbonCommercialSupplierDistance', 'commercialCompostSupplierDistance'],
+                ['carbonPassengerVehicleCo2Ef', 'passengerVehicleCo2EmissionFactor']
+            ].forEach(([id, field]) => {
                 const element = document.getElementById(id);
                 if (!element) return;
                 element.addEventListener('input', () => {
+                    this.setCarbonReductionDraftField(field, element.value);
                     this.updateCarbonReductionPreview();
                 });
             });
 
             this.updateOutputDurationDisplay();
-            this.updateCarbonReductionPreview();
+            if (this.data.carbonReductionExpanded) {
+                this.updateCarbonReductionPreview();
+            }
         }
 
         if (this.data.currentPage === 'export') {
@@ -6744,61 +6687,46 @@ const App = {
         const outputDate = document.getElementById('outputDate')?.value;
         const compostOutputRaw = document.getElementById('compostOutput')?.value;
         const notes = document.getElementById('harvestNotes')?.value.trim() || '';
-        const hasHarvestDraft = !!((outputDate || '').trim() || String(compostOutputRaw || '').trim() || notes);
-        const carbonReduction = {
-            ...this.getOutputCarbonReductionState(batch),
-            ...this.getCarbonReductionDraftFromDom(batch)
-        };
-
-        const nextOutput = {
-            ...(batch.output || {}),
-            estimatedOutput: batch.output?.estimatedOutput != null ? batch.output.estimatedOutput : this.calculateEstimatedCompostOutput(batch),
-            carbonReduction
-        };
-
-        if (hasHarvestDraft) {
-            if (!outputDate) {
-                alert('Please select the Harvest Date.');
-                return;
-            }
-            if (compostOutputRaw == null || String(compostOutputRaw).trim() === '') {
-                alert('Please enter the Actual Compost Output before saving.');
-                return;
-            }
-            const compostOutput = parseFloat(compostOutputRaw);
-            if (isNaN(compostOutput) || compostOutput < 0) {
-                alert('Please enter a valid Actual Compost Output.');
-                return;
-            }
-
-            nextOutput.harvestStatus = 'completed';
-            nextOutput.date = outputDate;
-            nextOutput.compostOutput = compostOutput;
-            nextOutput.notes = notes;
-        } else if (!batch.output || batch.output.harvestStatus !== 'completed') {
-            nextOutput.harvestStatus = 'pending';
-            nextOutput.date = '';
-            nextOutput.compostOutput = null;
-            nextOutput.notes = '';
+        if (!outputDate) {
+            alert('Please select the Harvest Date.');
+            return;
+        }
+        if (compostOutputRaw == null || String(compostOutputRaw).trim() === '') {
+            alert('Please enter the Actual Compost Output before saving.');
+            return;
+        }
+        const compostOutput = parseFloat(compostOutputRaw);
+        if (isNaN(compostOutput) || compostOutput < 0) {
+            alert('Please enter a valid Actual Compost Output.');
+            return;
         }
 
-        batch.output = nextOutput;
+        batch.output = {
+            ...(batch.output || {}),
+            estimatedOutput: batch.output?.estimatedOutput != null ? batch.output.estimatedOutput : this.calculateEstimatedCompostOutput(batch),
+            harvestStatus: 'completed',
+            date: outputDate,
+            compostOutput,
+            notes
+        };
 
         this.saveData();
         try {
             await this.upsertBatchToCloud(batch, { skipCreatedAt: true });
         } catch (error) {
-            alert('Output settings were saved locally, but cloud sync failed. Please try again after refreshing.');
+            alert('Harvest saved locally, but cloud sync failed. Please try again after refreshing.');
         }
         this.render();
-        this.showTransientSuccessMessage(hasHarvestDraft ? '✅ Output Saved Successfully' : '✅ Carbon Settings Saved Successfully', 2300);
+        this.showTransientSuccessMessage('✅ Harvest Saved Successfully', 2300);
     },
 
     toggleHarvestForm() {
         const section = document.getElementById('harvestFormSection');
+        const saveBtn = document.getElementById('saveHarvestBtn');
         if (!section) return;
         const hidden = section.style.display === 'none' || section.style.display === '';
         section.style.display = hidden ? 'block' : 'none';
+        if (saveBtn) saveBtn.style.display = hidden ? '' : 'none';
     },
 
     updateInputTotals() {
