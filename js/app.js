@@ -850,7 +850,7 @@ const App = {
     },
 
     getModuleToggleLabel(label, isCompleted) {
-        return isCompleted ? `☑ ${label}` : `☐ ${label} (Click to expand)`;
+        return isCompleted ? `☑ ${label}` : `☐ ${label}`;
     },
 
     syncModuleToggleText(textEl, label) {
@@ -893,9 +893,23 @@ const App = {
         ];
         if (numericValues.some(value => value != null && !isNaN(value) && Number(value) > 0)) return true;
         const foodRows = Array.isArray(maintenance.foodWasteEntries) ? maintenance.foodWasteEntries : (Array.isArray(maintenance.foodWasteSources) ? maintenance.foodWasteSources : []);
-        if (foodRows.some(row => (row?.source || '').trim() || (row?.type || '').trim() || (row?.otherType || '').trim() || (row?.sourceId || '').trim() || Number(row?.amount || 0) > 0)) return true;
+        if (foodRows.some((row) => {
+            const hasLibraryRef = !!String(row?.sourceId || '').trim();
+            if (hasLibraryRef) return Number(row?.amount || 0) > 0;
+            return (Number(row?.amount || 0) > 0)
+                || !!String(row?.source || '').trim()
+                || !!String(row?.type || '').trim()
+                || !!String(row?.otherType || '').trim();
+        })) return true;
         const structRows = Array.isArray(maintenance.structuralMaterialEntries) ? maintenance.structuralMaterialEntries : (Array.isArray(maintenance.structuralMaterials) ? maintenance.structuralMaterials : []);
-        if (structRows.some(row => (row?.type || '').trim() || (row?.otherType || '').trim() || (row?.material || '').trim() || (row?.materialId || '').trim() || Number(row?.amount || 0) > 0)) return true;
+        if (structRows.some((row) => {
+            const hasLibraryRef = !!String(row?.materialId || '').trim();
+            if (hasLibraryRef) return Number(row?.amount || 0) > 0;
+            return (Number(row?.amount || 0) > 0)
+                || !!String(row?.type || '').trim()
+                || !!String(row?.otherType || '').trim()
+                || !!String(row?.material || '').trim();
+        })) return true;
         const additionalRows = Array.isArray(maintenance.additionalInputs) ? maintenance.additionalInputs : [];
         return additionalRows.some(row => (row?.source || '').trim() || (row?.description || '').trim() || Number(row?.amount || 0) > 0 || ((row?.type || '') !== 'organic' && (row?.type || '') !== ''));
     },
@@ -2339,17 +2353,28 @@ const App = {
     },
 
     calculateDaysRunning(batch) {
-        const timeZone = 'Europe/Madrid';
-        const startDate = batch?.startDate || null;
+        const records = Array.isArray(batch?.records) ? batch.records : [];
+        if (records.length === 0) return 0;
+
+        const sortedRecordDates = records
+            .map((record) => String(record?.date || '').trim())
+            .filter(Boolean)
+            .sort((a, b) => {
+                const aMs = this.parseDateToUTCms(a);
+                const bMs = this.parseDateToUTCms(b);
+                return (aMs ?? 0) - (bMs ?? 0);
+            });
+
+        const startDate = sortedRecordDates[0] || null;
         const endDate = (batch.status === 'finished' && batch.output && batch.output.date)
             ? batch.output.date
-            : this.getTodayISODateInTimeZone(timeZone);
+            : (sortedRecordDates[sortedRecordDates.length - 1] || null);
 
         const startMs = this.parseDateToUTCms(startDate);
         const endMs = this.parseDateToUTCms(endDate);
         if (startMs === null || endMs === null) return 0;
         const diff = Math.floor((endMs - startMs) / (1000 * 60 * 60 * 24));
-        return diff >= 0 ? diff : 0;
+        return diff >= 0 ? diff + 1 : 0;
     },
 
     updateOutputDurationDisplay() {
@@ -2365,7 +2390,8 @@ const App = {
             return;
         }
         const diff = Math.floor((endMs - startMs) / (1000 * 60 * 60 * 24));
-        durationEl.textContent = `${diff >= 0 ? diff : 0} days`;
+        const days = diff >= 0 ? diff + 1 : 0;
+        durationEl.textContent = `${days} ${days === 1 ? 'day' : 'days'}`;
     },
 
     calculateTotalInput(batch) {
