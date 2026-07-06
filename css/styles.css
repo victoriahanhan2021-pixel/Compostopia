@@ -1208,9 +1208,79 @@ body {
     white-space: nowrap;
 }
 
+.batch-info-action-strip {
+    margin-top: 20px;
+    padding-top: 18px;
+    border-top: 1px solid rgba(0,0,0,0.08);
+}
+
+.batch-info-tool-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+}
+
+.batch-info-tool-btn {
+    min-width: 240px;
+    justify-content: space-between;
+    background: #FFFFFF;
+    color: var(--dark);
+    border: 1px solid rgba(0,0,0,0.1);
+    box-shadow: 0 6px 14px rgba(0,0,0,0.04);
+}
+
+.batch-info-tool-btn:hover {
+    border-color: rgba(21, 101, 192, 0.24);
+    background: #F8FBFF;
+}
+
+.batch-info-tool-btn.active {
+    border-color: rgba(21, 101, 192, 0.3);
+    background: #EEF6FF;
+    color: #1565C0;
+}
+
+.batch-info-tool-count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 30px;
+    height: 30px;
+    padding: 0 10px;
+    border-radius: 999px;
+    background: rgba(21, 101, 192, 0.1);
+    color: inherit;
+    font-size: 0.88rem;
+    font-weight: 800;
+}
+
+.batch-info-tool-hint {
+    margin-top: 12px;
+    color: var(--gray);
+    font-size: 0.92rem;
+    line-height: 1.5;
+}
+
+.batch-info-tool-panel {
+    margin-top: 16px;
+    padding: 18px;
+    border-radius: 18px;
+    background: linear-gradient(180deg, #FCFCFF 0%, #FFFFFF 100%);
+    border: 1px solid rgba(0,0,0,0.06);
+}
+
 .collaborator-management-card {
     border: 1px solid rgba(25, 118, 210, 0.12);
     background: linear-gradient(180deg, #FAFCFF 0%, #FFFFFF 100%);
+}
+
+.collaborator-management-card-embedded,
+.activity-log-card-embedded {
+    padding: 0;
+    margin-bottom: 0;
+    border: none;
+    box-shadow: none;
+    background: transparent;
 }
 
 .collaborator-management-header {
@@ -1584,6 +1654,11 @@ body {
     .batch-info-composter-capacity {
         grid-column: 1 / -1;
         justify-self: flex-start;
+    }
+
+    .batch-info-tool-btn {
+        width: 100%;
+        min-width: 0;
     }
 }
 

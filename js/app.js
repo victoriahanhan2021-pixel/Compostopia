@@ -43,7 +43,8 @@ const App = {
         editingBatch: null,
         editingRecord: null,
         globalClickDelegationBound: false,
-        batchGalleryPhotos: []
+        batchGalleryPhotos: [],
+        batchInfoPanel: null
     },
 
     init() {
@@ -3030,7 +3031,8 @@ const App = {
         `;
     },
 
-    renderCollaboratorManagement(batch) {
+    renderCollaboratorManagement(batch, options = {}) {
+        const embedded = !!options.embedded;
         const routeId = this.escapeAttr(this.getBatchRouteId(batch));
         const collaborators = this.getBatchCollaborators(batch);
         const ownerEmail = batch?.ownerEmail || this.data.currentUser?.email || '—';
@@ -3040,9 +3042,12 @@ const App = {
         const accessHint = isOwner
             ? (collaborators.length > 0 ? 'You manage who can access and edit this batch.' : 'Add collaborator emails to convert this batch into a shared batch.')
             : 'You can view and contribute to this batch because the owner shared it with you.';
+        const wrapperClass = embedded
+            ? 'collaborator-management-card collaborator-management-card-embedded'
+            : 'card collaborator-management-card';
 
         return `
-            <div class="card collaborator-management-card">
+            <div class="${wrapperClass}">
                 <div class="card-header collaborator-management-header">
                     <div>
                         <h2 class="card-title">🤝 Collaborator Management</h2>
@@ -3092,6 +3097,40 @@ const App = {
                 ` : ''}
             </div>
         `;
+    },
+
+    getActiveBatchInfoPanel(batch) {
+        const panelState = this.data.batchInfoPanel;
+        const routeId = this.getBatchRouteId(batch);
+        if (!panelState || panelState.batchId !== routeId) return '';
+        return panelState.panel || '';
+    },
+
+    toggleBatchInfoPanel(batchId, panel) {
+        const current = this.data.batchInfoPanel;
+        if (current && current.batchId === batchId && current.panel === panel) {
+            this.data.batchInfoPanel = null;
+        } else {
+            this.data.batchInfoPanel = { batchId, panel };
+        }
+        this.render();
+    },
+
+    renderBatchInfoInlinePanel(batch, activePanel) {
+        if (activePanel === 'collaborators') {
+            return this.renderCollaboratorManagement(batch, { embedded: true });
+        }
+        if (activePanel === 'activity') {
+            return `
+                <div class="activity-log-card activity-log-card-embedded">
+                    <div class="card-header">
+                        <h2 class="card-title">📜 Collaborator Activity Log</h2>
+                    </div>
+                    ${this.renderActivityLog(batch)}
+                </div>
+            `;
+        }
+        return '';
     },
 
     getBatchGalleryState(batch) {
@@ -3655,6 +3694,9 @@ const App = {
         const organicWasteDisplay = `${this.formatNumber(materialTotals.totalOrganicWaste, 3)} ${inputUnit}`;
         const structuralMaterialDisplay = `${this.formatNumber(materialTotals.totalStructuralMaterial, 3)} ${inputUnit}`;
         const daysRunningDisplay = `${daysRunning} ${daysRunning === 1 ? 'day' : 'days'}`;
+        const activeBatchInfoPanel = this.getActiveBatchInfoPanel(batch);
+        const collaborators = this.getBatchCollaborators(batch);
+        const activityEntries = this.getBatchActivityLog(batch);
 
         return `
             <div class="header">
@@ -3702,15 +3744,24 @@ const App = {
                             <span class="info-value">${batch.notes || '-'}</span>
                         </div>
                     </div>
-                </div>
-
-                ${this.renderCollaboratorManagement(batch)}
-
-                <div class="card activity-log-card">
-                    <div class="card-header">
-                        <h2 class="card-title">📜 Collaborator Activity Log</h2>
+                    <div class="batch-info-action-strip">
+                        <div class="batch-info-tool-buttons">
+                            <button type="button" class="btn batch-info-tool-btn ${activeBatchInfoPanel === 'collaborators' ? 'active' : ''}" onclick="app.toggleBatchInfoPanel('${escapedRouteId}', 'collaborators')">
+                                <span>🤝 Collaborator Management</span>
+                                <span class="batch-info-tool-count">${collaborators.length}</span>
+                            </button>
+                            <button type="button" class="btn batch-info-tool-btn ${activeBatchInfoPanel === 'activity' ? 'active' : ''}" onclick="app.toggleBatchInfoPanel('${escapedRouteId}', 'activity')">
+                                <span>📜 Collaborator Activity Log</span>
+                                <span class="batch-info-tool-count">${activityEntries.length}</span>
+                            </button>
+                        </div>
+                        <div class="batch-info-tool-hint">Open these when needed to manage access or review shared activity without keeping separate cards on the page.</div>
+                        ${activeBatchInfoPanel ? `
+                            <div class="batch-info-tool-panel">
+                                ${this.renderBatchInfoInlinePanel(batch, activeBatchInfoPanel)}
+                            </div>
+                        ` : ''}
                     </div>
-                    ${this.renderActivityLog(batch)}
                 </div>
 
                 <div class="card">
@@ -4716,6 +4767,7 @@ const App = {
         if (this.data.currentBatch && this.getBatchRouteId(this.data.currentBatch) === this.getBatchRouteId(batch)) {
             this.data.currentBatch = null;
         }
+        this.data.batchInfoPanel = null;
         this.saveData();
         this.navigate('dashboard');
         this.showTransientSuccessMessage('✅ You left the shared batch', 2200);
