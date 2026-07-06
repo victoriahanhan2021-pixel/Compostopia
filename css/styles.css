@@ -615,6 +615,79 @@ body {
     margin-top: 10px;
 }
 
+.nonicta-library-list {
+    display: grid;
+    gap: 14px;
+}
+
+.nonicta-library-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1.5fr) minmax(220px, 0.8fr);
+    gap: 16px 18px;
+    align-items: end;
+    border: 1px solid rgba(0,0,0,0.08);
+    border-radius: 14px;
+    padding: 16px;
+    background: rgba(255,255,255,0.68);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+}
+
+.nonicta-library-main {
+    min-width: 0;
+}
+
+.nonicta-library-title-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.nonicta-library-title {
+    font-weight: 800;
+    color: var(--dark);
+    line-height: 1.4;
+}
+
+.nonicta-library-subtitle {
+    margin-top: 6px;
+    color: var(--gray);
+    line-height: 1.5;
+}
+
+.nonicta-library-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
+.nonicta-inline-btn {
+    padding: 7px 10px;
+    font-size: 0.82rem;
+}
+
+.nonicta-library-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 6px 10px;
+    border-radius: 999px;
+    background: #F3F4F6;
+    color: #616161;
+    font-size: 0.8rem;
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.nonicta-library-empty {
+    padding: 18px 16px;
+    border-radius: 14px;
+    border: 1px dashed rgba(0,0,0,0.14);
+    background: rgba(255,255,255,0.52);
+    color: var(--gray);
+    text-align: center;
+}
+
 .maintenance-amount {
     text-align: right;
 }
@@ -1635,6 +1708,18 @@ body {
         grid-template-columns: 1fr;
     }
 
+    .nonicta-library-row {
+        grid-template-columns: 1fr;
+    }
+
+    .nonicta-library-title-row {
+        flex-direction: column;
+    }
+
+    .nonicta-library-actions {
+        justify-content: flex-start;
+    }
+
     .action-conditional-grid {
         grid-template-columns: 1fr;
     }
@@ -1760,6 +1845,10 @@ body {
     .nonicta-row-grid.two,
     .nonicta-row-grid.three {
         grid-template-columns: 1fr;
+    }
+
+    .nonicta-inline-btn {
+        width: auto;
     }
 
     .btn-group {

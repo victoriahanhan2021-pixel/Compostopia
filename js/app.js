@@ -598,6 +598,8 @@ const App = {
             settings: batch.settings || null,
             initialStock: batch.initialStock || null,
             compostingSystemInformation: batch.compostingSystemInformation || null,
+            foodWasteLibrary: Array.isArray(batch.foodWasteLibrary) ? batch.foodWasteLibrary : [],
+            structuralMaterialLibrary: Array.isArray(batch.structuralMaterialLibrary) ? batch.structuralMaterialLibrary : [],
             collaborationSettings: {
                 ...collaboration,
                 type: collaboration.type || 'private',
@@ -890,10 +892,10 @@ const App = {
             maintenance.woodChips
         ];
         if (numericValues.some(value => value != null && !isNaN(value) && Number(value) > 0)) return true;
-        const foodRows = Array.isArray(maintenance.foodWasteSources) ? maintenance.foodWasteSources : [];
-        if (foodRows.some(row => (row?.source || '').trim() || (row?.type || '').trim() || (row?.otherType || '').trim() || Number(row?.amount || 0) > 0)) return true;
-        const structRows = Array.isArray(maintenance.structuralMaterials) ? maintenance.structuralMaterials : [];
-        if (structRows.some(row => (row?.type || '').trim() || (row?.otherType || '').trim() || Number(row?.amount || 0) > 0)) return true;
+        const foodRows = Array.isArray(maintenance.foodWasteEntries) ? maintenance.foodWasteEntries : (Array.isArray(maintenance.foodWasteSources) ? maintenance.foodWasteSources : []);
+        if (foodRows.some(row => (row?.source || '').trim() || (row?.type || '').trim() || (row?.otherType || '').trim() || (row?.sourceId || '').trim() || Number(row?.amount || 0) > 0)) return true;
+        const structRows = Array.isArray(maintenance.structuralMaterialEntries) ? maintenance.structuralMaterialEntries : (Array.isArray(maintenance.structuralMaterials) ? maintenance.structuralMaterials : []);
+        if (structRows.some(row => (row?.type || '').trim() || (row?.otherType || '').trim() || (row?.material || '').trim() || (row?.materialId || '').trim() || Number(row?.amount || 0) > 0)) return true;
         const additionalRows = Array.isArray(maintenance.additionalInputs) ? maintenance.additionalInputs : [];
         return additionalRows.some(row => (row?.source || '').trim() || (row?.description || '').trim() || Number(row?.amount || 0) > 0 || ((row?.type || '') !== 'organic' && (row?.type || '') !== ''));
     },
@@ -1459,54 +1461,8 @@ const App = {
         `;
     },
 
-    getNonICTAMaintenanceState(record, batch) {
-        const input = record?.input || {};
-        const maintenance = record?.maintenance || {};
-        const inputUnit = batch ? this.getBatchInputUnitName(batch) : 'kg';
-
-        const foodWasteSources = Array.isArray(maintenance.foodWasteSources) && maintenance.foodWasteSources.length > 0
-            ? maintenance.foodWasteSources
-            : [];
-        const structuralMaterials = Array.isArray(maintenance.structuralMaterials) && maintenance.structuralMaterials.length > 0
-            ? maintenance.structuralMaterials
-            : (Array.isArray(input.structuringMaterials) ? input.structuringMaterials.map((m) => ({
-                type: m?.type || '',
-                otherType: '',
-                amount: (m?.kg != null && !isNaN(m.kg)) ? (parseFloat(m.kg) || 0) : 0
-            })) : []);
-
-        const ensureFoodRow = () => ({ source: '', type: '', otherType: '', amount: 0 });
-        const ensureStructuralRow = () => ({ type: '', otherType: '', amount: 0 });
-        const breakdown = this.calculateRecordMaterialBreakdown({
-            ...record,
-            input,
-            maintenance: {
-                ...maintenance,
-                foodWasteSources,
-                structuralMaterials
-            }
-        });
-
-        return {
-            batchUnit: inputUnit,
-            foodWasteSources: foodWasteSources.length > 0 ? foodWasteSources : [ensureFoodRow()],
-            structuralMaterials: structuralMaterials.length > 0 ? structuralMaterials : [ensureStructuralRow()],
-            additionalInputs: breakdown.additionalInputs.length > 0 ? breakdown.additionalInputs : [{ source: '', type: 'organic', description: '', amount: 0 }],
-            totalFoodWaste: breakdown.regularOrganicWaste,
-            regularStructuralMaterial: breakdown.regularStructuralMaterial,
-            additionalOrganicMaterial: breakdown.additionalOrganicMaterial,
-            additionalStructuralMaterial: breakdown.additionalStructuralMaterial,
-            totalAdditionalInput: breakdown.totalAdditionalInput,
-            totalOrganicWaste: breakdown.totalOrganicWaste,
-            totalStructuralMaterial: breakdown.totalStructuralMaterial,
-            totalOrganicInput: breakdown.totalOrganicInput
-        };
-    },
-
-    renderNonICTAMaintenanceModule(batch, maintenance) {
-        const inputUnit = maintenance.batchUnit || this.getBatchInputUnitName(batch);
-        const isCompleted = this.hasMaintenanceStateContent(maintenance);
-        const foodTypeOptions = [
+    getNonICTAFoodTypeOptions() {
+        return [
             'Fruit & Vegetable Waste',
             'Cooked Food Waste',
             'Coffee Grounds',
@@ -1515,7 +1471,302 @@ const App = {
             'Mixed Organic Waste',
             'Other'
         ];
-        const structuralOptions = ['Wood Chips', 'Dry Leaves', 'Pruning Waste', 'Sawdust', 'Other'];
+    },
+
+    makeNonICTALibraryItemId(prefix = 'lib') {
+        return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    },
+
+    normalizeNonICTAFoodWasteLibrary(batch) {
+        const explicit = Array.isArray(batch?.foodWasteLibrary) ? batch.foodWasteLibrary : [];
+        const normalizedExplicit = explicit
+            .map((item) => ({
+                id: String(item?.id || this.makeNonICTALibraryItemId('food')),
+                source: String(item?.source || '').trim(),
+                type: String(item?.type || '').trim(),
+                active: item?.active !== false
+            }))
+            .filter((item) => item.source && item.type);
+        if (normalizedExplicit.length > 0) return normalizedExplicit;
+
+        const derived = [];
+        const seen = new Set();
+        const records = Array.isArray(batch?.records) ? batch.records : [];
+        records.forEach((record) => {
+            const maintenance = record?.maintenance || {};
+            const rows = Array.isArray(maintenance.foodWasteSources) ? maintenance.foodWasteSources : [];
+            rows.forEach((row) => {
+                const source = String(row?.source || '').trim();
+                const baseType = String(row?.type || '').trim();
+                const otherType = String(row?.otherType || '').trim();
+                const type = baseType === 'Other' ? otherType : (otherType || baseType);
+                if (!source || !type) return;
+                const key = `${source.toLowerCase()}__${type.toLowerCase()}`;
+                if (seen.has(key)) return;
+                seen.add(key);
+                derived.push({
+                    id: this.makeNonICTALibraryItemId('food'),
+                    source,
+                    type,
+                    active: true
+                });
+            });
+        });
+        return derived;
+    },
+
+    normalizeNonICTAStructuralMaterialLibrary(batch) {
+        const explicit = Array.isArray(batch?.structuralMaterialLibrary) ? batch.structuralMaterialLibrary : [];
+        const normalizedExplicit = explicit
+            .map((item) => ({
+                id: String(item?.id || this.makeNonICTALibraryItemId('struct')),
+                material: String(item?.material || '').trim(),
+                active: item?.active !== false
+            }))
+            .filter((item) => item.material);
+        if (normalizedExplicit.length > 0) return normalizedExplicit;
+
+        const derived = [];
+        const seen = new Set();
+        const records = Array.isArray(batch?.records) ? batch.records : [];
+        records.forEach((record) => {
+            const maintenance = record?.maintenance || {};
+            const legacyRows = Array.isArray(maintenance.structuralMaterials) ? maintenance.structuralMaterials : [];
+            legacyRows.forEach((row) => {
+                const baseType = String(row?.type || '').trim();
+                const otherType = String(row?.otherType || '').trim();
+                const material = baseType === 'Other' ? otherType : (otherType || baseType);
+                if (!material) return;
+                const key = material.toLowerCase();
+                if (seen.has(key)) return;
+                seen.add(key);
+                derived.push({
+                    id: this.makeNonICTALibraryItemId('struct'),
+                    material,
+                    active: true
+                });
+            });
+            const legacyInputRows = Array.isArray(record?.input?.structuringMaterials) ? record.input.structuringMaterials : [];
+            legacyInputRows.forEach((row) => {
+                const material = String(row?.type || '').trim();
+                if (!material) return;
+                const key = material.toLowerCase();
+                if (seen.has(key)) return;
+                seen.add(key);
+                derived.push({
+                    id: this.makeNonICTALibraryItemId('struct'),
+                    material,
+                    active: true
+                });
+            });
+        });
+        return derived;
+    },
+
+    ensureNonICTAMaterialLibraries(batch) {
+        if (!batch) {
+            return {
+                foodWasteLibrary: [],
+                structuralMaterialLibrary: []
+            };
+        }
+
+        const foodWasteLibrary = this.normalizeNonICTAFoodWasteLibrary(batch);
+        const structuralMaterialLibrary = this.normalizeNonICTAStructuralMaterialLibrary(batch);
+        batch.foodWasteLibrary = foodWasteLibrary;
+        batch.structuralMaterialLibrary = structuralMaterialLibrary;
+        return { foodWasteLibrary, structuralMaterialLibrary };
+    },
+
+    getLegacyNonICTAFoodEntryAmounts(maintenance, library) {
+        const rows = Array.isArray(maintenance?.foodWasteSources) ? maintenance.foodWasteSources : [];
+        const amounts = new Map();
+        rows.forEach((row) => {
+            const source = String(row?.source || '').trim();
+            const baseType = String(row?.type || '').trim();
+            const otherType = String(row?.otherType || '').trim();
+            const type = baseType === 'Other' ? otherType : (otherType || baseType);
+            const amount = (row?.amount != null && !isNaN(row.amount)) ? (parseFloat(row.amount) || 0) : 0;
+            if (!source || !type || amount <= 0) return;
+            const match = library.find((item) => item.source === source && item.type === type);
+            if (!match) return;
+            amounts.set(match.id, amount);
+        });
+        return amounts;
+    },
+
+    getLegacyNonICTAStructuralEntryAmounts(maintenance, input, library) {
+        const amounts = new Map();
+        const rows = Array.isArray(maintenance?.structuralMaterials) ? maintenance.structuralMaterials : [];
+        rows.forEach((row) => {
+            const baseType = String(row?.type || '').trim();
+            const otherType = String(row?.otherType || '').trim();
+            const material = baseType === 'Other' ? otherType : (otherType || baseType);
+            const amount = (row?.amount != null && !isNaN(row.amount)) ? (parseFloat(row.amount) || 0) : 0;
+            if (!material || amount <= 0) return;
+            const match = library.find((item) => item.material === material);
+            if (!match) return;
+            amounts.set(match.id, amount);
+        });
+
+        if (amounts.size === 0) {
+            const legacyInputRows = Array.isArray(input?.structuringMaterials) ? input.structuringMaterials : [];
+            legacyInputRows.forEach((row) => {
+                const material = String(row?.type || '').trim();
+                const amount = (row?.kg != null && !isNaN(row.kg)) ? (parseFloat(row.kg) || 0) : 0;
+                if (!material || amount <= 0) return;
+                const match = library.find((item) => item.material === material);
+                if (!match) return;
+                amounts.set(match.id, amount);
+            });
+        }
+
+        return amounts;
+    },
+
+    getNonICTAMaintenanceDraftFromDom() {
+        const moduleContent = document.getElementById('maintenanceModuleContent');
+        const otherContent = document.getElementById('otherOrganicContent');
+        const foodWasteEntries = Array.from(document.querySelectorAll('#nonIctaFoodWasteRows .nonicta-library-row'))
+            .map((row) => {
+                const sourceId = row.getAttribute('data-source-id') || '';
+                const amountValue = row.querySelector('.nonicta-food-amount')?.value;
+                const amount = amountValue !== '' && amountValue != null ? parseFloat(amountValue) : 0;
+                return {
+                    sourceId,
+                    amount: isNaN(amount) ? 0 : amount
+                };
+            });
+        const structuralMaterialEntries = Array.from(document.querySelectorAll('#nonIctaStructuralRows .nonicta-library-row'))
+            .map((row) => {
+                const materialId = row.getAttribute('data-material-id') || '';
+                const amountValue = row.querySelector('.nonicta-struct-amount')?.value;
+                const amount = amountValue !== '' && amountValue != null ? parseFloat(amountValue) : 0;
+                return {
+                    materialId,
+                    amount: isNaN(amount) ? 0 : amount
+                };
+            });
+        const additionalInputs = Array.from(document.querySelectorAll('#maintenanceAdditionalInputsList .maintenance-additional-row'))
+            .map((row) => {
+                const source = row.querySelector('.maintenance-additional-source')?.value || '';
+                const type = row.querySelector('input[type="radio"]:checked')?.value || 'organic';
+                const description = row.querySelector('.maintenance-additional-desc')?.value || '';
+                const amountValue = row.querySelector('.maintenance-additional-amount')?.value;
+                const amount = amountValue !== '' && amountValue != null ? parseFloat(amountValue) : 0;
+                return {
+                    source,
+                    type,
+                    description,
+                    amount: isNaN(amount) ? 0 : amount
+                };
+            });
+
+        return {
+            foodWasteEntries,
+            structuralMaterialEntries,
+            additionalInputs,
+            moduleExpanded: !!moduleContent && moduleContent.style.display === 'block',
+            otherOrganicExpanded: !!otherContent && otherContent.style.display === 'block'
+        };
+    },
+
+    getNonICTAMaintenanceState(record, batch, draft = null) {
+        const input = record?.input || {};
+        const maintenance = record?.maintenance || {};
+        const inputUnit = batch ? this.getBatchInputUnitName(batch) : 'kg';
+        const libraries = this.ensureNonICTAMaterialLibraries(batch);
+        const foodWasteLibraryAll = Array.isArray(libraries.foodWasteLibrary) ? libraries.foodWasteLibrary : [];
+        const structuralMaterialLibraryAll = Array.isArray(libraries.structuralMaterialLibrary) ? libraries.structuralMaterialLibrary : [];
+
+        const recordFoodEntries = Array.isArray(draft?.foodWasteEntries) && draft.foodWasteEntries.length > 0
+            ? draft.foodWasteEntries
+            : (Array.isArray(maintenance.foodWasteEntries) && maintenance.foodWasteEntries.length > 0
+                ? maintenance.foodWasteEntries
+                : Array.from(this.getLegacyNonICTAFoodEntryAmounts(maintenance, foodWasteLibraryAll), ([sourceId, amount]) => ({ sourceId, amount })));
+        const recordStructuralEntries = Array.isArray(draft?.structuralMaterialEntries) && draft.structuralMaterialEntries.length > 0
+            ? draft.structuralMaterialEntries
+            : (Array.isArray(maintenance.structuralMaterialEntries) && maintenance.structuralMaterialEntries.length > 0
+                ? maintenance.structuralMaterialEntries
+                : Array.from(this.getLegacyNonICTAStructuralEntryAmounts(maintenance, input, structuralMaterialLibraryAll), ([materialId, amount]) => ({ materialId, amount })));
+
+        const referencedFoodIds = new Set(recordFoodEntries.map((entry) => String(entry?.sourceId || '')).filter(Boolean));
+        const referencedMaterialIds = new Set(recordStructuralEntries.map((entry) => String(entry?.materialId || '')).filter(Boolean));
+
+        const visibleFoodLibrary = foodWasteLibraryAll.filter((item) => item.active !== false || referencedFoodIds.has(item.id));
+        const visibleStructuralLibrary = structuralMaterialLibraryAll.filter((item) => item.active !== false || referencedMaterialIds.has(item.id));
+
+        const foodAmountMap = new Map(
+            recordFoodEntries.map((entry) => [
+                String(entry?.sourceId || ''),
+                (entry?.amount != null && !isNaN(entry.amount)) ? (parseFloat(entry.amount) || 0) : 0
+            ])
+        );
+        const structuralAmountMap = new Map(
+            recordStructuralEntries.map((entry) => [
+                String(entry?.materialId || ''),
+                (entry?.amount != null && !isNaN(entry.amount)) ? (parseFloat(entry.amount) || 0) : 0
+            ])
+        );
+
+        const foodWasteEntries = visibleFoodLibrary.map((item) => ({
+            sourceId: item.id,
+            source: item.source,
+            type: item.type,
+            active: item.active !== false,
+            amount: foodAmountMap.get(item.id) || 0
+        }));
+        const structuralMaterialEntries = visibleStructuralLibrary.map((item) => ({
+            materialId: item.id,
+            material: item.material,
+            active: item.active !== false,
+            amount: structuralAmountMap.get(item.id) || 0
+        }));
+
+        const rawAdditionalInputs = Array.isArray(draft?.additionalInputs)
+            ? draft.additionalInputs
+            : (Array.isArray(maintenance.additionalInputs) && maintenance.additionalInputs.length > 0
+                ? maintenance.additionalInputs
+                : (Array.isArray(input.additionalInputs) ? input.additionalInputs.map((item) => ({
+                    source: item?.source || '',
+                    type: this.normalizeAdditionalMaterialType(item?.type),
+                    description: item?.description || '',
+                    amount: item?.amount != null
+                        ? ((item.amount != null && !isNaN(item.amount)) ? (parseFloat(item.amount) || 0) : 0)
+                        : ((item?.weight != null && !isNaN(item.weight)) ? (parseFloat(item.weight) || 0) : 0)
+                })) : []));
+        const additionalInputs = rawAdditionalInputs.length > 0 ? rawAdditionalInputs : [{ source: '', type: 'organic', description: '', amount: 0 }];
+        const additionalTotals = this.calculateAdditionalInputTotals(additionalInputs);
+
+        const totalFoodWaste = foodWasteEntries.reduce((sum, item) => sum + ((item.amount != null && !isNaN(item.amount)) ? (parseFloat(item.amount) || 0) : 0), 0);
+        const regularStructuralMaterial = structuralMaterialEntries.reduce((sum, item) => sum + ((item.amount != null && !isNaN(item.amount)) ? (parseFloat(item.amount) || 0) : 0), 0);
+        const totalOrganicWaste = totalFoodWaste + additionalTotals.additionalOrganicMaterial;
+        const totalStructuralMaterial = regularStructuralMaterial + additionalTotals.additionalStructuralMaterial;
+        const totalOrganicInput = totalOrganicWaste + totalStructuralMaterial;
+
+        return {
+            batchUnit: inputUnit,
+            foodWasteLibrary: visibleFoodLibrary,
+            foodWasteEntries,
+            structuralMaterialLibrary: visibleStructuralLibrary,
+            structuralMaterialEntries,
+            additionalInputs,
+            totalFoodWaste,
+            regularStructuralMaterial,
+            additionalOrganicMaterial: additionalTotals.additionalOrganicMaterial,
+            additionalStructuralMaterial: additionalTotals.additionalStructuralMaterial,
+            totalAdditionalInput: additionalTotals.totalAdditionalInput,
+            totalOrganicWaste,
+            totalStructuralMaterial,
+            totalOrganicInput,
+            moduleExpanded: !!draft?.moduleExpanded,
+            otherOrganicExpanded: !!draft?.otherOrganicExpanded
+        };
+    },
+
+    renderNonICTAMaintenanceModule(batch, maintenance) {
+        const inputUnit = maintenance.batchUnit || this.getBatchInputUnitName(batch);
+        const isCompleted = this.hasMaintenanceStateContent(maintenance);
         const additionalRows = Array.isArray(maintenance.additionalInputs) && maintenance.additionalInputs.length > 0
             ? maintenance.additionalInputs
             : [{ source: '', type: 'organic', description: '', amount: 0 }];
@@ -1528,7 +1779,7 @@ const App = {
         ];
 
         return `
-            <div class="card">
+            <div class="card" id="nonIctaMaintenanceCard">
                 <div style="display: flex; align-items: center; justify-content: space-between; cursor: pointer;" onclick="app.toggleICTAMaintenanceModule()">
                     <h2 class="card-title module-title maintenance" id="maintenanceModuleToggleText" data-completed="${isCompleted ? 'true' : 'false'}" style="margin: 0;">${this.getModuleToggleLabel('Maintenance Module', isCompleted)}</h2>
                     <span id="maintenanceModuleToggleIcon" style="color: var(--gray); font-weight: 700;">▸</span>
@@ -1538,46 +1789,36 @@ const App = {
                     <div class="module" style="background: #F4FBF4; border-color: #C8E6C9;">
                         <div class="maintenance-section-header">
                             <h3 class="module-title maintenance" style="margin-bottom: 0;">Food Waste Input</h3>
-                            <div class="maintenance-helptext">ⓘ Add one or more food waste sources for this visit.</div>
+                            <div class="maintenance-helptext">ⓘ Sources and default food waste types are managed at Batch level. Daily Record only needs today's amount.</div>
                         </div>
 
-                        <div class="nonicta-row-grid nonicta-food-head three">
-                            <div class="maintenance-table-head">Food Waste Source</div>
-                            <div class="maintenance-table-head">Type</div>
-                            <div class="maintenance-table-head" style="text-align:right;">Amount (${inputUnit})</div>
-                        </div>
-
-                        <div id="nonIctaFoodWasteRows">
-                            ${maintenance.foodWasteSources.map((row, idx) => {
-                                const source = String(row?.source || '').replace(/"/g, '&quot;');
-                                const type = String(row?.type || '');
-                                const otherType = String(row?.otherType || '').replace(/"/g, '&quot;');
-                                const amount = row?.amount != null ? row.amount : '';
-                                const showOther = type === 'Other';
-                                return `
-                                    <div class="nonicta-row nonicta-row-grid three" data-row-index="${idx}">
-                                        <div class="form-group" style="margin: 0;">
-                                            <input type="text" class="form-input nonicta-food-source" value="${source}" placeholder="e.g., Kitchen, Restaurant, Market" oninput="app.updateNonICTAMaintenanceTotals()">
+                        <div id="nonIctaFoodWasteRows" class="nonicta-library-list">
+                            ${maintenance.foodWasteEntries.length > 0 ? maintenance.foodWasteEntries.map((row) => `
+                                <div class="nonicta-library-row" data-source-id="${this.escapeAttr(row.sourceId)}">
+                                    <div class="nonicta-library-main">
+                                        <div class="nonicta-library-title-row">
+                                            <div class="nonicta-library-title">${this.escapeAttr(row.source || 'Untitled Source')}</div>
+                                            <div class="nonicta-library-actions">
+                                                ${row.active !== false ? `
+                                                    <button type="button" class="btn btn-secondary nonicta-inline-btn" onclick="app.renameNonICTAFoodWasteSource('${this.escapeAttr(row.sourceId)}')">✏ Rename</button>
+                                                    <button type="button" class="btn btn-secondary nonicta-inline-btn" onclick="app.editNonICTAFoodWasteType('${this.escapeAttr(row.sourceId)}')">Edit Type</button>
+                                                    <button type="button" class="btn btn-secondary nonicta-inline-btn" onclick="app.removeNonICTAFoodWasteSource('${this.escapeAttr(row.sourceId)}')">🗑 Remove</button>
+                                                ` : `<span class="nonicta-library-badge">Archived</span>`}
+                                            </div>
                                         </div>
-                                        <div class="form-group" style="margin: 0;">
-                                            <select class="form-input nonicta-food-type" onchange="app.updateNonICTAMaintenanceRowVisibility(); app.updateNonICTAMaintenanceTotals()">
-                                                <option value="">Select type...</option>
-                                                ${foodTypeOptions.map(opt => `<option value="${opt}" ${type === opt ? 'selected' : ''}>${opt}</option>`).join('')}
-                                            </select>
-                                            <input type="text" class="form-input nonicta-food-type-other" value="${otherType}" placeholder="Specify Type" style="margin-top: 8px; ${showOther ? '' : 'display:none;'}" oninput="app.updateNonICTAMaintenanceTotals()">
-                                        </div>
-                                        <div class="form-group" style="margin: 0;">
-                                            <input type="number" class="form-input nonicta-food-amount" step="any" value="${amount}" placeholder="Enter number" oninput="app.updateNonICTAMaintenanceTotals()">
-                                        </div>
-                                        <div class="nonicta-row-actions">
-                                            <button type="button" class="btn btn-secondary" style="padding: 8px 12px;" onclick="app.removeNonICTAFoodWasteRow(this)">− Remove</button>
-                                        </div>
+                                        <div class="nonicta-library-subtitle">${this.escapeAttr(row.type || 'No Type')}</div>
                                     </div>
-                                `;
-                            }).join('')}
+                                    <div class="form-group" style="margin: 0;">
+                                        <label class="form-label">Today's Amount (${inputUnit})</label>
+                                        <input type="number" class="form-input nonicta-food-amount" step="any" value="${row.amount ? row.amount : ''}" placeholder="Enter number" oninput="app.updateNonICTAMaintenanceTotals()">
+                                    </div>
+                                </div>
+                            `).join('') : `
+                                <div class="nonicta-library-empty">No food waste sources have been added to this Batch yet.</div>
+                            `}
                         </div>
 
-                        <button type="button" class="btn btn-secondary" style="padding: 8px 12px; margin-top: 12px;" onclick="app.addNonICTAFoodWasteRow()">+ Add Source</button>
+                        <button type="button" class="btn btn-secondary" style="padding: 8px 12px; margin-top: 12px;" onclick="app.addNonICTAFoodWasteSource()">+ Add New Source</button>
 
                         <div class="field-section" style="margin-top: 12px;">
                             <label class="field-section-title">Regular Organic Waste: <span class="auto-calc" id="regularOrganicWaste">${this.formatNumber(maintenance.totalFoodWaste || 0, 3)}</span> ${inputUnit}</label>
@@ -1585,43 +1826,36 @@ const App = {
                     </div>
 
                     <div class="module" style="background: #FFFDF4; border-color: #FFE082;">
-                        <h3 class="module-title" style="color: #F57C00;">Structural Material Input</h3>
-
-                        <div class="nonicta-row-grid nonicta-struct-head three">
-                            <div class="maintenance-table-head">Structural Material Type</div>
-                            <div class="maintenance-table-head">Specify (if Other)</div>
-                            <div class="maintenance-table-head" style="text-align:right;">Amount (${inputUnit})</div>
+                        <div class="maintenance-section-header">
+                            <h3 class="module-title" style="color: #F57C00; margin-bottom: 0;">Structural Material Input</h3>
+                            <div class="maintenance-helptext">ⓘ Structural materials are stored in the Batch Material Library and reused across all Daily Records.</div>
                         </div>
 
-                        <div id="nonIctaStructuralRows">
-                            ${maintenance.structuralMaterials.map((row, idx) => {
-                                const type = String(row?.type || '');
-                                const otherType = String(row?.otherType || '').replace(/"/g, '&quot;');
-                                const amount = row?.amount != null ? row.amount : '';
-                                const showOther = type === 'Other';
-                                return `
-                                    <div class="nonicta-row nonicta-row-grid three" data-row-index="${idx}">
-                                        <div class="form-group" style="margin: 0;">
-                                            <select class="form-input nonicta-struct-type" onchange="app.updateNonICTAMaintenanceRowVisibility(); app.updateNonICTAMaintenanceTotals()">
-                                                <option value="">Select type...</option>
-                                                ${structuralOptions.map(opt => `<option value="${opt}" ${type === opt ? 'selected' : ''}>${opt}</option>`).join('')}
-                                            </select>
-                                        </div>
-                                        <div class="form-group" style="margin: 0;">
-                                            <input type="text" class="form-input nonicta-struct-other" value="${otherType}" placeholder="Specify Material" style="${showOther ? '' : 'display:none;'}" oninput="app.updateNonICTAMaintenanceTotals()">
-                                        </div>
-                                        <div class="form-group" style="margin: 0;">
-                                            <input type="number" class="form-input nonicta-struct-amount" step="any" value="${amount}" placeholder="Enter number" oninput="app.updateNonICTAMaintenanceTotals()">
-                                        </div>
-                                        <div class="nonicta-row-actions">
-                                            <button type="button" class="btn btn-secondary" style="padding: 8px 12px;" onclick="app.removeNonICTAStructuralRow(this)">− Remove</button>
+                        <div id="nonIctaStructuralRows" class="nonicta-library-list">
+                            ${maintenance.structuralMaterialEntries.length > 0 ? maintenance.structuralMaterialEntries.map((row) => `
+                                <div class="nonicta-library-row" data-material-id="${this.escapeAttr(row.materialId)}">
+                                    <div class="nonicta-library-main">
+                                        <div class="nonicta-library-title-row">
+                                            <div class="nonicta-library-title">${this.escapeAttr(row.material || 'Untitled Material')}</div>
+                                            <div class="nonicta-library-actions">
+                                                ${row.active !== false ? `
+                                                    <button type="button" class="btn btn-secondary nonicta-inline-btn" onclick="app.renameNonICTAStructuralMaterial('${this.escapeAttr(row.materialId)}')">✏ Rename</button>
+                                                    <button type="button" class="btn btn-secondary nonicta-inline-btn" onclick="app.removeNonICTAStructuralMaterial('${this.escapeAttr(row.materialId)}')">🗑 Remove</button>
+                                                ` : `<span class="nonicta-library-badge">Archived</span>`}
+                                            </div>
                                         </div>
                                     </div>
-                                `;
-                            }).join('')}
+                                    <div class="form-group" style="margin: 0;">
+                                        <label class="form-label">Today's Amount (${inputUnit})</label>
+                                        <input type="number" class="form-input nonicta-struct-amount" step="any" value="${row.amount ? row.amount : ''}" placeholder="Enter number" oninput="app.updateNonICTAMaintenanceTotals()">
+                                    </div>
+                                </div>
+                            `).join('') : `
+                                <div class="nonicta-library-empty">No structural materials have been added to this Batch yet.</div>
+                            `}
                         </div>
 
-                        <button type="button" class="btn btn-secondary" style="padding: 8px 12px; margin-top: 12px;" onclick="app.addNonICTAStructuralRow()">+ Add Structural Material</button>
+                        <button type="button" class="btn btn-secondary" style="padding: 8px 12px; margin-top: 12px;" onclick="app.addNonICTAStructuralMaterial()">+ Add Structural Material</button>
 
                         <div class="field-section" style="margin-top: 12px;">
                             <label class="field-section-title">Regular Structural Material: <span class="auto-calc" id="regularStructuralMaterial">${this.formatNumber(maintenance.regularStructuralMaterial || 0, 3)}</span> ${inputUnit}</label>
@@ -5378,142 +5612,170 @@ const App = {
     },
 
     updateNonICTAMaintenanceRowVisibility() {
-        const batch = this.data.currentBatch;
-        if (!batch) return;
-        const foodRows = Array.from(document.querySelectorAll('#nonIctaFoodWasteRows .nonicta-row'));
-        foodRows.forEach((row) => {
-            const typeSelect = row.querySelector('.nonicta-food-type');
-            const otherInput = row.querySelector('.nonicta-food-type-other');
-            const selected = typeSelect ? (typeSelect.value || '') : '';
-            if (otherInput) otherInput.style.display = selected === 'Other' ? 'block' : 'none';
-        });
-
-        const structRows = Array.from(document.querySelectorAll('#nonIctaStructuralRows .nonicta-row'));
-        structRows.forEach((row) => {
-            const typeSelect = row.querySelector('.nonicta-struct-type');
-            const otherInput = row.querySelector('.nonicta-struct-other');
-            const selected = typeSelect ? (typeSelect.value || '') : '';
-            if (otherInput) otherInput.style.display = selected === 'Other' ? 'block' : 'none';
-        });
+        return;
     },
 
-    addNonICTAFoodWasteRow() {
-        const list = document.getElementById('nonIctaFoodWasteRows');
-        if (!list) return;
+    async persistNonICTAMaterialLibraryChange(successMessage = '✅ Material library updated') {
         const batch = this.data.currentBatch;
         if (!batch) return;
-        const idx = list.querySelectorAll('.nonicta-row').length;
-        const foodTypeOptions = [
-            'Fruit & Vegetable Waste',
-            'Cooked Food Waste',
-            'Coffee Grounds',
-            'Bread & Bakery Waste',
-            'Garden Waste',
-            'Mixed Organic Waste',
-            'Other'
-        ];
-        const row = document.createElement('div');
-        row.className = 'nonicta-row nonicta-row-grid three';
-        row.setAttribute('data-row-index', String(idx));
-        row.innerHTML = `
-            <div class="form-group" style="margin: 0;">
-                <input type="text" class="form-input nonicta-food-source" value="" placeholder="e.g., Kitchen, Restaurant, Market">
-            </div>
-            <div class="form-group" style="margin: 0;">
-                <select class="form-input nonicta-food-type">
-                    <option value="">Select type...</option>
-                    ${foodTypeOptions.map(opt => `<option value="${opt}">${opt}</option>`).join('')}
-                </select>
-                <input type="text" class="form-input nonicta-food-type-other" value="" placeholder="Specify Type" style="margin-top: 8px; display:none;">
-            </div>
-            <div class="form-group" style="margin: 0;">
-                <input type="number" class="form-input nonicta-food-amount" step="any" value="" placeholder="Enter number">
-            </div>
-            <div class="nonicta-row-actions">
-                <button type="button" class="btn btn-secondary" style="padding: 8px 12px;">− Remove</button>
-            </div>
-        `;
-        const removeBtn = row.querySelector('button');
-        if (removeBtn) removeBtn.onclick = () => this.removeNonICTAFoodWasteRow(removeBtn);
-        const inputs = row.querySelectorAll('input, select');
-        inputs.forEach((el) => {
-            el.addEventListener('input', () => { this.updateNonICTAMaintenanceRowVisibility(); this.updateNonICTAMaintenanceTotals(); });
-            el.addEventListener('change', () => { this.updateNonICTAMaintenanceRowVisibility(); this.updateNonICTAMaintenanceTotals(); });
-        });
-        list.appendChild(row);
-        this.updateNonICTAMaintenanceRowVisibility();
+        this.saveData();
+        try {
+            await this.upsertBatchToCloud(batch, { skipCreatedAt: true });
+        } catch (error) {
+            alert('Material library was saved locally, but cloud sync failed. Please try again after refreshing.');
+        }
+        this.refreshNonICTAMaintenanceModule();
+        this.showTransientSuccessMessage(successMessage, 2200);
+    },
+
+    applyNonICTAMaintenanceOpenState(draft) {
+        const content = document.getElementById('maintenanceModuleContent');
+        const icon = document.getElementById('maintenanceModuleToggleIcon');
+        const text = document.getElementById('maintenanceModuleToggleText');
+        if (content && icon && text && draft?.moduleExpanded) {
+            content.style.display = 'block';
+            icon.textContent = '▾';
+            this.syncModuleToggleText(text, 'Maintenance Module');
+        }
+
+        const otherContent = document.getElementById('otherOrganicContent');
+        const otherIcon = document.getElementById('otherOrganicToggleIcon');
+        const otherText = document.getElementById('otherOrganicToggleText');
+        if (otherContent && otherIcon && otherText && draft?.otherOrganicExpanded) {
+            otherContent.style.display = 'block';
+            otherIcon.textContent = '▾';
+            otherText.textContent = '☑ Other Organic Input (Optional)';
+        }
+    },
+
+    refreshNonICTAMaintenanceModule() {
+        if (this.isICTAUser() || this.data.currentPage !== 'dailyRecord') return;
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+        const wrapper = document.getElementById('nonIctaMaintenanceCard');
+        if (!wrapper) return;
+
+        const record = this.data.editingRecord
+            ? batch.records.find((item) => String(item.id) === String(this.data.editingRecord)) || null
+            : null;
+        const draft = this.getNonICTAMaintenanceDraftFromDom();
+        const nextState = this.getNonICTAMaintenanceState(record, batch, draft);
+        wrapper.outerHTML = this.renderNonICTAMaintenanceModule(batch, nextState);
+        this.applyNonICTAMaintenanceOpenState(draft);
         this.updateNonICTAMaintenanceTotals();
     },
 
-    removeNonICTAFoodWasteRow(arg) {
-        const list = document.getElementById('nonIctaFoodWasteRows');
-        if (!list) return;
-        const row = (typeof arg === 'number')
-            ? Array.from(list.querySelectorAll('.nonicta-row'))[arg]
-            : arg?.closest?.('.nonicta-row');
-        if (!row) return;
-        row.remove();
-        if (list.querySelectorAll('.nonicta-row').length === 0) {
-            this.addNonICTAFoodWasteRow();
+    async addNonICTAFoodWasteSource() {
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+        this.ensureNonICTAMaterialLibraries(batch);
+
+        const source = (window.prompt('New Source Name') || '').trim();
+        if (!source) return;
+
+        const suggested = 'Mixed Organic Waste';
+        const type = (window.prompt(`Food Waste Type\nSuggested options: ${this.getNonICTAFoodTypeOptions().join(', ')}`, suggested) || '').trim();
+        if (!type) {
+            alert('Please enter a Food Waste Type.');
             return;
         }
-        this.updateNonICTAMaintenanceRowVisibility();
-        this.updateNonICTAMaintenanceTotals();
-    },
 
-    addNonICTAStructuralRow() {
-        const list = document.getElementById('nonIctaStructuralRows');
-        if (!list) return;
-        const batch = this.data.currentBatch;
-        if (!batch) return;
-        const idx = list.querySelectorAll('.nonicta-row').length;
-        const options = ['Wood Chips', 'Dry Leaves', 'Pruning Waste', 'Sawdust', 'Other'];
-        const row = document.createElement('div');
-        row.className = 'nonicta-row nonicta-row-grid three';
-        row.setAttribute('data-row-index', String(idx));
-        row.innerHTML = `
-            <div class="form-group" style="margin: 0;">
-                <select class="form-input nonicta-struct-type">
-                    <option value="">Select type...</option>
-                    ${options.map(opt => `<option value="${opt}">${opt}</option>`).join('')}
-                </select>
-            </div>
-            <div class="form-group" style="margin: 0;">
-                <input type="text" class="form-input nonicta-struct-other" value="" placeholder="Specify Material" style="display:none;">
-            </div>
-            <div class="form-group" style="margin: 0;">
-                <input type="number" class="form-input nonicta-struct-amount" step="any" value="" placeholder="Enter number">
-            </div>
-            <div class="nonicta-row-actions">
-                <button type="button" class="btn btn-secondary" style="padding: 8px 12px;">− Remove</button>
-            </div>
-        `;
-        const removeBtn = row.querySelector('button');
-        if (removeBtn) removeBtn.onclick = () => this.removeNonICTAStructuralRow(removeBtn);
-        const inputs = row.querySelectorAll('input, select');
-        inputs.forEach((el) => {
-            el.addEventListener('input', () => { this.updateNonICTAMaintenanceRowVisibility(); this.updateNonICTAMaintenanceTotals(); });
-            el.addEventListener('change', () => { this.updateNonICTAMaintenanceRowVisibility(); this.updateNonICTAMaintenanceTotals(); });
-        });
-        list.appendChild(row);
-        this.updateNonICTAMaintenanceRowVisibility();
-        this.updateNonICTAMaintenanceTotals();
-    },
-
-    removeNonICTAStructuralRow(arg) {
-        const list = document.getElementById('nonIctaStructuralRows');
-        if (!list) return;
-        const row = (typeof arg === 'number')
-            ? Array.from(list.querySelectorAll('.nonicta-row'))[arg]
-            : arg?.closest?.('.nonicta-row');
-        if (!row) return;
-        row.remove();
-        if (list.querySelectorAll('.nonicta-row').length === 0) {
-            this.addNonICTAStructuralRow();
+        const exists = batch.foodWasteLibrary.some((item) => item.active !== false
+            && String(item.source || '').trim().toLowerCase() === source.toLowerCase()
+            && String(item.type || '').trim().toLowerCase() === type.toLowerCase());
+        if (exists) {
+            alert('This food waste source and type already exist in the Batch library.');
             return;
         }
-        this.updateNonICTAMaintenanceRowVisibility();
-        this.updateNonICTAMaintenanceTotals();
+
+        batch.foodWasteLibrary.push({
+            id: this.makeNonICTALibraryItemId('food'),
+            source,
+            type,
+            active: true
+        });
+        await this.persistNonICTAMaterialLibraryChange('✅ Food waste source added');
+    },
+
+    async renameNonICTAFoodWasteSource(sourceId) {
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+        this.ensureNonICTAMaterialLibraries(batch);
+        const item = batch.foodWasteLibrary.find((entry) => String(entry.id) === String(sourceId));
+        if (!item) return;
+        const nextSource = (window.prompt('Rename Source', item.source || '') || '').trim();
+        if (!nextSource || nextSource === item.source) return;
+        item.source = nextSource;
+        await this.persistNonICTAMaterialLibraryChange('✅ Food waste source renamed');
+    },
+
+    async editNonICTAFoodWasteType(sourceId) {
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+        this.ensureNonICTAMaterialLibraries(batch);
+        const item = batch.foodWasteLibrary.find((entry) => String(entry.id) === String(sourceId));
+        if (!item) return;
+        const nextType = (window.prompt(`Edit Food Waste Type\nSuggested options: ${this.getNonICTAFoodTypeOptions().join(', ')}`, item.type || '') || '').trim();
+        if (!nextType || nextType === item.type) return;
+        item.type = nextType;
+        await this.persistNonICTAMaterialLibraryChange('✅ Food waste type updated');
+    },
+
+    async removeNonICTAFoodWasteSource(sourceId) {
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+        this.ensureNonICTAMaterialLibraries(batch);
+        const item = batch.foodWasteLibrary.find((entry) => String(entry.id) === String(sourceId));
+        if (!item) return;
+        if (!confirm(`Remove "${item.source}" from future Daily Records? Historical records will remain linked.`)) return;
+        item.active = false;
+        await this.persistNonICTAMaterialLibraryChange('✅ Food waste source removed from active library');
+    },
+
+    async addNonICTAStructuralMaterial() {
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+        this.ensureNonICTAMaterialLibraries(batch);
+
+        const material = (window.prompt('Material Name') || '').trim();
+        if (!material) return;
+
+        const exists = batch.structuralMaterialLibrary.some((item) => item.active !== false
+            && String(item.material || '').trim().toLowerCase() === material.toLowerCase());
+        if (exists) {
+            alert('This structural material already exists in the Batch library.');
+            return;
+        }
+
+        batch.structuralMaterialLibrary.push({
+            id: this.makeNonICTALibraryItemId('struct'),
+            material,
+            active: true
+        });
+        await this.persistNonICTAMaterialLibraryChange('✅ Structural material added');
+    },
+
+    async renameNonICTAStructuralMaterial(materialId) {
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+        this.ensureNonICTAMaterialLibraries(batch);
+        const item = batch.structuralMaterialLibrary.find((entry) => String(entry.id) === String(materialId));
+        if (!item) return;
+        const nextMaterial = (window.prompt('Rename Structural Material', item.material || '') || '').trim();
+        if (!nextMaterial || nextMaterial === item.material) return;
+        item.material = nextMaterial;
+        await this.persistNonICTAMaterialLibraryChange('✅ Structural material renamed');
+    },
+
+    async removeNonICTAStructuralMaterial(materialId) {
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+        this.ensureNonICTAMaterialLibraries(batch);
+        const item = batch.structuralMaterialLibrary.find((entry) => String(entry.id) === String(materialId));
+        if (!item) return;
+        if (!confirm(`Remove "${item.material}" from future Daily Records? Historical records will remain linked.`)) return;
+        item.active = false;
+        await this.persistNonICTAMaterialLibraryChange('✅ Structural material removed from active library');
     },
 
     updateNonICTAMaintenanceTotals() {
@@ -5521,14 +5783,14 @@ const App = {
         const batch = this.data.currentBatch;
         if (!batch) return;
 
-        const foodRows = Array.from(document.querySelectorAll('#nonIctaFoodWasteRows .nonicta-row'));
+        const foodRows = Array.from(document.querySelectorAll('#nonIctaFoodWasteRows .nonicta-library-row'));
         const regularOrganicWaste = foodRows.reduce((s, row) => {
             const amountEl = row.querySelector('.nonicta-food-amount');
             const n = (amountEl && amountEl.value !== '') ? parseFloat(amountEl.value) : 0;
             return s + (isNaN(n) ? 0 : n);
         }, 0);
 
-        const structRows = Array.from(document.querySelectorAll('#nonIctaStructuralRows .nonicta-row'));
+        const structRows = Array.from(document.querySelectorAll('#nonIctaStructuralRows .nonicta-library-row'));
         const regularStructuralMaterial = structRows.reduce((s, row) => {
             const amountEl = row.querySelector('.nonicta-struct-amount');
             const n = (amountEl && amountEl.value !== '') ? parseFloat(amountEl.value) : 0;
@@ -6232,6 +6494,8 @@ const App = {
             settings,
             initialStock,
             compostingSystemInformation,
+            foodWasteLibrary: Array.isArray(previousBatch?.foodWasteLibrary) ? previousBatch.foodWasteLibrary : [],
+            structuralMaterialLibrary: Array.isArray(previousBatch?.structuralMaterialLibrary) ? previousBatch.structuralMaterialLibrary : [],
             collaborationSettings,
             status: 'active',
             records: [],
@@ -6415,25 +6679,23 @@ const App = {
                 return isNaN(n) ? 0 : n;
             };
 
-            const foodRows = Array.from(document.querySelectorAll('#nonIctaFoodWasteRows .nonicta-row'));
-            const foodWasteSources = foodRows.map((row) => {
-                const source = row.querySelector('.nonicta-food-source')?.value || '';
-                const type = row.querySelector('.nonicta-food-type')?.value || '';
-                const otherType = row.querySelector('.nonicta-food-type-other')?.value || '';
+            this.ensureNonICTAMaterialLibraries(batch);
+            const foodRows = Array.from(document.querySelectorAll('#nonIctaFoodWasteRows .nonicta-library-row'));
+            const foodWasteEntries = foodRows.map((row) => {
+                const sourceId = row.getAttribute('data-source-id') || '';
                 const amount = parseAmount(row.querySelector('.nonicta-food-amount')?.value);
-                return { source, type, otherType, amount };
-            }).filter((r) => (r.source || '') !== '' || (r.type || '') !== '' || (r.otherType || '') !== '' || (r.amount || 0) > 0);
+                return { sourceId, amount };
+            }).filter((entry) => (entry.sourceId || '') !== '' && (entry.amount || 0) > 0);
 
-            const structRows = Array.from(document.querySelectorAll('#nonIctaStructuralRows .nonicta-row'));
-            const structuralMaterials = structRows.map((row) => {
-                const type = row.querySelector('.nonicta-struct-type')?.value || '';
-                const otherType = row.querySelector('.nonicta-struct-other')?.value || '';
+            const structRows = Array.from(document.querySelectorAll('#nonIctaStructuralRows .nonicta-library-row'));
+            const structuralMaterialEntries = structRows.map((row) => {
+                const materialId = row.getAttribute('data-material-id') || '';
                 const amount = parseAmount(row.querySelector('.nonicta-struct-amount')?.value);
-                return { type, otherType, amount };
-            }).filter((r) => (r.type || '') !== '' || (r.otherType || '') !== '' || (r.amount || 0) > 0);
+                return { materialId, amount };
+            }).filter((entry) => (entry.materialId || '') !== '' && (entry.amount || 0) > 0);
 
-            const totalFoodWaste = foodWasteSources.reduce((s, r) => s + ((r && r.amount != null && !isNaN(r.amount)) ? (parseFloat(r.amount) || 0) : 0), 0);
-            const regularStructuralMaterial = structuralMaterials.reduce((s, r) => s + ((r && r.amount != null && !isNaN(r.amount)) ? (parseFloat(r.amount) || 0) : 0), 0);
+            const totalFoodWaste = foodWasteEntries.reduce((s, r) => s + ((r && r.amount != null && !isNaN(r.amount)) ? (parseFloat(r.amount) || 0) : 0), 0);
+            const regularStructuralMaterial = structuralMaterialEntries.reduce((s, r) => s + ((r && r.amount != null && !isNaN(r.amount)) ? (parseFloat(r.amount) || 0) : 0), 0);
 
             const additionalRows = Array.from(document.querySelectorAll('#maintenanceAdditionalInputsList .maintenance-additional-row'));
             const additionalInputs = additionalRows.map((row) => {
@@ -6449,9 +6711,9 @@ const App = {
             const totalOrganicInput = totalOrganicWaste + totalStructuralMaterial;
 
             maintenance = {
-                foodWasteSources,
+                foodWasteEntries,
                 totalFoodWaste,
-                structuralMaterials,
+                structuralMaterialEntries,
                 regularStructuralMaterial,
                 additionalOrganicMaterial: additionalTotals.additionalOrganicMaterial,
                 additionalStructuralMaterial: additionalTotals.additionalStructuralMaterial,
@@ -6463,10 +6725,16 @@ const App = {
             };
 
             input.regularOrganicWaste = totalFoodWaste;
-            input.structuringMaterials = structuralMaterials.map((m) => ({
-                type: m.otherType ? `${m.type} - ${m.otherType}` : (m.type || ''),
-                kg: (m.amount != null && !isNaN(m.amount)) ? (parseFloat(m.amount) || 0) : 0
-            })).filter(m => (m.type || '') !== '' || (m.kg != null && !isNaN(m.kg)));
+            const structuralLibraryById = new Map(
+                (Array.isArray(batch.structuralMaterialLibrary) ? batch.structuralMaterialLibrary : []).map((item) => [String(item.id), item])
+            );
+            input.structuringMaterials = structuralMaterialEntries.map((entry) => {
+                const libraryItem = structuralLibraryById.get(String(entry.materialId || ''));
+                return {
+                    type: libraryItem?.material || '',
+                    kg: (entry.amount != null && !isNaN(entry.amount)) ? (parseFloat(entry.amount) || 0) : 0
+                };
+            }).filter(m => (m.type || '') !== '' || (m.kg != null && !isNaN(m.kg)));
             input.additionalInputs = additionalInputs.map(a => ({
                 source: a.source,
                 type: a.type === 'structural' ? 'Structural Material' : 'Organic Material',
