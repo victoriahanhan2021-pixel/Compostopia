@@ -1,0 +1,7689 @@
+const firebaseConfig = {
+    apiKey: "AIzaSyCjg1kZpXAD8lE1HfMWhTTc_GwWGx5zFWI",
+    authDomain: "composting-74985.firebaseapp.com",
+    projectId: "composting-74985",
+    storageBucket: "composting-74985.firebasestorage.app",
+    messagingSenderId: "192197253836",
+    appId: "1:192197253836:web:2db6084cf85cb2629b0069",
+    measurementId: "G-MKG29HYVWS"
+};
+
+firebase.initializeApp(firebaseConfig);
+const firebaseAuth = firebase.auth();
+let firestoreDb = null;
+let storageDb = null;
+try {
+    firestoreDb = firebase.firestore();
+} catch (error) {
+    firestoreDb = null;
+}
+try {
+    storageDb = firebase.storage();
+} catch (error) {
+    storageDb = null;
+}
+
+try {
+    firebase.analytics();
+} catch (error) {
+    console.log('analytics not available', error);
+}
+
+const App = {
+    data: {
+        batches: [],
+        currentBatch: null,
+        currentPage: 'login',
+        currentUser: null,
+        currentOrganization: '',
+        currentCommunityType: '',
+        currentCommunityTypeOther: '',
+        rememberMe: false,
+        authSubmitting: false,
+        editingBatch: null,
+        editingRecord: null,
+        globalClickDelegationBound: false,
+        batchGalleryPhotos: []
+    },
+
+    init() {
+        this.data.currentPage = 'login';
+        this.data.rememberMe = localStorage.getItem('compostRememberMe') === 'true';
+        this.bindGlobalClickDelegation();
+        this.bindAuthState();
+        this.render();
+    },
+
+    bindGlobalClickDelegation() {
+        if (this.data.globalClickDelegationBound) return;
+        document.addEventListener('click', (event) => {
+            const target = event.target;
+            if (!target || !target.closest) return;
+
+            const addBtn = target.closest('#addDailyRecordBtn');
+            if (addBtn) {
+                const batchId = addBtn.getAttribute('data-batch-id') || (this.data.currentBatch ? this.data.currentBatch.id : null);
+                if (batchId) this.navigate('dailyRecord', { batchId });
+                return;
+            }
+
+            const actionBtn = target.closest('button[data-action]');
+            if (actionBtn) {
+                const action = actionBtn.getAttribute('data-action') || '';
+                if (action === 'edit') {
+                    const batchId = actionBtn.getAttribute('data-batch-id') || (this.data.currentBatch ? this.data.currentBatch.id : null);
+                    const recordId = actionBtn.getAttribute('data-record-id');
+                    if (batchId && recordId != null) this.navigate('dailyRecord', { batchId, recordId });
+                    return;
+                }
+                if (action === 'delete') {
+                    const recordId = actionBtn.getAttribute('data-record-id');
+                    if (recordId != null) this.deleteDailyRecord(recordId);
+                }
+            }
+        }, true);
+        this.data.globalClickDelegationBound = true;
+    },
+
+    normalizeEmail(value) {
+        return (value || '').trim().toLowerCase();
+    },
+
+    bindAuthState() {
+        firebaseAuth.onAuthStateChanged(async (user) => {
+            this.data.currentUser = user ? { uid: user.uid, email: user.email } : null;
+
+            if (this.data.currentUser) {
+                await this.loadData();
+                this.loadOrganization();
+                await this.loadUserProfile();
+            } else {
+                this.data.batches = [];
+                this.data.currentBatch = null;
+                this.data.editingRecord = null;
+                this.data.currentOrganization = '';
+                this.data.currentCommunityType = '';
+                this.data.currentCommunityTypeOther = '';
+                this.data.currentPage = 'login';
+            }
+
+            if (this.data.currentUser && (this.data.currentPage === 'login' || this.data.currentPage === 'register')) {
+                this.navigate('dashboard');
+                return;
+            }
+
+            this.render();
+        });
+    },
+
+    getStorageKey() {
+        return this.data.currentUser?.uid ? `compostData_${this.data.currentUser.uid}` : null;
+    },
+
+    getOrganizationKey() {
+        return this.getOrganizationKeyForUid(this.data.currentUser?.uid);
+    },
+
+    getOrganizationKeyForUid(uid) {
+        return uid ? `compostOrg_${uid}` : null;
+    },
+
+    loadOrganization() {
+        const key = this.getOrganizationKey();
+        this.data.currentOrganization = key ? (localStorage.getItem(key) || '') : '';
+    },
+
+    saveOrganization(organization) {
+        const key = this.getOrganizationKey();
+        if (!key) return;
+        localStorage.setItem(key, organization || '');
+        this.data.currentOrganization = organization || '';
+    },
+
+    getUserProfileCacheKeyForUid(uid) {
+        return uid ? `compostUserProfile_${uid}` : null;
+    },
+
+    loadCachedUserProfile(uid = this.data.currentUser?.uid) {
+        const cacheKey = this.getUserProfileCacheKeyForUid(uid);
+        if (!cacheKey) return null;
+        const raw = localStorage.getItem(cacheKey);
+        if (!raw) return null;
+        try {
+            return JSON.parse(raw);
+        } catch (error) {
+            return null;
+        }
+    },
+
+    cacheUserProfile(uid, profile) {
+        const cacheKey = this.getUserProfileCacheKeyForUid(uid);
+        if (!cacheKey) return;
+        localStorage.setItem(cacheKey, JSON.stringify(profile || {}));
+    },
+
+    async loadUserProfile() {
+        const uid = this.data.currentUser?.uid;
+        if (!uid) return;
+
+        const applyProfile = (profile) => {
+            const organization = (profile && profile.organization) ? String(profile.organization).trim() : '';
+            const communityType = (profile && profile.communityType) ? String(profile.communityType).trim() : '';
+            const communityTypeOther = (profile && profile.communityTypeOther) ? String(profile.communityTypeOther).trim() : '';
+
+            if (organization) this.saveOrganization(organization);
+            this.data.currentCommunityType = communityType;
+            this.data.currentCommunityTypeOther = communityTypeOther;
+        };
+
+        try {
+            if (firestoreDb) {
+                const doc = await firestoreDb.collection('users').doc(uid).get();
+                if (doc && doc.exists) {
+                    const data = doc.data() || {};
+                    const profile = {
+                        organization: data.organization || '',
+                        communityType: data.communityType || '',
+                        communityTypeOther: data.communityTypeOther || ''
+                    };
+                    applyProfile(profile);
+                    this.cacheUserProfile(uid, profile);
+                    return;
+                }
+            }
+        } catch (error) {
+        }
+
+        const cached = this.loadCachedUserProfile(uid);
+        if (cached) applyProfile(cached);
+    },
+
+    async saveUserProfile(uid, profile) {
+        if (!uid) return;
+        const normalized = {
+            organization: profile?.organization ? String(profile.organization).trim() : '',
+            communityType: profile?.communityType ? String(profile.communityType).trim() : '',
+            communityTypeOther: profile?.communityTypeOther ? String(profile.communityTypeOther).trim() : ''
+        };
+
+        try {
+            if (firestoreDb) {
+                const payload = {
+                    ...normalized,
+                    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                };
+                await firestoreDb.collection('users').doc(uid).set(payload, { merge: true });
+            }
+        } catch (error) {
+        }
+
+        this.cacheUserProfile(uid, normalized);
+        localStorage.setItem(this.getOrganizationKeyForUid(uid), normalized.organization || '');
+
+        if (this.data.currentUser?.uid === uid) {
+            if (normalized.organization) this.data.currentOrganization = normalized.organization;
+            this.data.currentCommunityType = normalized.communityType;
+            this.data.currentCommunityTypeOther = normalized.communityTypeOther;
+        }
+    },
+
+    getBatchRouteId(batch) {
+        return batch ? String(batch.cloudId || batch.id || '') : '';
+    },
+
+    findBatchByRouteId(batchId) {
+        const target = String(batchId || '');
+        return this.data.batches.find((batch) => this.getBatchRouteId(batch) === target || String(batch?.id || '') === target) || null;
+    },
+
+    escapeAttr(value) {
+        return String(value == null ? '' : value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/"/g, '&quot;');
+    },
+
+    normalizeCollaboratorEmails(emails = []) {
+        return Array.from(new Set((Array.isArray(emails) ? emails : [])
+            .map((email) => this.normalizeEmail(email))
+            .filter(Boolean)));
+    },
+
+    isBatchOwner(batch) {
+        if (!batch) return false;
+        if (!batch.ownerUid) return true;
+        return batch.ownerUid === this.data.currentUser?.uid;
+    },
+
+    canDeleteBatch(batch) {
+        return this.isBatchOwner(batch);
+    },
+
+    getBatchCollaborators(batch) {
+        return this.normalizeCollaboratorEmails(
+            batch?.collaboratorEmails
+            || batch?.collaborationSettings?.collaborators
+            || []
+        );
+    },
+
+    isCurrentUserCollaborator(batch) {
+        const email = this.normalizeEmail(this.data.currentUser?.email || '');
+        return !!email && this.getBatchCollaborators(batch).includes(email) && !this.isBatchOwner(batch);
+    },
+
+    updateBatchCollaborationFields(batch, collaborators = []) {
+        const normalizedCollaborators = this.normalizeCollaboratorEmails(collaborators)
+            .filter((email) => email !== this.normalizeEmail(batch?.ownerEmail || this.data.currentUser?.email || ''));
+        const nextType = normalizedCollaborators.length > 0 ? 'shared' : 'private';
+        batch.collaboratorEmails = normalizedCollaborators;
+        batch.visibility = nextType;
+        batch.collaborationSettings = {
+            ...(batch.collaborationSettings || {}),
+            type: nextType,
+            collaborators: normalizedCollaborators
+        };
+        return batch;
+    },
+
+    async syncBatchCollaboration(batch) {
+        this.saveData();
+        try {
+            await this.upsertBatchToCloud(batch, { skipCreatedAt: true });
+            this.saveData();
+        } catch (error) {
+            alert('Collaboration settings were updated locally, but cloud sync failed. Please refresh and try again.');
+        }
+    },
+
+    getCurrentActorInfo() {
+        return {
+            uid: this.data.currentUser?.uid || '',
+            email: this.normalizeEmail(this.data.currentUser?.email || '') || 'unknown user'
+        };
+    },
+
+    createActivityEntry(action, summary, details = {}) {
+        const actor = this.getCurrentActorInfo();
+        return this.removeUndefinedDeep({
+            id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            action,
+            summary,
+            actorUid: actor.uid,
+            actorEmail: actor.email,
+            createdAt: new Date().toISOString(),
+            details
+        });
+    },
+
+    appendBatchActivity(batch, action, summary, details = {}) {
+        if (!batch) return null;
+        if (!Array.isArray(batch.activityLog)) batch.activityLog = [];
+        const entry = this.createActivityEntry(action, summary, details);
+        batch.activityLog.unshift(entry);
+        batch.activityLog = batch.activityLog
+            .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))
+            .slice(0, 80);
+        return entry;
+    },
+
+    getBatchActivityLog(batch) {
+        return (Array.isArray(batch?.activityLog) ? batch.activityLog : [])
+            .slice()
+            .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+    },
+
+    formatActivityDateTime(value) {
+        if (!value) return 'Unknown time';
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return String(value);
+        return date.toLocaleString('en-GB', {
+            day: '2-digit',
+            month: 'short',
+            year: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+    },
+
+    getActivityActionMeta(action) {
+        switch (action) {
+            case 'record_added':
+                return { icon: '📝', badgeClass: 'record' };
+            case 'record_photos_uploaded':
+                return { icon: '🖼', badgeClass: 'photo' };
+            case 'batch_finished':
+                return { icon: '🏁', badgeClass: 'finish' };
+            case 'batch_final_photos_uploaded':
+                return { icon: '📸', badgeClass: 'photo' };
+            case 'collaborators_added':
+                return { icon: '➕', badgeClass: 'collab' };
+            case 'collaborator_removed':
+                return { icon: '➖', badgeClass: 'collab' };
+            case 'collaborator_left':
+                return { icon: '🚪', badgeClass: 'collab' };
+            default:
+                return { icon: '•', badgeClass: 'default' };
+        }
+    },
+
+    renderActivityLog(batch) {
+        const entries = this.getBatchActivityLog(batch).slice(0, 16);
+        if (entries.length === 0) {
+            return `<div class="activity-log-empty">No shared activity has been recorded for this batch yet.</div>`;
+        }
+        return `
+            <div class="activity-log-list">
+                ${entries.map((entry) => {
+                    const meta = this.getActivityActionMeta(entry.action);
+                    return `
+                        <div class="activity-log-item">
+                            <div class="activity-log-icon ${meta.badgeClass}">${meta.icon}</div>
+                            <div class="activity-log-content">
+                                <div class="activity-log-summary">${this.escapeAttr(entry.summary || '')}</div>
+                                <div class="activity-log-meta">
+                                    <span>${this.escapeAttr(entry.actorEmail || 'unknown user')}</span>
+                                    <span>${this.escapeAttr(this.formatActivityDateTime(entry.createdAt))}</span>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        `;
+    },
+
+    isDataUrl(value) {
+        return typeof value === 'string' && value.startsWith('data:image/');
+    },
+
+    isRemotePhotoUrl(value) {
+        return typeof value === 'string' && /^https?:\/\//i.test(value);
+    },
+
+    normalizePhotoItem(photo) {
+        if (!photo) return null;
+        if (typeof photo === 'string') {
+            if (this.isDataUrl(photo)) {
+                return {
+                    url: photo,
+                    previewUrl: photo,
+                    storagePath: '',
+                    uploadedAt: '',
+                    uploadedBy: this.normalizeEmail(this.data.currentUser?.email || '')
+                };
+            }
+            if (this.isRemotePhotoUrl(photo)) {
+                return {
+                    url: photo,
+                    previewUrl: photo,
+                    storagePath: '',
+                    uploadedAt: '',
+                    uploadedBy: ''
+                };
+            }
+            return null;
+        }
+        const url = typeof photo.url === 'string' && photo.url
+            ? photo.url
+            : (typeof photo.src === 'string' ? photo.src : '');
+        if (!url) return null;
+        return {
+            url,
+            previewUrl: typeof photo.previewUrl === 'string' && photo.previewUrl ? photo.previewUrl : url,
+            storagePath: typeof photo.storagePath === 'string' ? photo.storagePath : '',
+            uploadedAt: photo.uploadedAt || '',
+            uploadedBy: typeof photo.uploadedBy === 'string' ? photo.uploadedBy : ''
+        };
+    },
+
+    normalizePhotoList(photos = []) {
+        return (Array.isArray(photos) ? photos : [])
+            .map((photo) => this.normalizePhotoItem(photo))
+            .filter(Boolean)
+            .slice(0, 9);
+    },
+
+    getPhotoPreviewSrc(photo) {
+        return this.normalizePhotoItem(photo)?.previewUrl || '';
+    },
+
+    isCloudPhotoStorageEnabled() {
+        return !!storageDb;
+    },
+
+    isBatchShared(batch) {
+        const type = String(batch?.collaborationSettings?.type || batch?.visibility || '').toLowerCase();
+        return type === 'shared';
+    },
+
+    serializePhotoItemForCloud(photo) {
+        const normalized = this.normalizePhotoItem(photo);
+        if (!normalized) return null;
+        if (!this.isCloudPhotoStorageEnabled()) return null;
+        if (this.isDataUrl(normalized.url)) return null;
+        return this.removeUndefinedDeep({
+            url: normalized.url,
+            storagePath: normalized.storagePath || '',
+            uploadedAt: normalized.uploadedAt || '',
+            uploadedBy: normalized.uploadedBy || ''
+        });
+    },
+
+    getPhotoStoragePaths(photos = []) {
+        return this.normalizePhotoList(photos)
+            .map((photo) => photo.storagePath || '')
+            .filter(Boolean);
+    },
+
+    getStorageRoot() {
+        return storageDb ? storageDb.ref() : null;
+    },
+
+    makeStoragePhotoPath(batch, scope, recordId = '') {
+        const ownerUid = this.data.currentUser?.uid || batch?.ownerUid || 'anonymous';
+        const routeId = this.getBatchRouteId(batch) || String(batch?.id || 'batch');
+        const safeRecordId = recordId ? `/${String(recordId).replace(/[^a-zA-Z0-9_-]/g, '_')}` : '';
+        const unique = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        return `batch-photos/${ownerUid}/${routeId}/${scope}${safeRecordId}/${unique}.jpg`;
+    },
+
+    async uploadPhotoToStorage(batch, photo, scope, recordId = '') {
+        const normalized = this.normalizePhotoItem(photo);
+        if (!normalized) return null;
+        if (!this.isDataUrl(normalized.url)) {
+            return {
+                ...normalized,
+                previewUrl: normalized.url
+            };
+        }
+        const root = this.getStorageRoot();
+        if (!root) {
+            return {
+                ...normalized,
+                previewUrl: normalized.url
+            };
+        }
+        const storagePath = this.makeStoragePhotoPath(batch, scope, recordId);
+        const ref = root.child(storagePath);
+        await ref.putString(normalized.url, 'data_url');
+        const downloadUrl = await ref.getDownloadURL();
+        return {
+            url: downloadUrl,
+            previewUrl: downloadUrl,
+            storagePath,
+            uploadedAt: new Date().toISOString(),
+            uploadedBy: this.normalizeEmail(this.data.currentUser?.email || '')
+        };
+    },
+
+    async syncPhotoListToCloud(batch, photos, scope, recordId = '') {
+        const normalized = this.normalizePhotoList(photos);
+        const results = [];
+        for (const photo of normalized) {
+            const uploaded = await this.uploadPhotoToStorage(batch, photo, scope, recordId);
+            if (uploaded) results.push(uploaded);
+        }
+        return results.slice(0, 9);
+    },
+
+    async deleteStorageFiles(paths = []) {
+        const root = this.getStorageRoot();
+        if (!root) return;
+        const uniquePaths = Array.from(new Set((Array.isArray(paths) ? paths : []).filter(Boolean)));
+        await Promise.all(uniquePaths.map(async (storagePath) => {
+            try {
+                await root.child(storagePath).delete();
+            } catch (error) {
+            }
+        }));
+    },
+
+    removeUndefinedDeep(value) {
+        if (Array.isArray(value)) {
+            return value
+                .map((item) => this.removeUndefinedDeep(item))
+                .filter((item) => item !== undefined);
+        }
+        if (value && typeof value === 'object') {
+            const result = {};
+            Object.entries(value).forEach(([key, nested]) => {
+                const cleaned = this.removeUndefinedDeep(nested);
+                if (cleaned !== undefined) result[key] = cleaned;
+            });
+            return result;
+        }
+        return value === undefined ? null : value;
+    },
+
+    getBatchesCollection() {
+        return firestoreDb ? firestoreDb.collection('batches') : null;
+    },
+
+    getRecordsCollection(batch) {
+        if (!firestoreDb || !batch?.cloudId) return null;
+        return firestoreDb.collection('batches').doc(String(batch.cloudId)).collection('records');
+    },
+
+    buildCloudBatchPayload(batch, options = {}) {
+        const collaboration = batch?.collaborationSettings || {};
+        const collaboratorEmails = this.normalizeCollaboratorEmails(
+            Array.isArray(collaboration.collaborators) ? collaboration.collaborators : batch?.collaboratorEmails || []
+        );
+        const cloudPhotosEnabled = this.isCloudPhotoStorageEnabled();
+        const cloudFinalPhotos = cloudPhotosEnabled
+            ? this.normalizePhotoList(batch?.finalAssessment?.finalCompostPhotos || [])
+                .map((photo) => this.serializePhotoItemForCloud(photo))
+                .filter(Boolean)
+            : [];
+        const finalAssessment = batch?.finalAssessment
+            ? {
+                ...batch.finalAssessment,
+                finalCompostPhotos: cloudFinalPhotos,
+                finalCompostPhotosCount: cloudFinalPhotos.length
+            }
+            : null;
+
+        const payload = {
+            id: batch.id,
+            startDate: batch.startDate || '',
+            manager: batch.manager || '',
+            location: batch.location || '',
+            notes: batch.notes || '',
+            measurementSettings: batch.measurementSettings || null,
+            settings: batch.settings || null,
+            initialStock: batch.initialStock || null,
+            compostingSystemInformation: batch.compostingSystemInformation || null,
+            collaborationSettings: {
+                ...collaboration,
+                type: collaboration.type || 'private',
+                collaborators: collaboratorEmails
+            },
+            status: batch.status || 'active',
+            output: batch.output || null,
+            finalAssessment,
+            currentPhase: batch.currentPhase || '',
+            finishedDate: batch.finishedDate || '',
+            ownerUid: batch.ownerUid || this.data.currentUser?.uid || '',
+            ownerEmail: batch.ownerEmail || this.normalizeEmail(this.data.currentUser?.email || ''),
+            visibility: collaboration.type === 'shared' ? 'shared' : 'private',
+            collaboratorEmails,
+            activityLog: this.getBatchActivityLog(batch),
+            updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+        };
+
+        if (!batch.cloudId && !options.skipCreatedAt) {
+            payload.createdAt = firebase.firestore.FieldValue.serverTimestamp();
+        }
+
+        return this.removeUndefinedDeep(payload);
+    },
+
+    buildCloudRecordPayload(record) {
+        const cloudPhotosEnabled = this.isCloudPhotoStorageEnabled();
+        const photos = cloudPhotosEnabled && Array.isArray(record?.uploadedPhotos) ? record.uploadedPhotos : [];
+        const cloudPhotos = cloudPhotosEnabled
+            ? this.normalizePhotoList(photos)
+                .map((photo) => this.serializePhotoItemForCloud(photo))
+                .filter(Boolean)
+            : [];
+        return this.removeUndefinedDeep({
+            ...record,
+            id: String(record?.id || ''),
+            uploadedPhotos: cloudPhotos,
+            uploadedPhotosCount: cloudPhotos.length,
+            updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+        });
+    },
+
+    normalizeCloudBatch(doc) {
+        const data = doc.data() || {};
+        const collaboratorEmails = this.normalizeCollaboratorEmails(data.collaboratorEmails || data?.collaborationSettings?.collaborators || []);
+        const finalAssessment = data.finalAssessment
+            ? {
+                ...data.finalAssessment,
+                finalCompostPhotos: this.normalizePhotoList(data.finalAssessment.finalCompostPhotos)
+            }
+            : null;
+        return {
+            ...data,
+            cloudId: doc.id,
+            ownerUid: data.ownerUid || '',
+            ownerEmail: data.ownerEmail || '',
+            finalAssessment,
+            activityLog: Array.isArray(data.activityLog) ? data.activityLog : [],
+            collaboratorEmails,
+            collaborationSettings: {
+                ...(data.collaborationSettings || {}),
+                type: data.visibility || data?.collaborationSettings?.type || 'private',
+                collaborators: collaboratorEmails
+            },
+            records: []
+        };
+    },
+
+    normalizeCloudRecord(doc) {
+        const data = doc.data() || {};
+        return {
+            ...data,
+            id: String(data.id || doc.id),
+            uploadedPhotos: this.normalizePhotoList(data.uploadedPhotos)
+        };
+    },
+
+    async loadCloudBatches() {
+        const collection = this.getBatchesCollection();
+        const uid = this.data.currentUser?.uid;
+        const email = this.normalizeEmail(this.data.currentUser?.email || '');
+        if (!collection || !uid) return [];
+
+        const requests = [collection.where('ownerUid', '==', uid).get()];
+        if (email) requests.push(collection.where('collaboratorEmails', 'array-contains', email).get());
+        const snapshots = await Promise.all(requests);
+        const docMap = new Map();
+        snapshots.forEach((snapshot) => {
+            snapshot.forEach((doc) => docMap.set(doc.id, doc));
+        });
+
+        const batches = await Promise.all(Array.from(docMap.values()).map(async (doc) => {
+            const batch = this.normalizeCloudBatch(doc);
+            const recordsCollection = this.getRecordsCollection(batch);
+            if (recordsCollection) {
+                const recordsSnap = await recordsCollection.get();
+                batch.records = recordsSnap.docs
+                    .map((recordDoc) => this.normalizeCloudRecord(recordDoc))
+                    .sort((a, b) => new Date(a.date) - new Date(b.date));
+            }
+            return batch;
+        }));
+
+        return batches.sort((a, b) => String(b.startDate || '').localeCompare(String(a.startDate || '')));
+    },
+
+    async upsertBatchToCloud(batch, options = {}) {
+        const collection = this.getBatchesCollection();
+        if (!collection || !batch || !this.data.currentUser?.uid) return batch;
+        const payload = this.buildCloudBatchPayload(batch, options);
+        if (batch.cloudId) {
+            await collection.doc(String(batch.cloudId)).set(payload, { merge: true });
+        } else {
+            const ref = collection.doc();
+            await ref.set(payload, { merge: true });
+            batch.cloudId = ref.id;
+        }
+        return batch;
+    },
+
+    async upsertDailyRecordToCloud(batch, record) {
+        const recordsCollection = this.getRecordsCollection(batch);
+        if (!recordsCollection || !record?.id) return;
+        await recordsCollection.doc(String(record.id)).set(this.buildCloudRecordPayload(record), { merge: true });
+    },
+
+    async deleteDailyRecordFromCloud(batch, recordId, removedPhotoPaths = []) {
+        const recordsCollection = this.getRecordsCollection(batch);
+        if (!recordsCollection || recordId == null) return;
+        await recordsCollection.doc(String(recordId)).delete();
+        await this.deleteStorageFiles(removedPhotoPaths);
+    },
+
+    async deleteBatchFromCloud(batch) {
+        if (!firestoreDb || !batch?.cloudId) return;
+        const recordsCollection = this.getRecordsCollection(batch);
+        const photoPaths = [];
+        (Array.isArray(batch?.records) ? batch.records : []).forEach((record) => {
+            photoPaths.push(...this.getPhotoStoragePaths(record?.uploadedPhotos || []));
+        });
+        photoPaths.push(...this.getPhotoStoragePaths(batch?.finalAssessment?.finalCompostPhotos || []));
+        if (recordsCollection) {
+            const recordsSnap = await recordsCollection.get();
+            await Promise.all(recordsSnap.docs.map((doc) => doc.ref.delete()));
+        }
+        await firestoreDb.collection('batches').doc(String(batch.cloudId)).delete();
+        await this.deleteStorageFiles(photoPaths);
+    },
+
+    getBatchMeasurementSettings(batch) {
+        const raw = (batch && batch.measurementSettings) ? batch.measurementSettings : {};
+        const inputMethod = (raw && raw.inputMethod) ? String(raw.inputMethod) : 'weight';
+        const normalizedMethod = ['weight', 'volume', 'other'].includes(inputMethod) ? inputMethod : 'weight';
+
+        if (normalizedMethod === 'volume') {
+            const bucketSizeL = (raw && raw.bucketSizeL != null && !isNaN(raw.bucketSizeL)) ? parseFloat(raw.bucketSizeL) : 2;
+            const bucketConversionEnabled = raw && raw.bucketConversionEnabled != null ? !!raw.bucketConversionEnabled : true;
+            return {
+                inputMethod: 'volume',
+                unitName: 'L',
+                bucketSizeL,
+                bucketConversionEnabled,
+                customUnitName: ''
+            };
+        }
+
+        if (normalizedMethod === 'other') {
+            const customUnitName = (raw && raw.customUnitName) ? String(raw.customUnitName).trim() : '';
+            return {
+                inputMethod: 'other',
+                unitName: customUnitName || 'Unit',
+                bucketSizeL: null,
+                bucketConversionEnabled: false,
+                customUnitName
+            };
+        }
+
+        return {
+            inputMethod: 'weight',
+            unitName: 'kg',
+            bucketSizeL: null,
+            bucketConversionEnabled: false,
+            customUnitName: ''
+        };
+    },
+
+    getBatchInputUnitName(batch) {
+        const settings = this.getBatchMeasurementSettings(batch);
+        return settings.unitName || 'kg';
+    },
+
+    getBatchCalculationSettings(batch) {
+        const raw = batch?.settings || {};
+        const useCustom = !!raw.useCustomConversionRate;
+        const storedRate = raw.compostConversionRate != null ? parseFloat(raw.compostConversionRate) : null;
+        const compostConversionRate = (storedRate != null && !isNaN(storedRate) && storedRate >= 0)
+            ? storedRate
+            : 0.36;
+        return {
+            useCustomConversionRate: useCustom,
+            compostConversionRate
+        };
+    },
+
+    calculateTotalMaterialInput(batch) {
+        return this.calculateInitialStockAmount(batch) + this.calculateTotalInput(batch) + this.calculateTotalWaterAdded(batch);
+    },
+
+    calculateEstimatedCompostOutput(batch) {
+        const settings = this.getBatchCalculationSettings(batch);
+        return this.calculateTotalMaterialInput(batch) * settings.compostConversionRate;
+    },
+
+    getICTAMonitoringState(record) {
+        const process = record?.process || {};
+        const observation = record?.observation || {};
+        const monitoring = record?.monitoring || {};
+
+        const mapOdourFromObservation = () => {
+            if (monitoring.odourLevel) return monitoring.odourLevel;
+            if (observation.odour === 'Strong') return 'greater_than_5m';
+            if (observation.odour === 'Slight') return 'between_1_and_5m';
+            return 'no_odour';
+        };
+
+        const mapLeachateFromObservation = () => {
+            if (monitoring.leachateObserved) return monitoring.leachateObserved;
+            if (observation.leachate === 'Yes') return 'yes';
+            if (observation.leachate === 'No') return 'no';
+            return 'not_assessed';
+        };
+
+        const quantitativeMoisture = monitoring.moistureValue != null
+            ? monitoring.moistureValue
+            : (process.moisture != null ? process.moisture : null);
+
+        return {
+            ambientTemperature: monitoring.ambientTemperature != null ? monitoring.ambientTemperature : (process.ambient != null ? process.ambient : null),
+            coreTemperature: monitoring.coreTemperature != null ? monitoring.coreTemperature : (process.core != null ? process.core : null),
+            transitionTemperature: monitoring.transitionTemperature != null ? monitoring.transitionTemperature : (process.transition != null ? process.transition : null),
+            outerTemperature: monitoring.outerTemperature != null ? monitoring.outerTemperature : (process.outer != null ? process.outer : null),
+            moistureAssessmentType: monitoring.moistureAssessmentType || (quantitativeMoisture != null ? 'quantitative' : 'qualitative'),
+            moistureValue: quantitativeMoisture,
+            moistureQualitative: monitoring.moistureQualitative || '',
+            odourLevel: mapOdourFromObservation(),
+            leachateObserved: mapLeachateFromObservation()
+        };
+    },
+
+    getModuleToggleLabel(label, isCompleted) {
+        return isCompleted ? `☑ ${label}` : `☐ ${label} (Click to expand)`;
+    },
+
+    syncModuleToggleText(textEl, label) {
+        if (!textEl) return;
+        const isCompleted = textEl.dataset.completed === 'true';
+        textEl.textContent = this.getModuleToggleLabel(label, isCompleted);
+    },
+
+    hasMonitoringStateContent(monitoring) {
+        if (!monitoring) return false;
+        return [
+            monitoring.ambientTemperature,
+            monitoring.coreTemperature,
+            monitoring.transitionTemperature,
+            monitoring.outerTemperature,
+            monitoring.moistureValue
+        ].some(value => value != null && value !== '' && !isNaN(value))
+            || !!monitoring.moistureQualitative
+            || (monitoring.odourLevel && monitoring.odourLevel !== 'no_odour')
+            || (monitoring.leachateObserved && monitoring.leachateObserved !== 'not_assessed');
+    },
+
+    hasMaintenanceStateContent(maintenance) {
+        if (!maintenance) return false;
+        const numericValues = [
+            maintenance.totalFoodWaste,
+            maintenance.regularStructuralMaterial,
+            maintenance.additionalOrganicMaterial,
+            maintenance.additionalStructuralMaterial,
+            maintenance.totalAdditionalInput,
+            maintenance.totalOrganicWaste,
+            maintenance.totalStructuralMaterial,
+            maintenance.totalOrganicInput,
+            maintenance.foodWasteCocina,
+            maintenance.foodWastePlanta0,
+            maintenance.foodWastePlanta1,
+            maintenance.foodWastePlanta3,
+            maintenance.woodFusta,
+            maintenance.woodChips
+        ];
+        if (numericValues.some(value => value != null && !isNaN(value) && Number(value) > 0)) return true;
+        const foodRows = Array.isArray(maintenance.foodWasteSources) ? maintenance.foodWasteSources : [];
+        if (foodRows.some(row => (row?.source || '').trim() || (row?.type || '').trim() || (row?.otherType || '').trim() || Number(row?.amount || 0) > 0)) return true;
+        const structRows = Array.isArray(maintenance.structuralMaterials) ? maintenance.structuralMaterials : [];
+        if (structRows.some(row => (row?.type || '').trim() || (row?.otherType || '').trim() || Number(row?.amount || 0) > 0)) return true;
+        const additionalRows = Array.isArray(maintenance.additionalInputs) ? maintenance.additionalInputs : [];
+        return additionalRows.some(row => (row?.source || '').trim() || (row?.description || '').trim() || Number(row?.amount || 0) > 0 || ((row?.type || '') !== 'organic' && (row?.type || '') !== ''));
+    },
+
+    hasActionTakenContent(action) {
+        if (!action) return false;
+        return !!(
+            action.actionTurning ||
+            action.actionMixing ||
+            action.actionAddedWater ||
+            action.actionRemovedImpurities ||
+            action.actionOther ||
+            (action.waterAddedAmount != null && Number(action.waterAddedAmount) > 0) ||
+            (action.removedImpuritiesDescription || '').trim() ||
+            (action.otherActionDescription || '').trim()
+        );
+    },
+
+    hasPhotosContent(photos) {
+        return Array.isArray(photos) && photos.length > 0;
+    },
+
+    hasNotesContent(notes) {
+        return !!String(notes || '').trim();
+    },
+
+    renderMonitoringPlaceholder(label, compact = false) {
+        return `
+            <div style="margin-top: ${compact ? '0' : '8px'}; padding: ${compact ? '22px 14px' : '18px'}; border: 2px dashed #C8E6C9; border-radius: 10px; background: #FAFFFA; color: var(--gray); text-align: center; font-size: ${compact ? '0.85rem' : '0.9rem'};">
+                Placeholder image: ${label}
+            </div>
+        `;
+    },
+
+    renderMaintenanceSummaryInfoButton(title, description) {
+        const safeTitle = String(title || '').replace(/'/g, "\\'");
+        const safeDescription = String(description || '').replace(/'/g, "\\'");
+        return `<button type="button" class="maintenance-summary-info-btn" onclick="event.stopPropagation(); app.showMaintenanceSummaryInfo('${safeTitle}', '${safeDescription}')">ⓘ</button>`;
+    },
+
+    renderMoistureGuideImage(kind, compact = false) {
+        const srcMap = {
+            dry: 'assets/moisture-guides/dry.jpg',
+            optimal: 'assets/moisture-guides/optimal.jpg',
+            wet: 'assets/moisture-guides/wet.jpg'
+        };
+        const labelMap = {
+            dry: 'Dry moisture assessment',
+            optimal: 'Optimal moisture assessment',
+            wet: 'Wet moisture assessment'
+        };
+        const src = srcMap[kind] || '';
+        const label = labelMap[kind] || 'Moisture assessment';
+        if (!src) return this.renderMonitoringPlaceholder(label, compact);
+        return `
+            <div class="moisture-guide-illustration">
+                <img class="moisture-guide-image" src="${src}" alt="${label}"
+                    onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">
+                <div style="display:none;">${this.renderMonitoringPlaceholder(label, compact)}</div>
+            </div>
+        `;
+    },
+
+    renderICTAMonitoringModule(monitoring) {
+        const moistureType = monitoring.moistureAssessmentType || 'quantitative';
+        const isQuantitative = moistureType === 'quantitative';
+        const odourLevel = monitoring.odourLevel || 'no_odour';
+        const leachateObserved = monitoring.leachateObserved || 'not_assessed';
+        const isCompleted = this.hasMonitoringStateContent(monitoring);
+
+        return `
+            <div class="card">
+                <div style="display: flex; align-items: center; justify-content: space-between; cursor: pointer;" onclick="app.toggleICTAMonitoringModule()">
+                    <h2 class="card-title module-title process" id="monitoringModuleToggleText" data-completed="${isCompleted ? 'true' : 'false'}" style="margin: 0;">${this.getModuleToggleLabel('Monitoring Module', isCompleted)}</h2>
+                    <span id="monitoringModuleToggleIcon" style="color: var(--gray); font-weight: 700;">▸</span>
+                </div>
+
+                <div id="monitoringModuleContent" style="display: none; margin-top: 20px;">
+                    <div class="module" style="background: #F4FBF4; border-color: #C8E6C9;">
+                        <h3 class="module-title process">Temperature Monitoring</h3>
+                        <div class="monitoring-temperature-ambient">
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label class="form-label required">Ambient Temperature (°C)</label>
+                                <input type="number" class="form-input" id="ambientTemperature" step="any" value="${monitoring.ambientTemperature != null ? monitoring.ambientTemperature : ''}">
+                            </div>
+                        </div>
+                        <div class="monitoring-temperature-grid">
+                            <div class="monitoring-temperature-card">
+                                <label class="form-label" style="margin-bottom: 6px;">Core Temperature (°C)</label>
+                                <button type="button" class="btn btn-secondary monitoring-help-btn" onclick="event.stopPropagation(); app.showTemperatureGuide('core')">ⓘ How to Measure</button>
+                                <input type="number" class="form-input" id="coreTemperature" step="any" value="${monitoring.coreTemperature != null ? monitoring.coreTemperature : ''}">
+                            </div>
+                            <div class="monitoring-temperature-card">
+                                <label class="form-label required" style="margin-bottom: 6px;">Transition Temperature (°C)</label>
+                                <button type="button" class="btn btn-secondary monitoring-help-btn" onclick="event.stopPropagation(); app.showTemperatureGuide('transition')">ⓘ How to Measure</button>
+                                <input type="number" class="form-input" id="transitionTemperature" step="any" value="${monitoring.transitionTemperature != null ? monitoring.transitionTemperature : ''}">
+                            </div>
+                            <div class="monitoring-temperature-card">
+                                <label class="form-label required" style="margin-bottom: 6px;">Outer Temperature (°C)</label>
+                                <button type="button" class="btn btn-secondary monitoring-help-btn" onclick="event.stopPropagation(); app.showTemperatureGuide('outer')">ⓘ How to Measure</button>
+                                <input type="number" class="form-input" id="outerTemperature" step="any" value="${monitoring.outerTemperature != null ? monitoring.outerTemperature : ''}">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="module" style="background: #FFFDF4; border-color: #FFE082;">
+                        <h3 class="module-title" style="color: #F57C00;">Moisture Assessment</h3>
+                        <div class="radio-group" style="margin-bottom: 15px;">
+                            <label class="radio-item">
+                                <input type="radio" name="moistureAssessmentType" value="quantitative" ${isQuantitative ? 'checked' : ''} onchange="app.updateICTAMoistureAssessmentVisibility()">
+                                Quantitative
+                            </label>
+                            <label class="radio-item">
+                                <input type="radio" name="moistureAssessmentType" value="qualitative" ${!isQuantitative ? 'checked' : ''} onchange="app.updateICTAMoistureAssessmentVisibility()">
+                                Qualitative
+                            </label>
+                        </div>
+
+                        <div id="moistureQuantitativeSection" style="${isQuantitative ? '' : 'display:none;'}">
+                            <div class="form-group">
+                                <label class="form-label">Moisture (%)</label>
+                                <input type="number" class="form-input" id="moistureValue" step="any" value="${monitoring.moistureValue != null ? monitoring.moistureValue : ''}">
+                            </div>
+                        </div>
+
+                        <div id="moistureQualitativeSection" style="${!isQuantitative ? '' : 'display:none;'}">
+                            <div style="margin-bottom: 12px; color: var(--gray);">Take a handful of compost and squeeze firmly.</div>
+                            <div class="moisture-card-grid">
+                                <label class="moisture-card">
+                                    <input type="radio" name="moistureQualitative" value="dry" ${monitoring.moistureQualitative === 'dry' ? 'checked' : ''}>
+                                    <div class="moisture-card-content">
+                                        <div class="moisture-card-image">${this.renderMoistureGuideImage('dry', true)}</div>
+                                        <div class="moisture-card-title">Dry</div>
+                                        <div class="moisture-card-desc">No shape remains after squeezing</div>
+                                    </div>
+                                </label>
+                                <label class="moisture-card">
+                                    <input type="radio" name="moistureQualitative" value="optimal" ${monitoring.moistureQualitative === 'optimal' ? 'checked' : ''}>
+                                    <div class="moisture-card-content">
+                                        <div class="moisture-card-image">${this.renderMoistureGuideImage('optimal', true)}</div>
+                                        <div class="moisture-card-title">Optimal</div>
+                                        <div class="moisture-card-desc">Keeps shape and releases 1–2 drops</div>
+                                    </div>
+                                </label>
+                                <label class="moisture-card">
+                                    <input type="radio" name="moistureQualitative" value="wet" ${monitoring.moistureQualitative === 'wet' ? 'checked' : ''}>
+                                    <div class="moisture-card-content">
+                                        <div class="moisture-card-image">${this.renderMoistureGuideImage('wet', true)}</div>
+                                        <div class="moisture-card-title">Wet</div>
+                                        <div class="moisture-card-desc">Water flows out when squeezed</div>
+                                    </div>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="module" style="background: #F3F8FF; border-color: #BBDEFB;">
+                        <h3 class="module-title" style="color: #1976D2;">Odour Assessment <button type="button" class="btn btn-secondary" style="padding: 4px 10px; font-size: 0.8rem;" onclick="event.stopPropagation(); app.showOdourGuide()">ⓘ Odour Guide</button></h3>
+                        <div class="radio-group" style="flex-direction: column; align-items: flex-start;">
+                            <label class="radio-item">
+                                <input type="radio" name="odourLevel" value="no_odour" ${odourLevel === 'no_odour' ? 'checked' : ''}>
+                                No odour
+                            </label>
+                            <label class="radio-item">
+                                <input type="radio" name="odourLevel" value="less_than_1m" ${odourLevel === 'less_than_1m' ? 'checked' : ''}>
+                                Detected &lt;1 m
+                            </label>
+                            <label class="radio-item">
+                                <input type="radio" name="odourLevel" value="between_1_and_5m" ${odourLevel === 'between_1_and_5m' ? 'checked' : ''}>
+                                Detected 1–5 m
+                            </label>
+                            <label class="radio-item">
+                                <input type="radio" name="odourLevel" value="greater_than_5m" ${odourLevel === 'greater_than_5m' ? 'checked' : ''}>
+                                Detected &gt;5 m
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="module" style="background: #FFF8F8; border-color: #FFCDD2;">
+                        <h3 class="module-title" style="color: #C62828;">Leachate Assessment</h3>
+                        <div class="form-group">
+                            <label class="form-label">Leachate Observed</label>
+                            <div class="radio-group">
+                                <label class="radio-item">
+                                    <input type="radio" name="leachateObserved" value="yes" ${leachateObserved === 'yes' ? 'checked' : ''}>
+                                    Yes
+                                </label>
+                                <label class="radio-item">
+                                    <input type="radio" name="leachateObserved" value="no" ${leachateObserved === 'no' ? 'checked' : ''}>
+                                    No
+                                </label>
+                                <label class="radio-item">
+                                    <input type="radio" name="leachateObserved" value="not_assessed" ${leachateObserved === 'not_assessed' ? 'checked' : ''}>
+                                    Not Assessed
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+    },
+
+    renderNonICTAMonitoringModule(monitoring) {
+        const moistureType = monitoring.moistureAssessmentType || 'quantitative';
+        const isQuantitative = moistureType === 'quantitative';
+        const odourLevel = monitoring.odourLevel || 'no_odour';
+        const leachateObserved = monitoring.leachateObserved || 'not_assessed';
+        const isCompleted = this.hasMonitoringStateContent(monitoring);
+
+        return `
+            <div class="card">
+                <div style="display: flex; align-items: center; justify-content: space-between; cursor: pointer;" onclick="app.toggleICTAMonitoringModule()">
+                    <h2 class="card-title module-title process" id="monitoringModuleToggleText" data-completed="${isCompleted ? 'true' : 'false'}" style="margin: 0;">${this.getModuleToggleLabel('Monitoring Module', isCompleted)}</h2>
+                    <span id="monitoringModuleToggleIcon" style="color: var(--gray); font-weight: 700;">▸</span>
+                </div>
+
+                <div id="monitoringModuleContent" style="display: none; margin-top: 20px;">
+                    <div class="module" style="background: #F4FBF4; border-color: #C8E6C9;">
+                        <h3 class="module-title process">Temperature Monitoring</h3>
+                        <div class="monitoring-temperature-grid" style="grid-template-columns: minmax(0, 1fr);">
+                            <div class="monitoring-temperature-card">
+                                <label class="form-label" style="margin-bottom: 6px;">Core Temperature (°C)</label>
+                                <button type="button" class="btn btn-secondary monitoring-help-btn" onclick="event.stopPropagation(); app.showTemperatureGuide('core')">ⓘ How to Measure</button>
+                                <input type="number" class="form-input" id="coreTemperature" step="any" value="${monitoring.coreTemperature != null ? monitoring.coreTemperature : ''}">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="module" style="background: #FFFDF4; border-color: #FFE082;">
+                        <h3 class="module-title" style="color: #F57C00;">Moisture Assessment</h3>
+                        <div class="radio-group" style="margin-bottom: 15px;">
+                            <label class="radio-item">
+                                <input type="radio" name="moistureAssessmentType" value="quantitative" ${isQuantitative ? 'checked' : ''} onchange="app.updateICTAMoistureAssessmentVisibility()">
+                                Quantitative
+                            </label>
+                            <label class="radio-item">
+                                <input type="radio" name="moistureAssessmentType" value="qualitative" ${!isQuantitative ? 'checked' : ''} onchange="app.updateICTAMoistureAssessmentVisibility()">
+                                Qualitative
+                            </label>
+                        </div>
+
+                        <div id="moistureQuantitativeSection" style="${isQuantitative ? '' : 'display:none;'}">
+                            <div class="form-group">
+                                <label class="form-label">Moisture (%)</label>
+                                <input type="number" class="form-input" id="moistureValue" step="any" value="${monitoring.moistureValue != null ? monitoring.moistureValue : ''}">
+                            </div>
+                        </div>
+
+                        <div id="moistureQualitativeSection" style="${!isQuantitative ? '' : 'display:none;'}">
+                            <div style="margin-bottom: 12px; color: var(--gray);">Take a handful of compost and squeeze firmly.</div>
+                            <div class="moisture-card-grid">
+                                <label class="moisture-card">
+                                    <input type="radio" name="moistureQualitative" value="dry" ${monitoring.moistureQualitative === 'dry' ? 'checked' : ''}>
+                                    <div class="moisture-card-content">
+                                        <div class="moisture-card-image">${this.renderMoistureGuideImage('dry', true)}</div>
+                                        <div class="moisture-card-title">Dry</div>
+                                        <div class="moisture-card-desc">No shape remains after squeezing</div>
+                                    </div>
+                                </label>
+                                <label class="moisture-card">
+                                    <input type="radio" name="moistureQualitative" value="optimal" ${monitoring.moistureQualitative === 'optimal' ? 'checked' : ''}>
+                                    <div class="moisture-card-content">
+                                        <div class="moisture-card-image">${this.renderMoistureGuideImage('optimal', true)}</div>
+                                        <div class="moisture-card-title">Optimal</div>
+                                        <div class="moisture-card-desc">Keeps shape and releases 1–2 drops</div>
+                                    </div>
+                                </label>
+                                <label class="moisture-card">
+                                    <input type="radio" name="moistureQualitative" value="wet" ${monitoring.moistureQualitative === 'wet' ? 'checked' : ''}>
+                                    <div class="moisture-card-content">
+                                        <div class="moisture-card-image">${this.renderMoistureGuideImage('wet', true)}</div>
+                                        <div class="moisture-card-title">Wet</div>
+                                        <div class="moisture-card-desc">Water flows out when squeezed</div>
+                                    </div>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="module" style="background: #F3F8FF; border-color: #BBDEFB;">
+                        <h3 class="module-title" style="color: #1976D2;">Odour Assessment <button type="button" class="btn btn-secondary" style="padding: 4px 10px; font-size: 0.8rem;" onclick="event.stopPropagation(); app.showOdourGuide()">ⓘ Odour Guide</button></h3>
+                        <div class="radio-group" style="flex-direction: column; align-items: flex-start;">
+                            <label class="radio-item">
+                                <input type="radio" name="odourLevel" value="no_odour" ${odourLevel === 'no_odour' ? 'checked' : ''}>
+                                No odour
+                            </label>
+                            <label class="radio-item">
+                                <input type="radio" name="odourLevel" value="less_than_1m" ${odourLevel === 'less_than_1m' ? 'checked' : ''}>
+                                Detected &lt;1 m
+                            </label>
+                            <label class="radio-item">
+                                <input type="radio" name="odourLevel" value="between_1_and_5m" ${odourLevel === 'between_1_and_5m' ? 'checked' : ''}>
+                                Detected 1–5 m
+                            </label>
+                            <label class="radio-item">
+                                <input type="radio" name="odourLevel" value="greater_than_5m" ${odourLevel === 'greater_than_5m' ? 'checked' : ''}>
+                                Detected &gt;5 m
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="module" style="background: #FFF8F8; border-color: #FFCDD2;">
+                        <h3 class="module-title" style="color: #C62828;">Leachate Assessment</h3>
+                        <div class="form-group">
+                            <label class="form-label">Leachate Observed</label>
+                            <div class="radio-group">
+                                <label class="radio-item">
+                                    <input type="radio" name="leachateObserved" value="yes" ${leachateObserved === 'yes' ? 'checked' : ''}>
+                                    Yes
+                                </label>
+                                <label class="radio-item">
+                                    <input type="radio" name="leachateObserved" value="no" ${leachateObserved === 'no' ? 'checked' : ''}>
+                                    No
+                                </label>
+                                <label class="radio-item">
+                                    <input type="radio" name="leachateObserved" value="not_assessed" ${leachateObserved === 'not_assessed' ? 'checked' : ''}>
+                                    Not Assessed
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+    },
+
+    getICTAMaintenanceState(record, batch) {
+        const input = record?.input || {};
+        const maintenance = record?.maintenance || {};
+        const batchUnit = batch ? this.getBatchInputUnitName(batch) : 'kg';
+        const batchMethod = batch ? (this.getBatchMeasurementSettings(batch)?.inputMethod || '') : '';
+
+        const foodWasteCocina = (maintenance.foodWasteCocina != null ? maintenance.foodWasteCocina : input.cocina) || 0;
+        const foodWastePlanta0 = (maintenance.foodWastePlanta0 != null ? maintenance.foodWastePlanta0 : input.planta0) || 0;
+        const foodWastePlanta1 = (maintenance.foodWastePlanta1 != null ? maintenance.foodWastePlanta1 : input.planta1) || 0;
+        const foodWastePlanta3 = (maintenance.foodWastePlanta3 != null ? maintenance.foodWastePlanta3 : input.planta3) || 0;
+        const woodFusta = (maintenance.woodFusta != null ? maintenance.woodFusta : input.woodFusta) || 0;
+        const woodChips = (maintenance.woodChips != null ? maintenance.woodChips : input.woodChips) || 0;
+        const breakdown = this.calculateRecordMaterialBreakdown({
+            ...record,
+            input,
+            maintenance: {
+                ...maintenance,
+                foodWasteCocina,
+                foodWastePlanta0,
+                foodWastePlanta1,
+                foodWastePlanta3,
+                woodFusta,
+                woodChips
+            }
+        });
+        const foodStructuralRatio = (batchMethod === 'volume')
+            ? this.simplifyRatio(breakdown.totalOrganicWaste, breakdown.totalStructuralMaterial)
+            : '';
+
+        return {
+            batchUnit,
+            batchMethod,
+            foodWasteCocina,
+            foodWastePlanta0,
+            foodWastePlanta1,
+            foodWastePlanta3,
+            totalFoodWaste: breakdown.regularOrganicWaste,
+            woodFusta,
+            woodChips,
+            regularStructuralMaterial: breakdown.regularStructuralMaterial,
+            totalStructuralMaterial: breakdown.totalStructuralMaterial,
+            additionalInputs: breakdown.additionalInputs,
+            additionalOrganicMaterial: breakdown.additionalOrganicMaterial,
+            additionalStructuralMaterial: breakdown.additionalStructuralMaterial,
+            totalAdditionalInput: breakdown.totalAdditionalInput,
+            totalOrganicWaste: breakdown.totalOrganicWaste,
+            totalOrganicInput: breakdown.totalOrganicInput,
+            foodStructuralRatio
+        };
+    },
+
+    simplifyRatio(a, b) {
+        const x = (a != null && !isNaN(a)) ? (parseFloat(a) || 0) : 0;
+        const y = (b != null && !isNaN(b)) ? (parseFloat(b) || 0) : 0;
+        if (x <= 0 || y <= 0) return '—';
+
+        const scale = 1000;
+        const xi = Math.round(x * scale);
+        const yi = Math.round(y * scale);
+        const gcd = (m, n) => {
+            let a = Math.abs(m);
+            let b = Math.abs(n);
+            while (b !== 0) {
+                const t = b;
+                b = a % b;
+                a = t;
+            }
+            return a || 1;
+        };
+        const g = gcd(xi, yi);
+        const left = Math.round(xi / g);
+        const right = Math.round(yi / g);
+        return `${left} : ${right}`;
+    },
+
+    renderICTAMaintenanceModule(batch, maintenance) {
+        const inputUnit = maintenance.batchUnit || this.getBatchInputUnitName(batch);
+        const isCompleted = this.hasMaintenanceStateContent(maintenance);
+        const additionalRows = Array.isArray(maintenance.additionalInputs) && maintenance.additionalInputs.length > 0
+            ? maintenance.additionalInputs
+            : [{ source: '', type: 'organic', description: '', amount: 0 }];
+
+        const sourceOptions = [
+            'Organic waste generated during events',
+            'Garden clean-up residues',
+            'Seasonal pruning residues',
+            'Research or experimental materials',
+            'Other occasional organic inputs'
+        ];
+
+        return `
+            <div class="card">
+                <div style="display: flex; align-items: center; justify-content: space-between; cursor: pointer;" onclick="app.toggleICTAMaintenanceModule()">
+                    <h2 class="card-title module-title maintenance" id="maintenanceModuleToggleText" data-completed="${isCompleted ? 'true' : 'false'}" style="margin: 0;">${this.getModuleToggleLabel('Maintenance Module', isCompleted)}</h2>
+                    <span id="maintenanceModuleToggleIcon" style="color: var(--gray); font-weight: 700;">▸</span>
+                </div>
+
+                <div id="maintenanceModuleContent" style="display: none; margin-top: 20px;">
+                    <div class="module" style="background: #F4FBF4; border-color: #C8E6C9;">
+                        <div class="maintenance-section-header">
+                            <h3 class="module-title maintenance" style="margin-bottom: 0;">Food Waste Input</h3>
+                            <div class="maintenance-helptext">ⓘ Regularly collected food waste from the community collection system.</div>
+                        </div>
+
+                        <div class="maintenance-table">
+                            <div class="maintenance-table-head">Food Waste Source</div>
+                            <div class="maintenance-table-head" style="text-align:right;">Amount (${inputUnit})</div>
+
+                            <div class="maintenance-table-cell">Cocina</div>
+                            <div class="maintenance-table-cell">
+                                <input type="number" class="form-input maintenance-amount" id="foodWasteCocina" step="any" value="${maintenance.foodWasteCocina != null && maintenance.foodWasteCocina !== 0 ? maintenance.foodWasteCocina : ''}" placeholder="Enter number" oninput="app.updateMaintenanceTotals()">
+                            </div>
+
+                            <div class="maintenance-table-cell">Planta 0</div>
+                            <div class="maintenance-table-cell">
+                                <input type="number" class="form-input maintenance-amount" id="foodWastePlanta0" step="any" value="${maintenance.foodWastePlanta0 != null && maintenance.foodWastePlanta0 !== 0 ? maintenance.foodWastePlanta0 : ''}" placeholder="Enter number" oninput="app.updateMaintenanceTotals()">
+                            </div>
+
+                            <div class="maintenance-table-cell">Planta 1</div>
+                            <div class="maintenance-table-cell">
+                                <input type="number" class="form-input maintenance-amount" id="foodWastePlanta1" step="any" value="${maintenance.foodWastePlanta1 != null && maintenance.foodWastePlanta1 !== 0 ? maintenance.foodWastePlanta1 : ''}" placeholder="Enter number" oninput="app.updateMaintenanceTotals()">
+                            </div>
+
+                            <div class="maintenance-table-cell">Planta 3</div>
+                            <div class="maintenance-table-cell">
+                                <input type="number" class="form-input maintenance-amount" id="foodWastePlanta3" step="any" value="${maintenance.foodWastePlanta3 != null && maintenance.foodWastePlanta3 !== 0 ? maintenance.foodWastePlanta3 : ''}" placeholder="Enter number" oninput="app.updateMaintenanceTotals()">
+                            </div>
+                        </div>
+
+                        <div class="field-section" style="margin-top: 12px;">
+                            <label class="field-section-title">Regular Organic Waste: <span class="auto-calc" id="regularOrganicWaste">${this.formatNumber(maintenance.totalFoodWaste || 0, 3)}</span> ${inputUnit}</label>
+                        </div>
+                    </div>
+
+                    <div class="module" style="background: #FFFDF4; border-color: #FFE082;">
+                        <h3 class="module-title" style="color: #F57C00;">Structural Material Input</h3>
+                        <div class="maintenance-table">
+                            <div class="maintenance-table-head">Structural Material Type</div>
+                            <div class="maintenance-table-head" style="text-align:right;">Amount (${inputUnit})</div>
+
+                            <div class="maintenance-table-cell">Wood Fusta</div>
+                            <div class="maintenance-table-cell">
+                                <input type="number" class="form-input maintenance-amount" id="woodFusta" step="any" value="${maintenance.woodFusta != null && maintenance.woodFusta !== 0 ? maintenance.woodFusta : ''}" placeholder="Enter number" oninput="app.updateMaintenanceTotals()">
+                            </div>
+
+                            <div class="maintenance-table-cell">Wood Chips</div>
+                            <div class="maintenance-table-cell">
+                                <input type="number" class="form-input maintenance-amount" id="woodChips" step="any" value="${maintenance.woodChips != null && maintenance.woodChips !== 0 ? maintenance.woodChips : ''}" placeholder="Enter number" oninput="app.updateMaintenanceTotals()">
+                            </div>
+                        </div>
+                        <div class="field-section" style="margin-top: 12px;">
+                            <label class="field-section-title">Regular Structural Material: <span class="auto-calc" id="regularStructuralMaterial">${this.formatNumber(maintenance.regularStructuralMaterial || 0, 3)}</span> ${inputUnit}</label>
+                        </div>
+                    </div>
+
+                    <div class="module" style="background: #F3F8FF; border-color: #BBDEFB;">
+                        <div style="display:flex; align-items:center; justify-content: space-between; cursor:pointer;" onclick="app.toggleICTAOtherOrganicInput()">
+                            <h3 class="module-title" style="color: #1976D2; margin: 0;" id="otherOrganicToggleText">☐ Other Organic Input (Optional)</h3>
+                            <span id="otherOrganicToggleIcon" style="color: var(--gray); font-weight: 700;">▸</span>
+                        </div>
+                        <div class="maintenance-helptext" style="margin-top: 8px;">ⓘ Occasional organic materials that are not part of the regular collection system.</div>
+
+                        <div id="otherOrganicContent" style="display:none; margin-top: 16px;">
+                            <div id="maintenanceAdditionalInputsList">
+                                ${additionalRows.map((row, idx) => `
+                                    <div class="maintenance-additional-row">
+                                        <div class="maintenance-additional-grid">
+                                            <div class="form-group">
+                                                <label class="form-label">Source</label>
+                                                <select class="form-input maintenance-additional-source" onchange="app.updateMaintenanceTotals()">
+                                                    <option value="">Select source...</option>
+                                                    ${sourceOptions.map(opt => `<option value="${opt.replace(/"/g, '&quot;')}" ${(row.source || '') === opt ? 'selected' : ''}>${opt}</option>`).join('')}
+                                                </select>
+                                            </div>
+                                            <div class="form-group">
+                                                <label class="form-label">Type</label>
+                                                <div class="radio-group" style="gap: 14px;">
+                                                    <label class="radio-item">
+                                                        <input type="radio" name="maintenanceAdditionalType_${idx}" value="organic" ${(row.type || 'organic') === 'organic' ? 'checked' : ''} onchange="app.updateMaintenanceTotals()">
+                                                        Organic Material
+                                                    </label>
+                                                    <label class="radio-item">
+                                                        <input type="radio" name="maintenanceAdditionalType_${idx}" value="structural" ${(row.type || '') === 'structural' ? 'checked' : ''} onchange="app.updateMaintenanceTotals()">
+                                                        Structural Material
+                                                    </label>
+                                                </div>
+                                            </div>
+                                            <div class="form-group">
+                                                <label class="form-label">Material Description</label>
+                                                <input type="text" class="form-input maintenance-additional-desc" value="${(row.description || '').replace(/"/g, '&quot;')}" oninput="app.updateMaintenanceTotals()">
+                                            </div>
+                                            <div class="form-group">
+                                                <label class="form-label">Amount (${inputUnit})</label>
+                                                <input type="number" class="form-input maintenance-additional-amount" step="any" value="${row.amount != null ? row.amount : ''}" oninput="app.updateMaintenanceTotals()">
+                                            </div>
+                                        </div>
+                                        <div style="display:flex; justify-content:flex-end; margin-top: 10px;">
+                                            <button type="button" class="btn btn-secondary" style="padding: 8px 12px;" onclick="app.removeMaintenanceAdditionalInputRow(this)">− Remove</button>
+                                        </div>
+                                    </div>
+                                `).join('')}
+                            </div>
+                            <button type="button" class="btn btn-secondary" style="padding: 8px 12px;" onclick="app.addMaintenanceAdditionalInputRow()">+ Add Additional Input</button>
+
+                            <div class="field-section" style="margin-top: 12px;">
+                                <div class="field-section-title">Additional Input Summary</div>
+                                <div class="maintenance-helptext" style="margin-top: 8px;">
+                                    Additional Organic Material: <span class="auto-calc" id="additionalOrganicMaterial">${this.formatNumber(maintenance.additionalOrganicMaterial || 0, 3)}</span> ${inputUnit}
+                                </div>
+                                <div class="maintenance-helptext" style="margin-top: 4px;">
+                                    Additional Structural Material: <span class="auto-calc" id="additionalStructuralMaterial">${this.formatNumber(maintenance.additionalStructuralMaterial || 0, 3)}</span> ${inputUnit}
+                                </div>
+                                <div class="maintenance-helptext" style="margin-top: 4px; font-weight: 700;">
+                                    Total Additional Input: <span class="auto-calc" id="totalAdditionalInput">${this.formatNumber(maintenance.totalAdditionalInput || 0, 3)}</span> ${inputUnit}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="maintenance-summary-card">
+                        <div class="maintenance-summary-value maintenance-summary-value-row">
+                            <span>Organic Waste: <span id="totalOrganicWaste">${this.formatNumber(maintenance.totalOrganicWaste || 0, 3)}</span> ${inputUnit}</span>
+                            ${this.renderMaintenanceSummaryInfoButton('Organic Waste', 'Regular Organic Waste + Additional Organic Material')}
+                        </div>
+                        <div class="maintenance-summary-value maintenance-summary-value-row" style="margin-top: 10px;">
+                            <span>Structural Material: <span id="totalStructuralMaterialOverall">${this.formatNumber(maintenance.totalStructuralMaterial || 0, 3)}</span> ${inputUnit}</span>
+                            ${this.renderMaintenanceSummaryInfoButton('Structural Material', 'Regular Structural Material + Additional Structural Material')}
+                        </div>
+                        <div class="maintenance-summary-value maintenance-summary-value-row" style="margin-top: 10px;">
+                            <span>Total Organic Input: <span id="totalOrganicInput">${this.formatNumber(maintenance.totalOrganicInput || 0, 3)}</span> ${inputUnit}</span>
+                            ${this.renderMaintenanceSummaryInfoButton('Total Organic Input', 'Organic Waste + Structural Material')}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+    },
+
+    getNonICTAMaintenanceState(record, batch) {
+        const input = record?.input || {};
+        const maintenance = record?.maintenance || {};
+        const inputUnit = batch ? this.getBatchInputUnitName(batch) : 'kg';
+
+        const foodWasteSources = Array.isArray(maintenance.foodWasteSources) && maintenance.foodWasteSources.length > 0
+            ? maintenance.foodWasteSources
+            : [];
+        const structuralMaterials = Array.isArray(maintenance.structuralMaterials) && maintenance.structuralMaterials.length > 0
+            ? maintenance.structuralMaterials
+            : (Array.isArray(input.structuringMaterials) ? input.structuringMaterials.map((m) => ({
+                type: m?.type || '',
+                otherType: '',
+                amount: (m?.kg != null && !isNaN(m.kg)) ? (parseFloat(m.kg) || 0) : 0
+            })) : []);
+
+        const ensureFoodRow = () => ({ source: '', type: '', otherType: '', amount: 0 });
+        const ensureStructuralRow = () => ({ type: '', otherType: '', amount: 0 });
+        const breakdown = this.calculateRecordMaterialBreakdown({
+            ...record,
+            input,
+            maintenance: {
+                ...maintenance,
+                foodWasteSources,
+                structuralMaterials
+            }
+        });
+
+        return {
+            batchUnit: inputUnit,
+            foodWasteSources: foodWasteSources.length > 0 ? foodWasteSources : [ensureFoodRow()],
+            structuralMaterials: structuralMaterials.length > 0 ? structuralMaterials : [ensureStructuralRow()],
+            additionalInputs: breakdown.additionalInputs.length > 0 ? breakdown.additionalInputs : [{ source: '', type: 'organic', description: '', amount: 0 }],
+            totalFoodWaste: breakdown.regularOrganicWaste,
+            regularStructuralMaterial: breakdown.regularStructuralMaterial,
+            additionalOrganicMaterial: breakdown.additionalOrganicMaterial,
+            additionalStructuralMaterial: breakdown.additionalStructuralMaterial,
+            totalAdditionalInput: breakdown.totalAdditionalInput,
+            totalOrganicWaste: breakdown.totalOrganicWaste,
+            totalStructuralMaterial: breakdown.totalStructuralMaterial,
+            totalOrganicInput: breakdown.totalOrganicInput
+        };
+    },
+
+    renderNonICTAMaintenanceModule(batch, maintenance) {
+        const inputUnit = maintenance.batchUnit || this.getBatchInputUnitName(batch);
+        const isCompleted = this.hasMaintenanceStateContent(maintenance);
+        const foodTypeOptions = [
+            'Fruit & Vegetable Waste',
+            'Cooked Food Waste',
+            'Coffee Grounds',
+            'Bread & Bakery Waste',
+            'Garden Waste',
+            'Mixed Organic Waste',
+            'Other'
+        ];
+        const structuralOptions = ['Wood Chips', 'Dry Leaves', 'Pruning Waste', 'Sawdust', 'Other'];
+        const additionalRows = Array.isArray(maintenance.additionalInputs) && maintenance.additionalInputs.length > 0
+            ? maintenance.additionalInputs
+            : [{ source: '', type: 'organic', description: '', amount: 0 }];
+        const sourceOptions = [
+            'Organic waste generated during events',
+            'Garden clean-up residues',
+            'Seasonal pruning residues',
+            'Research or experimental materials',
+            'Other occasional organic inputs'
+        ];
+
+        return `
+            <div class="card">
+                <div style="display: flex; align-items: center; justify-content: space-between; cursor: pointer;" onclick="app.toggleICTAMaintenanceModule()">
+                    <h2 class="card-title module-title maintenance" id="maintenanceModuleToggleText" data-completed="${isCompleted ? 'true' : 'false'}" style="margin: 0;">${this.getModuleToggleLabel('Maintenance Module', isCompleted)}</h2>
+                    <span id="maintenanceModuleToggleIcon" style="color: var(--gray); font-weight: 700;">▸</span>
+                </div>
+
+                <div id="maintenanceModuleContent" style="display: none; margin-top: 20px;">
+                    <div class="module" style="background: #F4FBF4; border-color: #C8E6C9;">
+                        <div class="maintenance-section-header">
+                            <h3 class="module-title maintenance" style="margin-bottom: 0;">Food Waste Input</h3>
+                            <div class="maintenance-helptext">ⓘ Add one or more food waste sources for this visit.</div>
+                        </div>
+
+                        <div class="nonicta-row-grid nonicta-food-head three">
+                            <div class="maintenance-table-head">Food Waste Source</div>
+                            <div class="maintenance-table-head">Type</div>
+                            <div class="maintenance-table-head" style="text-align:right;">Amount (${inputUnit})</div>
+                        </div>
+
+                        <div id="nonIctaFoodWasteRows">
+                            ${maintenance.foodWasteSources.map((row, idx) => {
+                                const source = String(row?.source || '').replace(/"/g, '&quot;');
+                                const type = String(row?.type || '');
+                                const otherType = String(row?.otherType || '').replace(/"/g, '&quot;');
+                                const amount = row?.amount != null ? row.amount : '';
+                                const showOther = type === 'Other';
+                                return `
+                                    <div class="nonicta-row nonicta-row-grid three" data-row-index="${idx}">
+                                        <div class="form-group" style="margin: 0;">
+                                            <input type="text" class="form-input nonicta-food-source" value="${source}" placeholder="e.g., Kitchen, Restaurant, Market" oninput="app.updateNonICTAMaintenanceTotals()">
+                                        </div>
+                                        <div class="form-group" style="margin: 0;">
+                                            <select class="form-input nonicta-food-type" onchange="app.updateNonICTAMaintenanceRowVisibility(); app.updateNonICTAMaintenanceTotals()">
+                                                <option value="">Select type...</option>
+                                                ${foodTypeOptions.map(opt => `<option value="${opt}" ${type === opt ? 'selected' : ''}>${opt}</option>`).join('')}
+                                            </select>
+                                            <input type="text" class="form-input nonicta-food-type-other" value="${otherType}" placeholder="Specify Type" style="margin-top: 8px; ${showOther ? '' : 'display:none;'}" oninput="app.updateNonICTAMaintenanceTotals()">
+                                        </div>
+                                        <div class="form-group" style="margin: 0;">
+                                            <input type="number" class="form-input nonicta-food-amount" step="any" value="${amount}" placeholder="Enter number" oninput="app.updateNonICTAMaintenanceTotals()">
+                                        </div>
+                                        <div class="nonicta-row-actions">
+                                            <button type="button" class="btn btn-secondary" style="padding: 8px 12px;" onclick="app.removeNonICTAFoodWasteRow(this)">− Remove</button>
+                                        </div>
+                                    </div>
+                                `;
+                            }).join('')}
+                        </div>
+
+                        <button type="button" class="btn btn-secondary" style="padding: 8px 12px; margin-top: 12px;" onclick="app.addNonICTAFoodWasteRow()">+ Add Source</button>
+
+                        <div class="field-section" style="margin-top: 12px;">
+                            <label class="field-section-title">Regular Organic Waste: <span class="auto-calc" id="regularOrganicWaste">${this.formatNumber(maintenance.totalFoodWaste || 0, 3)}</span> ${inputUnit}</label>
+                        </div>
+                    </div>
+
+                    <div class="module" style="background: #FFFDF4; border-color: #FFE082;">
+                        <h3 class="module-title" style="color: #F57C00;">Structural Material Input</h3>
+
+                        <div class="nonicta-row-grid nonicta-struct-head three">
+                            <div class="maintenance-table-head">Structural Material Type</div>
+                            <div class="maintenance-table-head">Specify (if Other)</div>
+                            <div class="maintenance-table-head" style="text-align:right;">Amount (${inputUnit})</div>
+                        </div>
+
+                        <div id="nonIctaStructuralRows">
+                            ${maintenance.structuralMaterials.map((row, idx) => {
+                                const type = String(row?.type || '');
+                                const otherType = String(row?.otherType || '').replace(/"/g, '&quot;');
+                                const amount = row?.amount != null ? row.amount : '';
+                                const showOther = type === 'Other';
+                                return `
+                                    <div class="nonicta-row nonicta-row-grid three" data-row-index="${idx}">
+                                        <div class="form-group" style="margin: 0;">
+                                            <select class="form-input nonicta-struct-type" onchange="app.updateNonICTAMaintenanceRowVisibility(); app.updateNonICTAMaintenanceTotals()">
+                                                <option value="">Select type...</option>
+                                                ${structuralOptions.map(opt => `<option value="${opt}" ${type === opt ? 'selected' : ''}>${opt}</option>`).join('')}
+                                            </select>
+                                        </div>
+                                        <div class="form-group" style="margin: 0;">
+                                            <input type="text" class="form-input nonicta-struct-other" value="${otherType}" placeholder="Specify Material" style="${showOther ? '' : 'display:none;'}" oninput="app.updateNonICTAMaintenanceTotals()">
+                                        </div>
+                                        <div class="form-group" style="margin: 0;">
+                                            <input type="number" class="form-input nonicta-struct-amount" step="any" value="${amount}" placeholder="Enter number" oninput="app.updateNonICTAMaintenanceTotals()">
+                                        </div>
+                                        <div class="nonicta-row-actions">
+                                            <button type="button" class="btn btn-secondary" style="padding: 8px 12px;" onclick="app.removeNonICTAStructuralRow(this)">− Remove</button>
+                                        </div>
+                                    </div>
+                                `;
+                            }).join('')}
+                        </div>
+
+                        <button type="button" class="btn btn-secondary" style="padding: 8px 12px; margin-top: 12px;" onclick="app.addNonICTAStructuralRow()">+ Add Structural Material</button>
+
+                        <div class="field-section" style="margin-top: 12px;">
+                            <label class="field-section-title">Regular Structural Material: <span class="auto-calc" id="regularStructuralMaterial">${this.formatNumber(maintenance.regularStructuralMaterial || 0, 3)}</span> ${inputUnit}</label>
+                        </div>
+                    </div>
+
+                    <div class="module" style="background: #F3F8FF; border-color: #BBDEFB;">
+                        <div style="display:flex; align-items:center; justify-content: space-between; cursor:pointer;" onclick="app.toggleICTAOtherOrganicInput()">
+                            <h3 class="module-title" style="color: #1976D2; margin: 0;" id="otherOrganicToggleText">☐ Other Organic Input (Optional)</h3>
+                            <span id="otherOrganicToggleIcon" style="color: var(--gray); font-weight: 700;">▸</span>
+                        </div>
+                        <div class="maintenance-helptext" style="margin-top: 8px;">ⓘ Occasional organic materials that are not part of the regular collection system.</div>
+
+                        <div id="otherOrganicContent" style="display:none; margin-top: 16px;">
+                            <div id="maintenanceAdditionalInputsList">
+                                ${additionalRows.map((row, idx) => `
+                                    <div class="maintenance-additional-row">
+                                        <div class="maintenance-additional-grid">
+                                            <div class="form-group">
+                                                <label class="form-label">Source</label>
+                                                <select class="form-input maintenance-additional-source" onchange="app.updateMaintenanceTotals()">
+                                                    <option value="">Select source...</option>
+                                                    ${sourceOptions.map(opt => `<option value="${opt.replace(/"/g, '&quot;')}" ${(row.source || '') === opt ? 'selected' : ''}>${opt}</option>`).join('')}
+                                                </select>
+                                            </div>
+                                            <div class="form-group">
+                                                <label class="form-label">Type</label>
+                                                <div class="radio-group" style="gap: 14px;">
+                                                    <label class="radio-item">
+                                                        <input type="radio" name="maintenanceAdditionalType_${idx}" value="organic" ${(row.type || 'organic') === 'organic' ? 'checked' : ''} onchange="app.updateMaintenanceTotals()">
+                                                        Organic Material
+                                                    </label>
+                                                    <label class="radio-item">
+                                                        <input type="radio" name="maintenanceAdditionalType_${idx}" value="structural" ${(row.type || '') === 'structural' ? 'checked' : ''} onchange="app.updateMaintenanceTotals()">
+                                                        Structural Material
+                                                    </label>
+                                                </div>
+                                            </div>
+                                            <div class="form-group">
+                                                <label class="form-label">Material Description</label>
+                                                <input type="text" class="form-input maintenance-additional-desc" value="${(row.description || '').replace(/"/g, '&quot;')}" oninput="app.updateMaintenanceTotals()">
+                                            </div>
+                                            <div class="form-group">
+                                                <label class="form-label">Amount (${inputUnit})</label>
+                                                <input type="number" class="form-input maintenance-additional-amount" step="any" value="${row.amount != null ? row.amount : ''}" oninput="app.updateMaintenanceTotals()">
+                                            </div>
+                                        </div>
+                                        <div style="display:flex; justify-content:flex-end; margin-top: 10px;">
+                                            <button type="button" class="btn btn-secondary" style="padding: 8px 12px;" onclick="app.removeMaintenanceAdditionalInputRow(this)">− Remove</button>
+                                        </div>
+                                    </div>
+                                `).join('')}
+                            </div>
+                            <button type="button" class="btn btn-secondary" style="padding: 8px 12px;" onclick="app.addMaintenanceAdditionalInputRow()">+ Add Additional Input</button>
+
+                            <div class="field-section" style="margin-top: 12px;">
+                                <div class="field-section-title">Additional Input Summary</div>
+                                <div class="maintenance-helptext" style="margin-top: 8px;">
+                                    Additional Organic Material: <span class="auto-calc" id="additionalOrganicMaterial">${this.formatNumber(maintenance.additionalOrganicMaterial || 0, 3)}</span> ${inputUnit}
+                                </div>
+                                <div class="maintenance-helptext" style="margin-top: 4px;">
+                                    Additional Structural Material: <span class="auto-calc" id="additionalStructuralMaterial">${this.formatNumber(maintenance.additionalStructuralMaterial || 0, 3)}</span> ${inputUnit}
+                                </div>
+                                <div class="maintenance-helptext" style="margin-top: 4px; font-weight: 700;">
+                                    Total Additional Input: <span class="auto-calc" id="totalAdditionalInput">${this.formatNumber(maintenance.totalAdditionalInput || 0, 3)}</span> ${inputUnit}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="maintenance-summary-card">
+                        <div class="maintenance-summary-value maintenance-summary-value-row">
+                            <span>Organic Waste: <span id="totalOrganicWaste">${this.formatNumber(maintenance.totalOrganicWaste || 0, 3)}</span> ${inputUnit}</span>
+                            ${this.renderMaintenanceSummaryInfoButton('Organic Waste', 'Regular Organic Waste + Additional Organic Material')}
+                        </div>
+                        <div class="maintenance-summary-value maintenance-summary-value-row" style="margin-top: 10px;">
+                            <span>Structural Material: <span id="totalStructuralMaterialOverall">${this.formatNumber(maintenance.totalStructuralMaterial || 0, 3)}</span> ${inputUnit}</span>
+                            ${this.renderMaintenanceSummaryInfoButton('Structural Material', 'Regular Structural Material + Additional Structural Material')}
+                        </div>
+                        <div class="maintenance-summary-value maintenance-summary-value-row" style="margin-top: 10px;">
+                            <span>Total Organic Input: <span id="totalOrganicInput">${this.formatNumber(maintenance.totalOrganicInput || 0, 3)}</span> ${inputUnit}</span>
+                            ${this.renderMaintenanceSummaryInfoButton('Total Organic Input', 'Organic Waste + Structural Material')}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+    },
+
+    getICTAActionTakenState(record) {
+        const raw = record || {};
+        const nested = raw.actionTaken || {};
+        const legacy = raw.process || {};
+        return {
+            actionTurning: !!(raw.actionTurning ?? nested.actionTurning ?? legacy.turning),
+            actionMixing: !!(raw.actionMixing ?? nested.actionMixing ?? legacy.mixing),
+            actionAddedWater: !!(raw.actionAddedWater ?? nested.actionAddedWater ?? legacy.waterAdded),
+            waterAddedAmount: (raw.waterAddedAmount ?? nested.waterAddedAmount ?? legacy.waterAddedAmount) != null ? (parseFloat(raw.waterAddedAmount ?? nested.waterAddedAmount ?? legacy.waterAddedAmount) || 0) : 0,
+            actionRemovedImpurities: !!(raw.actionRemovedImpurities ?? nested.actionRemovedImpurities),
+            removedImpuritiesDescription: String(raw.removedImpuritiesDescription ?? nested.removedImpuritiesDescription ?? ''),
+            actionOther: !!(raw.actionOther ?? nested.actionOther),
+            otherActionDescription: String(raw.otherActionDescription ?? nested.otherActionDescription ?? '')
+        };
+    },
+
+    renderICTAActionTakenModule(action) {
+        const showWater = !!action.actionAddedWater;
+        const showRemoved = !!action.actionRemovedImpurities;
+        const showOther = !!action.actionOther;
+        const isCompleted = this.hasActionTakenContent(action);
+        return `
+            <div class="card">
+                <div style="display: flex; align-items: center; justify-content: space-between; cursor: pointer;" onclick="app.toggleICTAActionTakenModule()">
+                    <h2 class="card-title module-title maintenance" id="actionTakenToggleText" data-completed="${isCompleted ? 'true' : 'false'}" style="margin: 0;">${this.getModuleToggleLabel('Action Taken', isCompleted)}</h2>
+                    <span id="actionTakenToggleIcon" style="color: var(--gray); font-weight: 700;">▸</span>
+                </div>
+
+                <div id="actionTakenContent" style="display: none; margin-top: 20px;">
+                    <div class="action-chip-group">
+                        <label class="action-chip">
+                            <input type="checkbox" id="actionTurning" ${action.actionTurning ? 'checked' : ''} onchange="app.updateICTAActionTakenVisibility()">
+                            <span>Turning</span>
+                        </label>
+                        <label class="action-chip">
+                            <input type="checkbox" id="actionMixing" ${action.actionMixing ? 'checked' : ''} onchange="app.updateICTAActionTakenVisibility()">
+                            <span>Mixing</span>
+                        </label>
+                        <label class="action-chip">
+                            <input type="checkbox" id="actionAddedWater" ${action.actionAddedWater ? 'checked' : ''} onchange="app.updateICTAActionTakenVisibility()">
+                            <span>Added Water</span>
+                        </label>
+                        <label class="action-chip">
+                            <input type="checkbox" id="actionRemovedImpurities" ${action.actionRemovedImpurities ? 'checked' : ''} onchange="app.updateICTAActionTakenVisibility()">
+                            <span>Removed Impurities</span>
+                        </label>
+                        <label class="action-chip">
+                            <input type="checkbox" id="actionOther" ${action.actionOther ? 'checked' : ''} onchange="app.updateICTAActionTakenVisibility()">
+                            <span>Other</span>
+                        </label>
+                    </div>
+
+                    <div class="action-conditional-grid">
+                        <div id="actionWaterFields" style="${showWater ? '' : 'display:none;'}">
+                            <label class="form-label">Water Added (L)</label>
+                            <input type="number" class="form-input" id="waterAddedAmount" step="any" value="${showWater && action.waterAddedAmount != null && action.waterAddedAmount !== 0 ? action.waterAddedAmount : ''}" placeholder="e.g., 5">
+                        </div>
+                        <div id="actionRemovedFields" style="${showRemoved ? '' : 'display:none;'}">
+                            <label class="form-label">Removed Materials</label>
+                            <input type="text" class="form-input" id="removedImpuritiesDescription" value="${action.removedImpuritiesDescription.replace(/"/g, '&quot;')}" placeholder="e.g., Plastic bags, paper towels...">
+                        </div>
+                        <div id="actionOtherFields" style="${showOther ? '' : 'display:none;'}">
+                            <label class="form-label">Description</label>
+                            <input type="text" class="form-input" id="otherActionDescription" value="${action.otherActionDescription.replace(/"/g, '&quot;')}" placeholder="Describe other actions taken">
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+    },
+
+    getICTAPhotosState(record) {
+        const photos = Array.isArray(record?.uploadedPhotos) ? record.uploadedPhotos : [];
+        return this.normalizePhotoList(photos);
+    },
+
+    renderICTAPhotoGridHtml(photos) {
+        if (!Array.isArray(photos) || photos.length === 0) {
+            return `<div class="icta-photo-empty">No photos uploaded yet.</div>`;
+        }
+        return photos.map((photo, idx) => `
+            <div class="icta-photo-tile">
+                <img class="icta-photo-thumb" src="${this.getPhotoPreviewSrc(photo)}" alt="Uploaded photo ${idx + 1}">
+                <div class="icta-photo-actions">
+                    <button type="button" class="btn btn-secondary icta-photo-btn" onclick="app.viewICTAPhoto(${idx})">View</button>
+                    <button type="button" class="btn btn-secondary icta-photo-btn" onclick="app.openICTAPhotoReplace(${idx})">Replace</button>
+                    <button type="button" class="btn btn-danger icta-photo-btn" onclick="app.deleteICTAPhoto(${idx})">Delete</button>
+                </div>
+            </div>
+        `).join('');
+    },
+
+    renderICTAPhotoUploadModule(photos) {
+        const isCompleted = this.hasPhotosContent(photos);
+        const batch = this.data.currentBatch;
+        const showLocalOnlyNotice = this.isBatchShared(batch) && !this.isCloudPhotoStorageEnabled();
+        const localOnlyNotice = showLocalOnlyNotice
+            ? `<div class="alert alert-warning" style="margin-bottom: 14px;">
+                    <strong>Photos are local-only</strong><br>
+                    Photos will be saved on this device but will not be shared with collaborators until cloud photo storage is enabled.
+               </div>`
+            : '';
+        return `
+            <div class="card">
+                <div style="display: flex; align-items: center; justify-content: space-between; cursor: pointer;" onclick="app.toggleICTAPhotoUploadModule()">
+                    <h2 class="card-title module-title maintenance" id="photoUploadToggleText" data-completed="${isCompleted ? 'true' : 'false'}" style="margin: 0;">${this.getModuleToggleLabel('Photo Upload', isCompleted)}</h2>
+                    <span id="photoUploadToggleIcon" style="color: var(--gray); font-weight: 700;">▸</span>
+                </div>
+
+                <div id="photoUploadContent" style="display: none; margin-top: 20px;">
+                    ${localOnlyNotice}
+                    <div class="icta-photo-toolbar">
+                        <button type="button" class="btn btn-secondary" onclick="app.openICTAPhotoPicker('take')">📷 Take Photo</button>
+                        <button type="button" class="btn btn-secondary" onclick="app.openICTAPhotoPicker('upload')">⬆ Upload Photo</button>
+                        <button type="button" class="btn btn-secondary" onclick="app.openICTAPhotoPicker('file')">📁 Choose File</button>
+                        <div class="icta-photo-hint">JPG / JPEG / PNG • Up to 9 photos</div>
+                    </div>
+
+                    <input id="ictaTakePhotoInput" type="file" accept="image/jpeg,image/jpg,image/png" capture="environment" style="display:none;">
+                    <input id="ictaUploadPhotoInput" type="file" accept="image/jpeg,image/jpg,image/png" multiple style="display:none;">
+                    <input id="ictaChooseFileInput" type="file" accept="image/jpeg,image/jpg,image/png" multiple style="display:none;">
+                    <input id="ictaReplacePhotoInput" type="file" accept="image/jpeg,image/jpg,image/png" style="display:none;">
+
+                    <div id="ictaPhotoGrid" class="icta-photo-grid">
+                        ${this.renderICTAPhotoGridHtml(photos)}
+                    </div>
+                </div>
+            </div>
+        `;
+    },
+
+    getICTANotesState(record) {
+        return String(record?.notes ?? record?.observation?.notes ?? '');
+    },
+
+    renderICTANotesModule(notes) {
+        const isCompleted = this.hasNotesContent(notes);
+        return `
+            <div class="card">
+                <div style="display: flex; align-items: center; justify-content: space-between; cursor: pointer;" onclick="app.toggleICTANotesModule()">
+                    <h2 class="card-title module-title maintenance" id="ictaNotesToggleText" data-completed="${isCompleted ? 'true' : 'false'}" style="margin: 0;">${this.getModuleToggleLabel('Notes (Optional)', isCompleted)}</h2>
+                    <span id="ictaNotesToggleIcon" style="color: var(--gray); font-weight: 700;">▸</span>
+                </div>
+
+                <div id="ictaNotesContent" style="display: none; margin-top: 20px;">
+                    <textarea id="ictaNotesTextarea" class="form-input icta-notes-textarea" placeholder="Add any observations, unusual conditions, or additional information related to this visit.">${notes.replace(/</g, '&lt;')}</textarea>
+                </div>
+            </div>
+        `;
+    },
+
+    isICTAUser() {
+        return (this.data.currentOrganization || '').toLowerCase().includes('icta');
+    },
+
+    async loadData() {
+        const storageKey = this.getStorageKey();
+        if (!storageKey) {
+            this.data.batches = [];
+            return;
+        }
+        const saved = localStorage.getItem(storageKey);
+        let localBatches = [];
+        if (saved) {
+            try {
+                localBatches = JSON.parse(saved) || [];
+            } catch (error) {
+                localBatches = [];
+            }
+        }
+
+        this.data.batches = Array.isArray(localBatches) ? localBatches : [];
+
+        try {
+            if (this.getBatchesCollection() && this.data.currentUser?.uid) {
+                const cloudBatches = await this.loadCloudBatches();
+                const merged = [...cloudBatches];
+                this.data.batches.forEach((localBatch) => {
+                    const exists = merged.some((cloudBatch) => (
+                        (localBatch.cloudId && cloudBatch.cloudId === localBatch.cloudId)
+                        || (!localBatch.cloudId && String(cloudBatch.id || '') === String(localBatch.id || '') && (cloudBatch.ownerUid || this.data.currentUser?.uid) === (localBatch.ownerUid || this.data.currentUser?.uid))
+                    ));
+                    if (!exists) merged.push(localBatch);
+                });
+                this.data.batches = merged;
+                this.saveData();
+            }
+        } catch (error) {
+        }
+    },
+
+    saveData() {
+        const storageKey = this.getStorageKey();
+        if (!storageKey) return;
+        localStorage.setItem(storageKey, JSON.stringify(this.data.batches));
+    },
+
+    addSampleData() {
+        const sampleBatch = {
+            id: 'B2026-01',
+            startDate: '2026-03-01',
+            manager: 'Yihan',
+            location: 'Compost Site A',
+            notes: 'Initial batch for testing',
+            status: 'active',
+            output: null,
+            records: [
+                {
+                    id: 1,
+                    date: '2026-03-01',
+                    composterId: 1,
+                    input: {
+                        cocina: 50,
+                        planta0: 30,
+                        planta1: 40,
+                        planta3: 25,
+                        ratio: '1:1',
+                        woodFusta: 10,
+                        woodChips: 5,
+                        quality: 'Clean (0–5%)',
+                        contaminants: { plastic: true, paper: false, metal: false, glass: false, other: false }
+                    },
+                    process: {
+                        ambient: 22,
+                        core: 55,
+                        transition: 48,
+                        outer: 42,
+                        moisture: 55,
+                        oxygen: 18,
+                        turning: true,
+                        mixing: false,
+                        waterAdded: true,
+                        waterAddedAmount: 5,
+                        none: false
+                    },
+                    observation: {
+                        odour: 'None',
+                        odourNote: '',
+                        leachate: 'No',
+                        leachateNote: '',
+                        notes: ''
+                    }
+                },
+                {
+                    id: 2,
+                    date: '2026-03-03',
+                    composterId: 2,
+                    input: {
+                        cocina: 45,
+                        planta0: 35,
+                        planta1: 38,
+                        planta3: 28,
+                        ratio: '1:2',
+                        woodFusta: 8,
+                        woodChips: 4,
+                        quality: 'Slightly contaminated (5–15%)',
+                        contaminants: { plastic: true, paper: true, metal: false, glass: false, other: false }
+                    },
+                    process: {
+                        ambient: 24,
+                        core: 62,
+                        transition: 52,
+                        outer: 45,
+                        moisture: 58,
+                        oxygen: 12,
+                        turning: true,
+                        mixing: true,
+                        waterAdded: false,
+                        waterAddedAmount: 0,
+                        none: false
+                    },
+                    observation: {
+                        odour: 'Slight',
+                        odourNote: 'Normal composting smell',
+                        leachate: 'No',
+                        leachateNote: '',
+                        notes: ''
+                    }
+                },
+                {
+                    id: 3,
+                    date: '2026-03-05',
+                    composterId: 1,
+                    input: {
+                        cocina: 0,
+                        planta0: 0,
+                        planta1: 0,
+                        planta3: 0,
+                        ratio: '1:1',
+                        woodFusta: 0,
+                        woodChips: 0,
+                        quality: '',
+                        contaminants: { plastic: false, paper: false, metal: false, glass: false, other: false }
+                    },
+                    process: {
+                        ambient: 20,
+                        core: 42,
+                        transition: 38,
+                        outer: 35,
+                        moisture: null,
+                        oxygen: null,
+                        turning: false,
+                        mixing: false,
+                        waterAdded: false,
+                        waterAddedAmount: null,
+                        none: true
+                    },
+                    observation: {
+                        odour: 'Slight',
+                        odourNote: 'Slightly anaerobic',
+                        leachate: 'Yes',
+                        leachateNote: 'Minor leakage observed',
+                        notes: ''
+                    }
+                }
+            ]
+        };
+        this.data.batches.push(sampleBatch);
+        this.saveData();
+    },
+
+    navigate(page, params = {}) {
+        this.data.currentPage = page;
+        if (params.batchId) {
+            this.data.currentBatch = this.findBatchByRouteId(params.batchId);
+        }
+        if (params.recordId != null) {
+            this.data.editingRecord = String(params.recordId);
+        } else {
+            this.data.editingRecord = null;
+        }
+        this.render();
+        window.scrollTo(0, 0);
+    },
+
+    formatDate(dateStr) {
+        const date = new Date(dateStr);
+        return date.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+    },
+
+    formatNumber(value, maxDecimals = 3) {
+        const n = typeof value === 'number' ? value : parseFloat(value);
+        if (n === null || n === undefined || isNaN(n)) return '-';
+        const factor = Math.pow(10, maxDecimals);
+        const rounded = Math.round((n + Number.EPSILON) * factor) / factor;
+        const fixed = rounded.toFixed(maxDecimals);
+        return fixed.replace(/\.?0+$/, '');
+    },
+
+    getTodayISODateInTimeZone(timeZone) {
+        const parts = new Intl.DateTimeFormat('en-CA', {
+            timeZone,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit'
+        }).formatToParts(new Date());
+        const year = parts.find(p => p.type === 'year')?.value;
+        const month = parts.find(p => p.type === 'month')?.value;
+        const day = parts.find(p => p.type === 'day')?.value;
+        if (!year || !month || !day) return null;
+        return `${year}-${month}-${day}`;
+    },
+
+    parseDateToUTCms(dateStr) {
+        if (!dateStr) return null;
+        const str = String(dateStr).trim();
+
+        const m1 = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (m1) return Date.UTC(parseInt(m1[1], 10), parseInt(m1[2], 10) - 1, parseInt(m1[3], 10));
+
+        const m2 = str.match(/^(\d{4})\/(\d{2})\/(\d{2})$/);
+        if (m2) return Date.UTC(parseInt(m2[1], 10), parseInt(m2[2], 10) - 1, parseInt(m2[3], 10));
+
+        const m3 = str.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+        if (m3) return Date.UTC(parseInt(m3[3], 10), parseInt(m3[2], 10) - 1, parseInt(m3[1], 10));
+
+        const m4 = str.match(/^(\d{1,2})\s+([A-Za-z]{3,})\s+(\d{4})$/);
+        if (m4) {
+            const day = parseInt(m4[1], 10);
+            const monthName = m4[2].slice(0, 3).toLowerCase();
+            const year = parseInt(m4[3], 10);
+            const months = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+            const month = months[monthName];
+            if (!month) return null;
+            return Date.UTC(year, month - 1, day);
+        }
+
+        const parsed = Date.parse(str);
+        if (isNaN(parsed)) return null;
+        const d = new Date(parsed);
+        return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+    },
+
+    calculateDaysRunning(batch) {
+        const timeZone = 'Europe/Madrid';
+        const startDate = batch?.startDate || null;
+        const endDate = (batch.status === 'finished' && batch.output && batch.output.date)
+            ? batch.output.date
+            : this.getTodayISODateInTimeZone(timeZone);
+
+        const startMs = this.parseDateToUTCms(startDate);
+        const endMs = this.parseDateToUTCms(endDate);
+        if (startMs === null || endMs === null) return 0;
+        const diff = Math.floor((endMs - startMs) / (1000 * 60 * 60 * 24));
+        return diff >= 0 ? diff : 0;
+    },
+
+    updateOutputDurationDisplay() {
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+        const outputDateEl = document.getElementById('outputDate');
+        const durationEl = document.getElementById('outputDuration');
+        if (!outputDateEl || !durationEl) return;
+        const startMs = this.parseDateToUTCms(batch.startDate);
+        const endMs = this.parseDateToUTCms(outputDateEl.value);
+        if (startMs == null || endMs == null) {
+            durationEl.textContent = '0 days';
+            return;
+        }
+        const diff = Math.floor((endMs - startMs) / (1000 * 60 * 60 * 24));
+        durationEl.textContent = `${diff >= 0 ? diff : 0} days`;
+    },
+
+    calculateTotalInput(batch) {
+        return this.calculateBatchMaterialTotals(batch).totalOrganicInput;
+    },
+
+    calculateTotalWaterAdded(batch) {
+        if (!batch || !Array.isArray(batch.records)) return 0;
+        return batch.records.reduce((sum, record) => {
+            const raw = (record?.actionTaken?.waterAddedAmount != null ? record.actionTaken.waterAddedAmount : record?.waterAddedAmount);
+            const legacy = record?.process?.waterAddedAmount;
+            const picked = raw != null ? raw : legacy;
+            const value = picked == null ? 0 : parseFloat(picked);
+            return sum + (isNaN(value) ? 0 : value);
+        }, 0);
+    },
+
+    calculateInitialStockAmount(batch) {
+        const initial = batch?.initialStock || null;
+        if (!initial) return 0;
+        const exists = initial.exists === true || initial.exists === 'yes';
+        if (!exists) return 0;
+        const value = initial.amount != null ? parseFloat(initial.amount) : 0;
+        return isNaN(value) ? 0 : value;
+    },
+
+    normalizeAdditionalMaterialType(type) {
+        const raw = String(type || '').toLowerCase();
+        return raw.includes('struct') ? 'structural' : 'organic';
+    },
+
+    calculateAdditionalInputTotals(additionalInputs = [], explicitOrganic = null, explicitStructural = null) {
+        const items = Array.isArray(additionalInputs) ? additionalInputs : [];
+        const derived = items.reduce((acc, item) => {
+            const normalizedType = this.normalizeAdditionalMaterialType(item?.type);
+            const rawAmount = item?.amount != null ? item.amount : item?.weight;
+            const amount = rawAmount != null && !isNaN(rawAmount) ? (parseFloat(rawAmount) || 0) : 0;
+            if (normalizedType === 'structural') acc.structural += amount;
+            else acc.organic += amount;
+            return acc;
+        }, { organic: 0, structural: 0 });
+
+        const additionalOrganicMaterial = (explicitOrganic != null && !isNaN(explicitOrganic))
+            ? (parseFloat(explicitOrganic) || 0)
+            : derived.organic;
+        const additionalStructuralMaterial = (explicitStructural != null && !isNaN(explicitStructural))
+            ? (parseFloat(explicitStructural) || 0)
+            : derived.structural;
+        const totalAdditionalInput = additionalOrganicMaterial + additionalStructuralMaterial;
+
+        return {
+            additionalOrganicMaterial,
+            additionalStructuralMaterial,
+            totalAdditionalInput
+        };
+    },
+
+    calculateRecordMaterialBreakdown(record) {
+        const input = record?.input || {};
+        const maintenance = record?.maintenance || {};
+
+        const rawAdditionalInputs = Array.isArray(maintenance.additionalInputs) && maintenance.additionalInputs.length > 0
+            ? maintenance.additionalInputs
+            : (Array.isArray(input.additionalInputs) ? input.additionalInputs : []);
+
+        const additionalInputs = rawAdditionalInputs.map((item) => ({
+            source: item?.source || '',
+            type: this.normalizeAdditionalMaterialType(item?.type),
+            description: item?.description || '',
+            amount: item?.amount != null
+                ? ((item.amount != null && !isNaN(item.amount)) ? (parseFloat(item.amount) || 0) : 0)
+                : ((item?.weight != null && !isNaN(item.weight)) ? (parseFloat(item.weight) || 0) : 0)
+        }));
+
+        const regularOrganicWaste = (maintenance.totalFoodWaste != null && !isNaN(maintenance.totalFoodWaste))
+            ? (parseFloat(maintenance.totalFoodWaste) || 0)
+            : (
+                (input.regularOrganicWaste != null && !isNaN(input.regularOrganicWaste))
+                    ? (parseFloat(input.regularOrganicWaste) || 0)
+                    : (
+                        (input.totalWasteInput != null && !isNaN(input.totalWasteInput))
+                            ? (parseFloat(input.totalWasteInput) || 0)
+                            : ((input.cocina || 0) + (input.planta0 || 0) + (input.planta1 || 0) + (input.planta3 || 0))
+                    )
+            );
+
+        const regularStructuralMaterial = (maintenance.regularStructuralMaterial != null && !isNaN(maintenance.regularStructuralMaterial))
+            ? (parseFloat(maintenance.regularStructuralMaterial) || 0)
+            : (
+                (maintenance.totalStructuralMaterial != null && !isNaN(maintenance.totalStructuralMaterial) && (maintenance.additionalStructuralMaterial == null || isNaN(maintenance.additionalStructuralMaterial)))
+                    ? (parseFloat(maintenance.totalStructuralMaterial) || 0)
+                    : (
+                        (input.regularStructuralMaterial != null && !isNaN(input.regularStructuralMaterial))
+                            ? (parseFloat(input.regularStructuralMaterial) || 0)
+                            : (
+                                Array.isArray(input.structuringMaterials)
+                                    ? input.structuringMaterials.reduce((sum, item) => sum + ((item && item.kg != null && !isNaN(item.kg)) ? (parseFloat(item.kg) || 0) : 0), 0)
+                                    : ((input.woodFusta || 0) + (input.woodChips || 0))
+                            )
+                    )
+            );
+
+        const additionalTotals = this.calculateAdditionalInputTotals(
+            additionalInputs,
+            maintenance.additionalOrganicMaterial ?? input.additionalOrganicMaterial,
+            maintenance.additionalStructuralMaterial ?? input.additionalStructuralMaterial
+        );
+
+        const totalOrganicWaste = (maintenance.totalOrganicWaste != null && !isNaN(maintenance.totalOrganicWaste))
+            ? (parseFloat(maintenance.totalOrganicWaste) || 0)
+            : (
+                (input.totalOrganicWaste != null && !isNaN(input.totalOrganicWaste))
+                    ? (parseFloat(input.totalOrganicWaste) || 0)
+                    : (regularOrganicWaste + additionalTotals.additionalOrganicMaterial)
+            );
+
+        const totalStructuralMaterial = (maintenance.totalStructuralMaterial != null && !isNaN(maintenance.totalStructuralMaterial) && maintenance.additionalStructuralMaterial != null && !isNaN(maintenance.additionalStructuralMaterial))
+            ? (parseFloat(maintenance.totalStructuralMaterial) || 0)
+            : (
+                (input.totalStructuralMaterial != null && !isNaN(input.totalStructuralMaterial))
+                    ? (parseFloat(input.totalStructuralMaterial) || 0)
+                    : (regularStructuralMaterial + additionalTotals.additionalStructuralMaterial)
+            );
+
+        const totalOrganicInput = (maintenance.totalOrganicInput != null && !isNaN(maintenance.totalOrganicInput))
+            ? (parseFloat(maintenance.totalOrganicInput) || 0)
+            : (
+                (input.totalOrganicInput != null && !isNaN(input.totalOrganicInput))
+                    ? (parseFloat(input.totalOrganicInput) || 0)
+                    : (totalOrganicWaste + totalStructuralMaterial)
+            );
+
+        return {
+            additionalInputs,
+            regularOrganicWaste,
+            regularStructuralMaterial,
+            additionalOrganicMaterial: additionalTotals.additionalOrganicMaterial,
+            additionalStructuralMaterial: additionalTotals.additionalStructuralMaterial,
+            totalAdditionalInput: additionalTotals.totalAdditionalInput,
+            totalOrganicWaste,
+            totalStructuralMaterial,
+            totalOrganicInput
+        };
+    },
+
+    calculateBatchMaterialTotals(batch) {
+        if (!batch || !Array.isArray(batch.records)) {
+            return {
+                regularOrganicWaste: 0,
+                regularStructuralMaterial: 0,
+                additionalOrganicMaterial: 0,
+                additionalStructuralMaterial: 0,
+                totalAdditionalInput: 0,
+                totalOrganicWaste: 0,
+                totalStructuralMaterial: 0,
+                totalOrganicInput: 0
+            };
+        }
+
+        return batch.records.reduce((acc, record) => {
+            const breakdown = this.calculateRecordMaterialBreakdown(record);
+            acc.regularOrganicWaste += breakdown.regularOrganicWaste;
+            acc.regularStructuralMaterial += breakdown.regularStructuralMaterial;
+            acc.additionalOrganicMaterial += breakdown.additionalOrganicMaterial;
+            acc.additionalStructuralMaterial += breakdown.additionalStructuralMaterial;
+            acc.totalAdditionalInput += breakdown.totalAdditionalInput;
+            acc.totalOrganicWaste += breakdown.totalOrganicWaste;
+            acc.totalStructuralMaterial += breakdown.totalStructuralMaterial;
+            acc.totalOrganicInput += breakdown.totalOrganicInput;
+            return acc;
+        }, {
+            regularOrganicWaste: 0,
+            regularStructuralMaterial: 0,
+            additionalOrganicMaterial: 0,
+            additionalStructuralMaterial: 0,
+            totalAdditionalInput: 0,
+            totalOrganicWaste: 0,
+            totalStructuralMaterial: 0,
+            totalOrganicInput: 0
+        });
+    },
+
+    calculateRecordTotalOrganicInput(record) {
+        return this.calculateRecordMaterialBreakdown(record).totalOrganicInput;
+    },
+
+    calculateAvgTemperature(record) {
+        const monitoring = record?.monitoring || null;
+        const process = record?.process || null;
+        if (!monitoring && !process) return null;
+        const core = monitoring?.coreTemperature != null ? monitoring.coreTemperature : process?.core;
+        const transition = monitoring?.transitionTemperature != null ? monitoring.transitionTemperature : process?.transition;
+        const outer = monitoring?.outerTemperature != null ? monitoring.outerTemperature : process?.outer;
+        const values = [core, transition, outer].filter(v => v !== null && !isNaN(v));
+        if (values.length === 0) return null;
+        return Math.round((values.reduce((sum, v) => sum + v, 0) / values.length) * 10) / 10;
+    },
+
+    getBatchPhaseTracking(records) {
+        const sortedRecords = Array.isArray(records)
+            ? [...records].sort((a, b) => new Date(a.date) - new Date(b.date))
+            : [];
+        const phaseByRecordId = new Map();
+        let state = 'Mesophilic';
+        let hasEnteredThermophilic = false;
+        let lowStreak = 0;
+
+        for (const record of sortedRecords) {
+            const avg = this.calculateAvgTemperature(record);
+            if (avg === null) {
+                phaseByRecordId.set(record.id, state);
+                continue;
+            }
+
+            if (avg >= 45) {
+                state = 'Thermophilic';
+                hasEnteredThermophilic = true;
+                lowStreak = 0;
+            } else if (hasEnteredThermophilic) {
+                lowStreak += 1;
+                state = lowStreak >= 3 ? 'Cooling & Maturation' : 'Thermophilic';
+            } else {
+                state = 'Mesophilic';
+                lowStreak = 0;
+            }
+
+            phaseByRecordId.set(record.id, state);
+        }
+
+        return { sortedRecords, phaseByRecordId };
+    },
+
+    getPhaseInfo(batch) {
+        const phases = ['Mesophilic', 'Thermophilic', 'Cooling & Maturation', 'Finished'];
+        if (!batch || batch.records.length === 0) {
+            return { phase: 'Phase cannot be determined (no data available)', index: -1, avgTemp: null, status: 'no_data', duration: 0 };
+        }
+
+        const { sortedRecords, phaseByRecordId } = this.getBatchPhaseTracking(batch.records);
+        const latestTempRecord = [...sortedRecords].reverse().find((record) => this.calculateAvgTemperature(record) !== null);
+        const latestAvgTemp = latestTempRecord ? this.calculateAvgTemperature(latestTempRecord) : null;
+
+        if (batch.status === 'finished') {
+            return { phase: 'Finished', index: phases.indexOf('Finished'), avgTemp: latestAvgTemp, status: 'ok', duration: 0 };
+        }
+
+        if (!latestTempRecord || latestAvgTemp === null) {
+            return { phase: 'Phase cannot be determined (no data available)', index: -1, avgTemp: null, status: 'no_data', duration: 0 };
+        }
+
+        const currentPhase = phaseByRecordId.get(latestTempRecord.id) || 'Mesophilic';
+        const currentIndex = phases.indexOf(currentPhase);
+
+        let duration = 0;
+        const latestTempIndex = sortedRecords.findIndex((record) => record.id === latestTempRecord.id);
+        for (let i = latestTempIndex; i >= 0; i--) {
+            const r = sortedRecords[i];
+            const avg = this.calculateAvgTemperature(r);
+            if (avg === null) continue;
+            const p = phaseByRecordId.get(r.id);
+            if (p === currentPhase) duration += 1;
+            else break;
+        }
+
+        return { phase: currentPhase, index: currentIndex, avgTemp: latestAvgTemp, status: 'ok', duration };
+    },
+
+    getCurrentPhase(batch) {
+        const info = this.getPhaseInfo(batch);
+        return info.phase;
+    },
+
+    hasMonitoringData(record) {
+        const monitoring = record?.monitoring || {};
+        const process = record?.process || {};
+        const temperatureFields = [
+            monitoring.ambientTemperature,
+            monitoring.coreTemperature,
+            monitoring.transitionTemperature,
+            monitoring.outerTemperature,
+            process.ambient,
+            process.core,
+            process.transition,
+            process.outer
+        ];
+        const hasTemperature = temperatureFields.some((value) => value != null && !isNaN(value));
+        const hasMoisture = (monitoring.moistureValue != null && !isNaN(monitoring.moistureValue))
+            || !!monitoring.moistureQualitative;
+        const hasOdour = !!monitoring.odourLevel && monitoring.odourLevel !== 'no_odour';
+        const hasLeachate = !!monitoring.leachateObserved && monitoring.leachateObserved !== 'not_assessed';
+        return hasTemperature || hasMoisture || hasOdour || hasLeachate;
+    },
+
+    hasMaintenanceData(record) {
+        return this.calculateRecordTotalOrganicInput(record) > 0;
+    },
+
+    getVisitTypeInfo(record) {
+        const hasMonitoring = this.hasMonitoringData(record);
+        const hasMaintenance = this.hasMaintenanceData(record);
+
+        if (hasMonitoring && hasMaintenance) {
+            return { label: 'Monitoring & Maintenance', badgeClass: 'combined', icon: '🔵' };
+        }
+        if (hasMonitoring) {
+            return { label: 'Monitoring', badgeClass: 'monitoring', icon: '🟢' };
+        }
+        if (hasMaintenance) {
+            return { label: 'Maintenance', badgeClass: 'maintenance', icon: '🟠' };
+        }
+        return { label: 'Not Recorded', badgeClass: 'empty', icon: '⚪' };
+    },
+
+    viewDailyRecord(recordId) {
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+        const record = batch.records.find((item) => String(item.id) === String(recordId));
+        if (!record) return;
+
+        const visitType = this.getVisitTypeInfo(record);
+        const coreTemperature = record?.monitoring?.coreTemperature != null
+            ? (parseFloat(record.monitoring.coreTemperature) || 0)
+            : (record?.process?.core != null ? (parseFloat(record.process.core) || 0) : null);
+        const temperatureDisplay = coreTemperature != null && !isNaN(coreTemperature)
+            ? `${this.formatNumber(coreTemperature, 1)}°C`
+            : 'Not Recorded';
+        const status = (this.hasMonitoringData(record) || this.hasMaintenanceData(record)) ? '✅ Complete' : '🟡 Draft';
+
+        const body = `
+            <div style="display:grid; gap: 12px; line-height: 1.6;">
+                <div><strong>Date:</strong> ${this.formatDate(record.date)}</div>
+                <div><strong>Composter ID:</strong> ${record.composterId || '—'}</div>
+                <div><strong>Visit Type:</strong> ${visitType.icon} ${visitType.label}</div>
+                <div><strong>Temperature:</strong> ${temperatureDisplay}</div>
+                <div><strong>Status:</strong> ${status}</div>
+            </div>
+        `;
+        this.showInfoModal('Daily Record Details', body);
+    },
+
+    deleteDailyRecord(recordId) {
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+        const record = batch.records.find((item) => String(item.id) === String(recordId));
+        if (!record) return;
+        const routeId = this.getBatchRouteId(batch);
+
+        this.showConfirmModal({
+            id: 'deleteDailyRecordModal',
+            title: 'Delete Daily Record?',
+            message: `This will permanently delete the record from ${this.formatDate(record.date)}.`,
+            confirmText: 'Delete',
+            cancelText: 'Cancel',
+            confirmClass: 'btn btn-danger',
+            cancelClass: 'btn btn-secondary',
+            onConfirm: async () => {
+                const removedPhotoPaths = this.getPhotoStoragePaths(record?.uploadedPhotos || []);
+                batch.records = batch.records.filter((item) => String(item.id) !== String(recordId));
+                this.saveData();
+                try {
+                    await this.deleteDailyRecordFromCloud(batch, recordId, removedPhotoPaths);
+                    await this.upsertBatchToCloud(batch, { skipCreatedAt: true });
+                } catch (error) {
+                }
+                this.navigate('batchDetail', { batchId: routeId });
+            }
+        });
+    },
+
+    formatShortDate(dateStr) {
+        const date = new Date(dateStr);
+        return date.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
+    },
+
+    getBatchTrendData(batch) {
+        const sortedRecords = Array.isArray(batch?.records)
+            ? [...batch.records].sort((a, b) => new Date(a.date) - new Date(b.date))
+            : [];
+        let cumulativeOrganicInput = 0;
+
+        return sortedRecords.map((record) => {
+            const coreTemperature = record?.monitoring?.coreTemperature != null
+                ? (parseFloat(record.monitoring.coreTemperature) || 0)
+                : (record?.process?.core != null ? (parseFloat(record.process.core) || 0) : null);
+            const organicInputAddedToday = this.calculateRecordTotalOrganicInput(record);
+            cumulativeOrganicInput += organicInputAddedToday;
+            return {
+                id: record.id,
+                date: record.date,
+                shortDate: this.formatShortDate(record.date),
+                fullDate: this.formatDate(record.date),
+                coreTemperature,
+                organicInputAddedToday,
+                cumulativeOrganicInput
+            };
+        });
+    },
+
+    renderLineTrendChart(options = {}) {
+        const {
+            points = [],
+            yAxisLabel = '',
+            emptyMessage = 'No data available yet.',
+            tooltipFormatter = null
+        } = options;
+
+        const width = 700;
+        const height = 220;
+        const margin = { top: 20, right: 18, bottom: 48, left: 50 };
+        const chartWidth = width - margin.left - margin.right;
+        const chartHeight = height - margin.top - margin.bottom;
+        const validPoints = points.filter((point) => point && point.value != null && !isNaN(point.value));
+
+        if (points.length === 0 || validPoints.length === 0) {
+            return `
+                <div class="trend-chart-empty">
+                    <div>${emptyMessage}</div>
+                    <div class="trend-chart-empty-sub">Add Daily Records to visualize this trend.</div>
+                </div>
+            `;
+        }
+
+        const minValue = Math.min(...validPoints.map((point) => point.value));
+        const maxValue = Math.max(...validPoints.map((point) => point.value));
+        const range = maxValue - minValue;
+        const padding = range === 0 ? Math.max(1, Math.abs(maxValue || 1) * 0.1) : range * 0.12;
+        const yMin = Math.max(0, minValue - padding);
+        const yMax = maxValue + padding;
+        const yRange = yMax - yMin || 1;
+        const xStep = points.length > 1 ? chartWidth / (points.length - 1) : 0;
+        const xForIndex = (index) => margin.left + (points.length > 1 ? xStep * index : chartWidth / 2);
+        const yForValue = (value) => margin.top + chartHeight - ((value - yMin) / yRange) * chartHeight;
+
+        const polylinePoints = points
+            .map((point, index) => point.value != null && !isNaN(point.value) ? `${xForIndex(index)},${yForValue(point.value)}` : null)
+            .filter(Boolean)
+            .join(' ');
+
+        const gridLines = Array.from({ length: 5 }, (_, index) => {
+            const ratio = index / 4;
+            const value = yMax - (yRange * ratio);
+            const y = margin.top + chartHeight * ratio;
+            return `
+                <g>
+                    <line x1="${margin.left}" y1="${y}" x2="${width - margin.right}" y2="${y}" class="trend-grid-line"></line>
+                    <text x="${margin.left - 10}" y="${y + 4}" text-anchor="end" class="trend-axis-label">${this.formatNumber(value, 1)}</text>
+                </g>
+            `;
+        }).join('');
+
+        const xLabels = points.map((point, index) => `
+            <text x="${xForIndex(index)}" y="${height - 18}" text-anchor="middle" class="trend-axis-label">${point.label}</text>
+        `).join('');
+
+        const circles = points.map((point, index) => {
+            if (point.value == null || isNaN(point.value)) return '';
+            const tooltipText = tooltipFormatter
+                ? tooltipFormatter(point)
+                : `${point.fullDate}\n${this.formatNumber(point.value, 1)}`;
+            return `
+                <circle cx="${xForIndex(index)}" cy="${yForValue(point.value)}" r="4.5" class="trend-point">
+                    <title>${tooltipText}</title>
+                </circle>
+            `;
+        }).join('');
+
+        return `
+            <div class="trend-chart-shell">
+                <div class="trend-axis-title">${yAxisLabel}</div>
+                <svg viewBox="0 0 ${width} ${height}" class="trend-chart-svg" role="img" aria-label="${yAxisLabel} trend chart">
+                    ${gridLines}
+                    <line x1="${margin.left}" y1="${height - margin.bottom}" x2="${width - margin.right}" y2="${height - margin.bottom}" class="trend-axis-line"></line>
+                    <line x1="${margin.left}" y1="${margin.top}" x2="${margin.left}" y2="${height - margin.bottom}" class="trend-axis-line"></line>
+                    <polyline fill="none" points="${polylinePoints}" class="trend-line"></polyline>
+                    ${circles}
+                    ${xLabels}
+                </svg>
+            </div>
+        `;
+    },
+
+    renderBatchTrendSection(batch) {
+        const inputUnit = this.getBatchInputUnitName(batch);
+        const trendData = this.getBatchTrendData(batch);
+        const coreTemperaturePoints = trendData.map((item) => ({
+            label: item.shortDate,
+            fullDate: item.fullDate,
+            value: item.coreTemperature
+        }));
+        const organicInputPoints = trendData.map((item) => ({
+            label: item.shortDate,
+            fullDate: item.fullDate,
+            value: item.cumulativeOrganicInput,
+            addedToday: item.organicInputAddedToday
+        }));
+
+        return `
+            <div class="card">
+                <div class="trend-panel">
+                    <div class="trend-chart-card">
+                        <div class="trend-chart-title">Core Temperature Trend</div>
+                        ${this.renderLineTrendChart({
+                            points: coreTemperaturePoints,
+                            yAxisLabel: 'Temperature (°C)',
+                            emptyMessage: 'No core temperature records yet.',
+                            tooltipFormatter: (point) => `${point.fullDate}\nCore Temperature: ${this.formatNumber(point.value, 1)}°C`
+                        })}
+                    </div>
+                    <div class="trend-chart-card">
+                        <div class="trend-chart-title">Total Organic Input Trend</div>
+                        ${this.renderLineTrendChart({
+                            points: organicInputPoints,
+                            yAxisLabel: `Organic Input (${inputUnit})`,
+                            emptyMessage: 'No organic input records yet.',
+                            tooltipFormatter: (point) => `${point.fullDate}\nAdded Today: ${this.formatNumber(point.addedToday, 3)} ${inputUnit}\nCumulative Total: ${this.formatNumber(point.value, 3)} ${inputUnit}`
+                        })}
+                    </div>
+                </div>
+            </div>
+        `;
+    },
+
+    getDiagnosis(process, observation) {
+        const diagnosis = { phase: '', alerts: [] };
+
+        if (!process) return diagnosis;
+
+        const avgTemp = this.calculateAvgTemperature({ process });
+
+        // Temperature Logic - Only if core/transition/outer are not null
+        if (avgTemp !== null && avgTemp >= 70) {
+            diagnosis.alerts.push({
+                type: 'danger',
+                icon: '🔴',
+                text: `Temperature too high (${avgTemp}°C)`,
+                action: 'Turn compost and add water to prevent overheating.'
+            });
+        }
+
+        // Oxygen Logic - ONLY if oxygen is NOT null
+        if (process.oxygen !== null && !isNaN(process.oxygen)) {
+            if (process.oxygen < 10) {
+                diagnosis.alerts.push({
+                    type: 'danger',
+                    icon: '🔴',
+                    text: `Low oxygen level detected (${process.oxygen}%)`,
+                    action: 'Check aeration conditions and turn compost. <br>→ Consider adding structuring material. <br>→ If bad odour is also observed, strong intervention is recommended.'
+                });
+            } else if (process.oxygen < 15) {
+                diagnosis.alerts.push({
+                    type: 'warning',
+                    icon: '⚠️',
+                    text: `Oxygen borderline low (${process.oxygen}%)`,
+                    action: 'Consider turning to improve aeration.'
+                });
+            }
+        }
+
+        // Moisture Logic - ONLY if moisture is NOT null
+        if (process.moisture !== null && !isNaN(process.moisture)) {
+            if (process.moisture < 50 || process.moisture > 60) {
+                let action = '';
+                if (process.moisture < 50) {
+                    action = 'Material is too dry → consider adding water.';
+                } else {
+                    action = 'Material is too wet → consider adding dry/structuring material.';
+                }
+                diagnosis.alerts.push({
+                    type: 'warning',
+                    icon: '⚠️',
+                    text: `Moisture is outside the optimal range (50–60%) - Current: ${process.moisture}%`,
+                    action: action
+                });
+            } else {
+                diagnosis.alerts.push({
+                    type: 'success',
+                    icon: '✅',
+                    text: `Moisture optimal (${process.moisture}%)`,
+                    action: 'Moisture within ideal range (50-60%).'
+                });
+            }
+        }
+
+        if (observation && observation.leachate === 'Yes') {
+            diagnosis.alerts.push({
+                type: 'warning',
+                icon: '⚠️',
+                text: 'Leachate detected',
+                action: 'Check drainage and consider adding dry material'
+            });
+        }
+
+        if (observation && observation.odour === 'Strong') {
+            diagnosis.alerts.push({
+                type: 'warning',
+                icon: '⚠️',
+                text: 'Strong odour detected',
+                action: 'Potential anaerobic conditions - turn immediately'
+            });
+        }
+
+        if (diagnosis.alerts.length === 0) {
+            diagnosis.alerts.push({
+                type: 'success',
+                icon: '✅',
+                text: 'All parameters within normal range',
+                action: 'Continue regular monitoring'
+            });
+        }
+
+        return diagnosis;
+    },
+
+    render() {
+        const app = document.getElementById('app');
+        if (this.data.currentUser === null && this.data.currentPage !== 'login' && this.data.currentPage !== 'register') {
+            this.navigate('login');
+            return;
+        }
+        switch (this.data.currentPage) {
+            case 'login':
+                app.innerHTML = this.renderLogin();
+                break;
+            case 'register':
+                app.innerHTML = this.renderRegister();
+                break;
+            case 'dashboard':
+                app.innerHTML = this.renderDashboard();
+                break;
+            case 'createBatch':
+                app.innerHTML = this.renderCreateBatch();
+                break;
+            case 'batchDetail':
+                app.innerHTML = this.renderBatchDetail();
+                break;
+            case 'dailyRecord':
+                app.innerHTML = this.renderDailyRecord();
+                break;
+            case 'output':
+                app.innerHTML = this.renderOutput();
+                break;
+            case 'export':
+                app.innerHTML = this.renderExport();
+                break;
+            default:
+                app.innerHTML = this.renderLogin();
+        }
+        this.attachEventListeners();
+    },
+
+    renderLogin() {
+        const rememberMeChecked = this.data.rememberMe ? 'checked' : '';
+        return `
+            <div class="header">
+                <h1>🔐 Login</h1>
+            </div>
+            <div class="container">
+                <div class="card" style="max-width: 520px; margin: 40px auto;">
+                    <form id="loginForm">
+                        <div class="form-group">
+                            <label class="form-label required">Email</label>
+                            <input type="email" class="form-input" id="loginEmail" placeholder="Enter your email" required>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label required">Password</label>
+                            <div style="display: flex; gap: 8px; align-items: center;">
+                                <input type="password" class="form-input" id="loginPassword" placeholder="Enter your password" required>
+                                <button type="button" id="loginPasswordToggle" style="border: none; background: transparent; color: #999; font-size: 1rem; cursor: pointer; padding: 0 4px;" onclick="app.togglePasswordVisibility('loginPassword', 'loginPasswordToggle')">👀</button>
+                            </div>
+                        </div>
+                        <div class="form-group" style="margin-top: -10px; margin-bottom: 10px;">
+                            <label class="checkbox-item">
+                                <input type="checkbox" id="loginRememberMe" ${rememberMeChecked}>
+                                Remember Me
+                            </label>
+                        </div>
+                        <div class="form-group" style="margin-top: -8px; margin-bottom: 12px;">
+                            <button type="button" class="btn btn-secondary" style="padding: 8px 14px; font-size: 0.9rem;" onclick="app.handleForgotPassword()">
+                                Forgot Password?
+                            </button>
+                        </div>
+                        <div class="btn-group" style="margin-top: 10px;">
+                            <button type="submit" class="btn btn-primary">Login</button>
+                            <button type="button" class="btn btn-secondary" onclick="app.navigate('register')">Register</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        `;
+    },
+
+    renderRegister() {
+        return `
+            <div class="header">
+                <h1>📝 Register</h1>
+            </div>
+            <div class="container">
+                <div class="card" style="max-width: 520px; margin: 40px auto;">
+                    <form id="registerForm">
+                        <div class="form-group">
+                            <label class="form-label required">Organization Name</label>
+                            <input type="text" class="form-input" id="registerOrganization" placeholder="Enter your organization name" required>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label required">Community Type</label>
+                            <div class="radio-group" id="registerCommunityTypeGroup">
+                                <label class="radio-item">
+                                    <input type="radio" name="registerCommunityType" value="School">
+                                    School
+                                </label>
+                                <label class="radio-item">
+                                    <input type="radio" name="registerCommunityType" value="Community Garden">
+                                    Community Garden
+                                </label>
+                                <label class="radio-item">
+                                    <input type="radio" name="registerCommunityType" value="Neighborhood Composting">
+                                    Neighborhood Composting
+                                </label>
+                                <label class="radio-item">
+                                    <input type="radio" name="registerCommunityType" value="Urban Agriculture">
+                                    Urban Agriculture
+                                </label>
+                                <label class="radio-item">
+                                    <input type="radio" name="registerCommunityType" value="Research / University">
+                                    Research / University
+                                </label>
+                                <label class="radio-item">
+                                    <input type="radio" name="registerCommunityType" value="Other">
+                                    Other
+                                </label>
+                            </div>
+                            <input type="text" class="form-input" id="registerCommunityTypeOther" placeholder="Please specify" style="display:none; margin-top: 12px;">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label required">Email</label>
+                            <input type="email" class="form-input" id="registerEmail" placeholder="Enter your email" required>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label required">Password</label>
+                            <div style="display: flex; gap: 8px; align-items: center;">
+                                <input type="password" class="form-input" id="registerPassword" placeholder="Enter your password" required>
+                                <button type="button" id="registerPasswordToggle" style="border: none; background: transparent; color: #999; font-size: 1rem; cursor: pointer; padding: 0 4px;" onclick="app.togglePasswordVisibility('registerPassword', 'registerPasswordToggle')">👀</button>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label required">Confirm Password</label>
+                            <div style="display: flex; gap: 8px; align-items: center;">
+                                <input type="password" class="form-input" id="registerConfirmPassword" placeholder="Confirm your password" required>
+                                <button type="button" id="registerConfirmPasswordToggle" style="border: none; background: transparent; color: #999; font-size: 1rem; cursor: pointer; padding: 0 4px;" onclick="app.togglePasswordVisibility('registerConfirmPassword', 'registerConfirmPasswordToggle')">👀</button>
+                            </div>
+                        </div>
+                        <div class="btn-group" style="margin-top: 10px;">
+                            <button type="submit" class="btn btn-primary">Register</button>
+                            <button type="button" class="btn btn-secondary" onclick="app.navigate('login')">Back to Login</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        `;
+    },
+
+    renderDashboard() {
+        const activeBatches = this.data.batches.filter(b => b.status === 'active');
+        const finishedBatches = this.data.batches.filter(b => b.status === 'finished');
+        const userEmail = this.data.currentUser?.email || 'Not logged in';
+        const userOrganization = this.data.currentOrganization || '-';
+
+        return `
+            <div class="header">
+                <h1>🌱 Compostopia</h1>
+            </div>
+            <div class="container">
+                <div class="card">
+                    <div class="card-header">
+                        <h2 class="card-title">📊 Batch Overview</h2>
+                        <div class="btn-group" style="justify-content: flex-end;">
+                            <span class="status-badge" style="background: #E3F2FD; color: #1565C0;">👤 ${userEmail}</span>
+                            <span class="status-badge" style="background: #F3E5F5; color: #6A1B9A;">🏢 ${userOrganization}</span>
+                            <button class="btn btn-secondary" onclick="app.logoutUser()">🚪 Logout</button>
+                            <button class="btn btn-primary" onclick="app.navigate('createBatch')">
+                                ➕ Create Batch
+                            </button>
+                        </div>
+                    </div>
+
+                    ${activeBatches.length === 0 && finishedBatches.length === 0 ? `
+                        <div class="empty-state">
+                            <div class="empty-state-icon">📦</div>
+                            <h3>No Batches Yet</h3>
+                            <p>Create your first batch to start monitoring composting progress.</p>
+                        </div>
+                    ` : `
+                        ${activeBatches.length > 0 ? `
+                            <h3 style="margin: 20px 0 15px; color: var(--warning);">🟡 Active Batches (${activeBatches.length})</h3>
+                            <div class="batch-list">
+                                ${activeBatches.map(batch => this.renderBatchCard(batch)).join('')}
+                            </div>
+                        ` : ''}
+
+                        ${finishedBatches.length > 0 ? `
+                            <h3 style="margin: 30px 0 15px; color: var(--secondary);">🟢 Finished Batches (${finishedBatches.length})</h3>
+                            <div class="batch-list">
+                                ${finishedBatches.map(batch => this.renderBatchCard(batch)).join('')}
+                            </div>
+                        ` : ''}
+                    `}
+                </div>
+            </div>
+            <div class="footer">
+                <p>Compostopia v1.0</p>
+            </div>
+        `;
+    },
+
+    renderBatchCard(batch) {
+        const sortedRecords = [...(batch.records || [])].sort((a, b) => new Date(a.date) - new Date(b.date));
+        const totalInput = this.calculateTotalInput(batch);
+        const inputUnit = this.getBatchInputUnitName(batch);
+        const daysRunning = this.calculateDaysRunning(batch);
+        const lastActivity = sortedRecords.length > 0
+            ? this.formatDate(sortedRecords[sortedRecords.length - 1].date)
+            : 'No records';
+        const routeId = this.getBatchRouteId(batch);
+        const safeRouteId = String(routeId).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+        const galleryCount = this.getBatchGalleryState(batch).totalCount;
+        const collaborationType = batch?.collaborationSettings?.type || 'private';
+        const collaborationBadge = collaborationType === 'shared'
+            ? (this.isBatchOwner(batch) ? '🤝 Shared by you' : '🤝 Shared with you')
+            : '🔒 Private';
+
+        return `
+            <div class="batch-card ${batch.status}">
+                <div class="batch-info">
+                    <div class="info-item">
+                        <span class="info-label">Batch ID</span>
+                        <span class="info-value batch-id-with-info">
+                            <span>${batch.id}</span>
+                            <button type="button" class="batch-id-info-btn" onclick="event.stopPropagation(); app.showBatchInfo('${safeRouteId}')">ⓘ</button>
+                        </span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Start Date</span>
+                        <span class="info-value">${this.formatDate(batch.startDate)}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Status</span>
+                        <span class="status-badge ${batch.status}">${batch.status === 'active' ? '🟡 Active' : '🟢 Finished'}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Access</span>
+                        <span class="info-value">${collaborationBadge}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Manager</span>
+                        <span class="info-value">${batch.manager}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Total Input</span>
+                        <span class="info-value">${this.formatNumber(totalInput, 3)} ${inputUnit}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Days Running</span>
+                        <span class="info-value">${daysRunning}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Last Activity</span>
+                        <span class="info-value">${lastActivity}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Current Phase</span>
+                        <span class="info-value">${this.getCurrentPhase(batch)}</span>
+                    </div>
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-primary" onclick="app.navigate('batchDetail', {batchId: '${safeRouteId}'})">
+                        👀 View
+                    </button>
+                    <button class="btn btn-secondary" onclick="app.showBatchGallery('${safeRouteId}')">
+                        🖼 Gallery${galleryCount > 0 ? ` (${galleryCount})` : ''}
+                    </button>
+                    ${batch.status === 'active' ? `
+                        <button class="btn btn-danger" onclick="app.showFinishModal('${safeRouteId}')">
+                            🏁 Finish
+                        </button>
+                    ` : `
+                        <button class="btn btn-secondary" onclick="app.navigate('output', {batchId: '${safeRouteId}'})">
+                            📤 Output
+                        </button>
+                        <button class="btn btn-secondary" onclick="app.navigate('export', {batchId: '${safeRouteId}'})">
+                            📥 Export
+                        </button>
+                    `}
+                    ${this.canDeleteBatch(batch) ? `
+                        <button class="btn btn-danger" style="margin-left: auto;" onclick="app.deleteBatch('${safeRouteId}')">
+                            🗑️ Delete
+                        </button>
+                    ` : ''}
+                </div>
+            </div>
+        `;
+    },
+
+    renderCollaboratorManagement(batch) {
+        const routeId = this.escapeAttr(this.getBatchRouteId(batch));
+        const collaborators = this.getBatchCollaborators(batch);
+        const ownerEmail = batch?.ownerEmail || this.data.currentUser?.email || '—';
+        const isOwner = this.isBatchOwner(batch);
+        const isCollaborator = this.isCurrentUserCollaborator(batch);
+        const accessType = collaborators.length > 0 ? 'Shared Batch' : 'Private Batch';
+        const accessHint = isOwner
+            ? (collaborators.length > 0 ? 'You manage who can access and edit this batch.' : 'Add collaborator emails to convert this batch into a shared batch.')
+            : 'You can view and contribute to this batch because the owner shared it with you.';
+
+        return `
+            <div class="card collaborator-management-card">
+                <div class="card-header collaborator-management-header">
+                    <div>
+                        <h2 class="card-title">🤝 Collaborator Management</h2>
+                        <div class="collaborator-management-subtitle">${accessHint}</div>
+                    </div>
+                    <div class="collaborator-summary-badges">
+                        <span class="collaborator-status-badge">${accessType}</span>
+                        <span class="collaborator-count-badge">${collaborators.length} collaborator${collaborators.length === 1 ? '' : 's'}</span>
+                    </div>
+                </div>
+
+                <div class="collaborator-owner-row">
+                    <div class="collaborator-owner-label">Owner</div>
+                    <div class="collaborator-owner-email">${this.escapeAttr(ownerEmail)}</div>
+                </div>
+
+                <div class="collaborator-chip-list">
+                    ${collaborators.length > 0 ? collaborators.map((email) => `
+                        <div class="collaborator-chip">
+                            <span class="collaborator-chip-email">${this.escapeAttr(email)}</span>
+                            ${isOwner ? `
+                                <button type="button" class="collaborator-chip-remove" onclick="app.removeBatchCollaborator('${routeId}', '${this.escapeAttr(email)}')">Remove</button>
+                            ` : ''}
+                        </div>
+                    `).join('') : `
+                        <div class="collaborator-empty-state">No collaborators added yet.</div>
+                    `}
+                </div>
+
+                ${isOwner ? `
+                    <div class="collaborator-manager-form">
+                        <div class="form-group" style="margin-bottom: 0;">
+                            <label class="form-label">Invite Collaborators</label>
+                            <input type="text" class="form-input" id="batchCollaboratorInput" placeholder="Enter one or more emails, separated by commas">
+                        </div>
+                        <button type="button" class="btn btn-primary" onclick="app.addBatchCollaborators('${routeId}')">
+                            ${collaborators.length > 0 ? 'Add Collaborators' : 'Share Batch'}
+                        </button>
+                    </div>
+                ` : ''}
+
+                ${isCollaborator ? `
+                    <div class="collaborator-leave-box">
+                        <div class="collaborator-leave-copy">Need to stop contributing to this shared batch?</div>
+                        <button type="button" class="btn btn-secondary" onclick="app.leaveSharedBatch('${routeId}')">Leave Shared Batch</button>
+                    </div>
+                ` : ''}
+            </div>
+        `;
+    },
+
+    getBatchGalleryState(batch) {
+        const records = Array.isArray(batch?.records) ? [...batch.records].sort((a, b) => new Date(b.date) - new Date(a.date)) : [];
+        const sections = [];
+        const allPhotos = [];
+
+        records.forEach((record) => {
+            const photos = this.normalizePhotoList(record?.uploadedPhotos || []);
+            if (photos.length === 0) return;
+            const items = photos.map((photo, idx) => {
+                const src = this.getPhotoPreviewSrc(photo);
+                const photoIndex = allPhotos.push({
+                    src,
+                    title: `${batch.id} • ${this.formatDate(record.date)} • Photo ${idx + 1}`
+                }) - 1;
+                return { src, photoIndex };
+            });
+            sections.push({
+                title: `Daily Record • ${this.formatDate(record.date)}${record?.composterId ? ` • Composter ${record.composterId}` : ''}`,
+                subtitle: `${photos.length} photo${photos.length === 1 ? '' : 's'}`,
+                items
+            });
+        });
+
+        const finalPhotos = this.normalizePhotoList(batch?.finalAssessment?.finalCompostPhotos || []);
+        if (finalPhotos.length > 0) {
+            const items = finalPhotos.map((photo, idx) => {
+                const src = this.getPhotoPreviewSrc(photo);
+                const photoIndex = allPhotos.push({
+                    src,
+                    title: `${batch.id} • Final Compost Photo ${idx + 1}`
+                }) - 1;
+                return { src, photoIndex };
+            });
+            sections.push({
+                title: 'Final Compost Photos',
+                subtitle: `${finalPhotos.length} photo${finalPhotos.length === 1 ? '' : 's'}`,
+                items
+            });
+        }
+
+        return {
+            totalCount: allPhotos.length,
+            sections,
+            allPhotos
+        };
+    },
+
+    showBatchGallery(batchId) {
+        const batch = this.findBatchByRouteId(batchId);
+        if (!batch) return;
+
+        const gallery = this.getBatchGalleryState(batch);
+        this.data.batchGalleryPhotos = gallery.allPhotos;
+
+        const body = gallery.totalCount === 0
+            ? `
+                <div class="empty-state" style="padding: 10px 0;">
+                    <div class="empty-state-icon">🖼</div>
+                    <h3>No Photos Yet</h3>
+                    <p>This batch does not have any uploaded Daily Record or Final Compost photos yet.</p>
+                </div>
+            `
+            : `
+                <div style="display:grid; gap: 20px; max-height: 70vh; overflow-y: auto; padding-right: 4px;">
+                    ${gallery.sections.map((section) => `
+                        <div>
+                            <div style="font-weight: 800; margin-bottom: 4px;">${section.title}</div>
+                            <div style="color: var(--gray); font-size: 0.92rem; margin-bottom: 10px;">${section.subtitle}</div>
+                            <div class="icta-photo-grid">
+                                ${section.items.map((item) => `
+                                    <div class="icta-photo-tile">
+                                        <img class="icta-photo-thumb" src="${item.src}" alt="${section.title}">
+                                        <div class="icta-photo-actions">
+                                            <button type="button" class="btn btn-secondary icta-photo-btn" onclick="app.showBatchGalleryPhoto(${item.photoIndex})">View</button>
+                                        </div>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+
+        this.showInfoModal(`Batch Gallery — ${batch.id} (${gallery.totalCount})`, body);
+    },
+
+    showBatchGalleryPhoto(index) {
+        const photo = Array.isArray(this.data.batchGalleryPhotos) ? this.data.batchGalleryPhotos[index] : null;
+        if (!photo?.src) return;
+
+        const existing = document.getElementById('batchGalleryPhotoModal');
+        if (existing) existing.remove();
+
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.id = 'batchGalleryPhotoModal';
+        modal.innerHTML = `
+            <div class="modal" style="max-width: 900px;">
+                <div class="modal-header">
+                    <h2 class="modal-title">${photo.title}</h2>
+                </div>
+                <div class="modal-body">
+                    <img src="${photo.src}" alt="${photo.title}" style="max-width: 100%; max-height: 75vh; display:block; margin: 0 auto; border-radius: 12px;">
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" onclick="app.closeBatchGalleryPhotoModal()">Close</button>
+                </div>
+            </div>
+        `;
+        modal.addEventListener('click', (event) => {
+            if (event.target === modal) this.closeBatchGalleryPhotoModal();
+        });
+        document.body.appendChild(modal);
+    },
+
+    closeBatchGalleryPhotoModal() {
+        const modal = document.getElementById('batchGalleryPhotoModal');
+        if (modal) modal.remove();
+    },
+
+    showBatchInfo(batchId) {
+        const batch = this.findBatchByRouteId(batchId);
+        if (!batch) return;
+
+        const esc = (v) => String(v ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+
+        const measurement = this.getBatchMeasurementSettings(batch);
+        const methodLabel = measurement.inputMethod === 'volume'
+            ? 'Volume (L)'
+            : (measurement.inputMethod === 'other' ? 'Other' : 'Weight (kg)');
+        const bucketSizeLabel = (measurement.inputMethod === 'volume' && measurement.bucketSizeL != null && !isNaN(measurement.bucketSizeL))
+            ? `${this.formatNumber(measurement.bucketSizeL, 3)} L`
+            : '—';
+        const customUnitLabel = measurement.inputMethod === 'other' ? (measurement.customUnitName || measurement.unitName || '—') : '—';
+        const initialStock = batch.initialStock || {};
+        const calculationSettings = this.getBatchCalculationSettings(batch);
+
+        const compInfo = batch.compostingSystemInformation || {};
+        const composters = Array.isArray(compInfo.composters) ? compInfo.composters : [];
+        const composterCards = composters.length > 0
+            ? `
+                <div class="batch-info-composter-grid">
+                    ${composters.map((c) => {
+                        const id = c && c.composterId != null ? String(c.composterId) : '';
+                        const cap = (c && c.capacityL != null && !isNaN(c.capacityL)) ? `${this.formatNumber(c.capacityL, 3)} L` : '—';
+                        return `
+                            <div class="batch-info-composter-card">
+                                <div class="batch-info-composter-icon">🪵</div>
+                                <div class="batch-info-composter-meta">
+                                    <div class="batch-info-composter-label">Composter ID</div>
+                                    <div class="batch-info-composter-value">${esc(id || '—')}</div>
+                                </div>
+                                <div class="batch-info-composter-capacity">${esc(cap)}</div>
+                            </div>
+                        `;
+                    }).join('')}
+                </div>
+            `
+            : `<div style="margin-top: 8px; color: var(--gray);">No composter table data.</div>`;
+
+        const collaboration = batch.collaborationSettings || {};
+        const collabType = collaboration.type || 'private';
+        const collaborators = this.getBatchCollaborators(batch);
+        const ownerEmail = batch.ownerEmail || this.data.currentUser?.email || '—';
+        const statusLabel = batch.status === 'finished' ? 'Finished' : 'Active';
+        const statusClass = batch.status === 'finished' ? 'finished' : 'active';
+        const stockAmountLabel = initialStock.exists
+            ? `${this.formatNumber(initialStock.amount || 0, 3)} ${measurement.unitName}`
+            : '—';
+        const stockHeightLabel = initialStock.height != null && initialStock.height !== ''
+            ? `${this.formatNumber(initialStock.height, 2)} cm`
+            : '—';
+        const conversionRateLabel = `${this.formatNumber(calculationSettings.compostConversionRate * 100, 2)}%`;
+        const composterCountLabel = compInfo.numberOfCompostersUsed != null ? String(compInfo.numberOfCompostersUsed) : '—';
+
+        const body = `
+            <div class="batch-info-modal">
+                <div class="batch-info-modal-hero">
+                    <div>
+                        <div class="batch-info-modal-eyebrow">Batch Overview</div>
+                        <div class="batch-info-modal-title-row">
+                            <div class="batch-info-modal-batch-id">${esc(batch.id)}</div>
+                            <span class="status-badge ${statusClass}">${statusLabel}</span>
+                        </div>
+                        <div class="batch-info-modal-subtitle">Quick access to the full batch setup, system configuration, initial stock, and collaboration details.</div>
+                    </div>
+                </div>
+
+                <div class="batch-info-modal-summary">
+                    <div class="batch-info-modal-summary-card">
+                        <div class="batch-info-modal-summary-label">Start Date</div>
+                        <div class="batch-info-modal-summary-value">${esc(this.formatDate(batch.startDate))}</div>
+                    </div>
+                    <div class="batch-info-modal-summary-card">
+                        <div class="batch-info-modal-summary-label">Input Method</div>
+                        <div class="batch-info-modal-summary-value">${esc(methodLabel)}</div>
+                    </div>
+                    <div class="batch-info-modal-summary-card">
+                        <div class="batch-info-modal-summary-label">Composters</div>
+                        <div class="batch-info-modal-summary-value">${esc(composterCountLabel)}</div>
+                    </div>
+                    <div class="batch-info-modal-summary-card">
+                        <div class="batch-info-modal-summary-label">Conversion Rate</div>
+                        <div class="batch-info-modal-summary-value">${esc(conversionRateLabel)}</div>
+                    </div>
+                </div>
+
+                <div class="batch-info-modal-sections">
+                    <section class="batch-info-section-card batch-info-section-basic">
+                        <div class="batch-info-section-title"><span class="batch-info-section-icon">📋</span><span>Batch Basic Information</span></div>
+                        <div class="batch-info-kv-grid">
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Batch ID</span><span class="batch-info-kv-value">${esc(batch.id)}</span></div>
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Start Date</span><span class="batch-info-kv-value">${esc(this.formatDate(batch.startDate))}</span></div>
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Manager</span><span class="batch-info-kv-value">${esc(batch.manager || '—')}</span></div>
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Status</span><span class="batch-info-kv-value">${esc(statusLabel)}</span></div>
+                            <div class="batch-info-kv-item batch-info-kv-item-wide"><span class="batch-info-kv-label">Location</span><span class="batch-info-kv-value">${esc(batch.location || '—')}</span></div>
+                            <div class="batch-info-kv-item batch-info-kv-item-wide"><span class="batch-info-kv-label">Notes</span><span class="batch-info-kv-value">${esc(batch.notes || '—')}</span></div>
+                        </div>
+                    </section>
+
+                    <section class="batch-info-section-card batch-info-section-measurement">
+                        <div class="batch-info-section-title"><span class="batch-info-section-icon">📏</span><span>Measurement Settings</span></div>
+                        <div class="batch-info-kv-grid">
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Input Method</span><span class="batch-info-kv-value">${esc(methodLabel)}</span></div>
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Unit Name</span><span class="batch-info-kv-value">${esc(measurement.unitName || '—')}</span></div>
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Default Bucket Size</span><span class="batch-info-kv-value">${esc(bucketSizeLabel)}</span></div>
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Custom Unit Name</span><span class="batch-info-kv-value">${esc(customUnitLabel)}</span></div>
+                        </div>
+                    </section>
+
+                    <section class="batch-info-section-card batch-info-section-system">
+                        <div class="batch-info-section-title"><span class="batch-info-section-icon">🧺</span><span>Composting System Information</span></div>
+                        <div class="batch-info-kv-grid">
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Number of Composters Used</span><span class="batch-info-kv-value">${esc(composterCountLabel)}</span></div>
+                        </div>
+                        <div class="batch-info-table-wrap">${composterCards}</div>
+                    </section>
+
+                    <section class="batch-info-section-card batch-info-section-stock">
+                        <div class="batch-info-section-title"><span class="batch-info-section-icon">📦</span><span>Initial Composting Stock</span></div>
+                        <div class="batch-info-kv-grid">
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Exists</span><span class="batch-info-kv-value">${esc(initialStock.exists ? 'Yes' : 'No')}</span></div>
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Stock Type</span><span class="batch-info-kv-value">${esc(initialStock.type || '—')}</span></div>
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Other Type</span><span class="batch-info-kv-value">${esc(initialStock.otherType || '—')}</span></div>
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Initial Stock Amount</span><span class="batch-info-kv-value">${esc(stockAmountLabel)}</span></div>
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Composter ID</span><span class="batch-info-kv-value">${esc(initialStock.composterId || initialStock.location || '—')}</span></div>
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Approximate Initial Stock Height</span><span class="batch-info-kv-value">${esc(stockHeightLabel)}</span></div>
+                        </div>
+                    </section>
+
+                    <section class="batch-info-section-card batch-info-section-calculation">
+                        <div class="batch-info-section-title"><span class="batch-info-section-icon">⚙️</span><span>Calculation Settings</span></div>
+                        <div class="batch-info-kv-grid">
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Overall Compost Conversion Rate</span><span class="batch-info-kv-value">${esc(conversionRateLabel)}</span></div>
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Mode</span><span class="batch-info-kv-value">${esc(calculationSettings.useCustomConversionRate ? 'Custom' : 'Default (ICTA-UAB Case)')}</span></div>
+                        </div>
+                    </section>
+
+                    <section class="batch-info-section-card batch-info-section-collaboration">
+                        <div class="batch-info-section-title"><span class="batch-info-section-icon">🤝</span><span>Collaboration Settings</span></div>
+                        <div class="batch-info-kv-grid">
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Type</span><span class="batch-info-kv-value">${esc(collabType === 'shared' ? 'Shared' : 'Private')}</span></div>
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Owner</span><span class="batch-info-kv-value">${esc(ownerEmail)}</span></div>
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Collaborator Count</span><span class="batch-info-kv-value">${esc(String(collaborators.length))}</span></div>
+                            <div class="batch-info-kv-item batch-info-kv-item-wide"><span class="batch-info-kv-label">Collaborators</span><span class="batch-info-kv-value">${collaborators.length > 0 ? esc(collaborators.join(', ')) : '—'}</span></div>
+                        </div>
+                    </section>
+                </div>
+            </div>
+        `;
+
+        this.showInfoModal(`Batch Info — ${esc(batch.id)}`, body);
+    },
+
+    renderCreateBatch() {
+        return `
+            <div class="header">
+                <h1>➕ Create New Batch</h1>
+            </div>
+            <div class="container">
+                <button class="back-btn" onclick="app.navigate('dashboard')" style="margin-bottom: 20px;">
+                    ← Back to Dashboard
+                </button>
+
+                <div class="card">
+                    <form id="createBatchForm">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label class="form-label required">Batch ID</label>
+                                <input type="text" class="form-input" id="batchId"
+                                    value="B${new Date().getFullYear()}-${String(this.data.batches.length + 1).padStart(2, '0')}"
+                                    required>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label required">Start Date</label>
+                                <input type="date" class="form-input" id="startDate"
+                                    value="${new Date().toISOString().split('T')[0]}" required>
+                            </div>
+                        </div>
+
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label class="form-label">Location</label>
+                                <input type="text" class="form-input" id="location"
+                                    placeholder="Composting Place Name e.g.,ICTA Outdoor">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label required">Manager</label>
+                                <input type="text" class="form-input" id="manager"
+                                    placeholder="Enter manager name" required>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Notes</label>
+                            <textarea class="form-input" id="notes" rows="3"
+                                placeholder="Additional notes about this batch..."></textarea>
+                        </div>
+
+                        <div class="module" style="background: #F7F7FF; border-color: #DADAFB;">
+                            <h3 class="module-title" style="color: #3F51B5; margin-bottom: 8px;">📏 Measurement Settings</h3>
+                            <div class="form-group">
+                                <label class="form-label">Input Method <span style="color: var(--danger);">*</span> <span style="font-weight: 400; color: var(--gray); font-size: 0.85rem;">Please select the unit used to record material inputs in your composting system</span></label>
+                                <div class="radio-group" id="inputMethodGroup">
+                                    <label class="radio-item">
+                                        <input type="radio" name="inputMethod" value="weight" checked>
+                                        Weight (kg)
+                                    </label>
+                                    <label class="radio-item">
+                                        <input type="radio" name="inputMethod" value="volume">
+                                        Volume (L)
+                                    </label>
+                                    <label class="radio-item">
+                                        <input type="radio" name="inputMethod" value="other">
+                                        Other
+                                    </label>
+                                </div>
+                            </div>
+
+                            <div id="volumeSettings" style="display:none;">
+                                <div class="form-group">
+                                    <label class="form-label required">Default Bucket Size</label>
+                                    <div class="radio-group" id="bucketSizeGroup">
+                                        <label class="radio-item">
+                                            <input type="radio" name="bucketSize" value="1">
+                                            1 L
+                                        </label>
+                                        <label class="radio-item">
+                                            <input type="radio" name="bucketSize" value="2" checked>
+                                            2 L
+                                        </label>
+                                        <label class="radio-item">
+                                            <input type="radio" name="bucketSize" value="5">
+                                            5 L
+                                        </label>
+                                        <label class="radio-item">
+                                            <input type="radio" name="bucketSize" value="custom">
+                                            Custom
+                                        </label>
+                                    </div>
+                                    <input type="number" class="form-input" id="customBucketSizeL" step="any" placeholder="Custom Bucket Size (L)" style="display:none; margin-top: 12px;">
+                                </div>
+                            </div>
+
+                            <div id="otherUnitSettings" style="display:none;">
+                                <div class="form-group">
+                                    <label class="form-label required">Custom Unit Name</label>
+                                    <input type="text" class="form-input" id="customUnitName" placeholder="e.g., Buckets, Boxes, Containers, Bags, Crates" oninput="app.updateCreateBatchInitialStockVisibility()">
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="module" style="background: #F3FBF3; border-color: #C8E6C9;">
+                            <h3 class="module-title" style="color: #2E7D32; margin-bottom: 8px;">Composting System Information</h3>
+                            <div class="form-group">
+                                <label class="form-label">Number of Composters Used</label>
+                                <input type="number" class="form-input" id="numComposters" min="1" step="1" value="2" placeholder="Number">
+                            </div>
+
+                            <div class="form-group">
+                                <div style="font-weight: 600; margin-bottom: 10px;">Composter Information Table</div>
+                                <div id="composterTableContainer">
+                                    <table class="table">
+                                        <thead>
+                                            <tr>
+                                                <th>Composter ID</th>
+                                                <th>Capacity (L)</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            <tr>
+                                                <td><input type="text" class="form-input" id="composterId_1" value="" placeholder="Composter ID"></td>
+                                                <td><input type="number" class="form-input" id="composterCap_1" step="any" placeholder="Capacity (L)"></td>
+                                            </tr>
+                                            <tr>
+                                                <td><input type="text" class="form-input" id="composterId_2" value="" placeholder="Composter ID"></td>
+                                                <td><input type="number" class="form-input" id="composterCap_2" step="any" placeholder="Capacity (L)"></td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="module" style="background: #FFF7F0; border-color: #FFE0B2;">
+                            <h3 class="module-title" style="color: #E65100; margin-bottom: 8px;">📦 Initial Composting Stock (Optional)</h3>
+                            <div class="form-group">
+                                <label class="form-label">Was there already composting material inside the composter when this batch started?</label>
+                                <div class="radio-group">
+                                    <label class="radio-item">
+                                        <input type="radio" name="initialStockExists" value="no" checked onchange="app.updateCreateBatchInitialStockVisibility()">
+                                        No
+                                    </label>
+                                    <label class="radio-item">
+                                        <input type="radio" name="initialStockExists" value="yes" onchange="app.updateCreateBatchInitialStockVisibility()">
+                                        Yes
+                                    </label>
+                                </div>
+                            </div>
+
+                            <div id="initialStockDetails" style="display:none;">
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label class="form-label" id="initialStockAmountLabel">Initial Stock Amount</label>
+                                        <input type="number" class="form-input" id="initialStockAmount" step="any" placeholder="Enter amount">
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label" id="initialStockComposterLabel">Composter ID</label>
+                                        <select class="form-input" id="initialStockComposterId">
+                                            <option value="">Select composter</option>
+                                            <option value="1">1</option>
+                                            <option value="2">2</option>
+                                        </select>
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label" id="initialStockHeightLabel">Approximate Initial Stock Height (cm)</label>
+                                        <input type="number" class="form-input" id="initialStockHeight" step="any" min="0" placeholder="Enter approximate height">
+                                    </div>
+                                </div>
+
+                                <div class="form-group" style="margin-top: 6px;">
+                                    <label class="form-label" id="initialStockTypeLabel">Initial Stock Type</label>
+                                    <div class="radio-group" style="gap: 16px;">
+                                        <label class="radio-item">
+                                            <input type="radio" name="initialStockType" value="Mature Compost" onchange="app.updateCreateBatchInitialStockTypeVisibility()">
+                                            Mature Compost
+                                        </label>
+                                        <label class="radio-item">
+                                            <input type="radio" name="initialStockType" value="Active Compost" onchange="app.updateCreateBatchInitialStockTypeVisibility()">
+                                            Active Compost
+                                        </label>
+                                        <label class="radio-item">
+                                            <input type="radio" name="initialStockType" value="Previous Batch Residues" onchange="app.updateCreateBatchInitialStockTypeVisibility()">
+                                            Previous Batch Residues
+                                        </label>
+                                        <label class="radio-item">
+                                            <input type="radio" name="initialStockType" value="Other" onchange="app.updateCreateBatchInitialStockTypeVisibility()">
+                                            Other
+                                        </label>
+                                    </div>
+                                </div>
+
+                                <div class="form-group" id="initialStockOtherTypeGroup" style="display:none;">
+                                    <label class="form-label" id="initialStockOtherTypeLabel">Please specify</label>
+                                    <input type="text" class="form-input" id="initialStockOtherType" placeholder="Please specify">
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="module" style="background: #F4FAFF; border-color: #B3E5FC;">
+                            <h3 class="module-title" style="color: #0277BD; margin-bottom: 8px;">⚙️ Calculation Settings</h3>
+                            <div class="form-group">
+                                <label class="form-label">Overall Compost Conversion Rate</label>
+                                <div style="font-weight: 600; color: var(--gray); margin-bottom: 10px;">36% (ICTA-UAB Case)</div>
+                                <div class="radio-group">
+                                    <label class="radio-item">
+                                        <input type="radio" name="conversionRateMode" value="default" checked onchange="app.updateCreateBatchCalculationSettingsVisibility()">
+                                        Default
+                                    </label>
+                                    <label class="radio-item">
+                                        <input type="radio" name="conversionRateMode" value="custom" onchange="app.updateCreateBatchCalculationSettingsVisibility()">
+                                        Custom
+                                    </label>
+                                </div>
+                            </div>
+                            <div id="customConversionRateSection" style="display:none;">
+                                <div class="form-group">
+                                    <label class="form-label required">Conversion Rate (%)</label>
+                                    <input type="number" class="form-input" id="customConversionRate" step="any" min="0" placeholder="e.g., 36">
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="module" style="background: #FFF3E0; border-color: #FFE0B2;">
+                            <h3 class="module-title" style="color: #E65100; margin-bottom: 8px;">Collaboration Settings</h3>
+                            <div class="form-group">
+                                <label class="form-label">Collaboration Settings</label>
+                                <div class="radio-group" id="collaborationSettingsGroup">
+                                    <label class="radio-item">
+                                        <input type="radio" name="collaborationType" value="private" checked>
+                                        Private Batch
+                                    </label>
+                                    <label class="radio-item">
+                                        <input type="radio" name="collaborationType" value="shared">
+                                        Shared Batch
+                                    </label>
+                                </div>
+                            </div>
+
+                            <div id="inviteCollaboratorsSection" style="display:none;">
+                                <div style="font-weight: 600; margin-bottom: 10px;">Invite Collaborators</div>
+                                <div class="form-group">
+                                    <label class="form-label">Email:</label>
+                                    <input type="text" class="form-input" id="collaboratorsEmails" placeholder="Enter one or more emails, separated by commas">
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="btn-group">
+                            <button type="submit" class="btn btn-primary">
+                                💾 Save Batch
+                            </button>
+                            <button type="button" class="btn btn-secondary"
+                                onclick="app.navigate('dashboard')">
+                                Cancel
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        `;
+    },
+
+    renderBatchDetail() {
+        const batch = this.data.currentBatch;
+        if (!batch) {
+            return `<div class="container"><p>Batch not found</p></div>`;
+        }
+        const routeId = this.getBatchRouteId(batch);
+        const escapedRouteId = this.escapeAttr(routeId);
+
+        const sortedRecords = [...(batch.records || [])].sort((a, b) => new Date(a.date) - new Date(b.date));
+        const recordsDescending = [...sortedRecords].reverse();
+        const inputUnit = this.getBatchInputUnitName(batch);
+        const materialTotals = this.calculateBatchMaterialTotals(batch);
+        const totalInput = materialTotals.totalOrganicInput;
+        const daysRunning = this.calculateDaysRunning(batch);
+        const lastActivity = sortedRecords.length > 0
+            ? this.formatDate(sortedRecords[sortedRecords.length - 1].date)
+            : 'No records';
+        const phaseInfo = this.getPhaseInfo(batch);
+        const currentPhase = phaseInfo.status === 'ok' ? phaseInfo.phase : '-';
+        const totalOrganicInputDisplay = `${this.formatNumber(totalInput, 3)} ${inputUnit}`;
+        const organicWasteDisplay = `${this.formatNumber(materialTotals.totalOrganicWaste, 3)} ${inputUnit}`;
+        const structuralMaterialDisplay = `${this.formatNumber(materialTotals.totalStructuralMaterial, 3)} ${inputUnit}`;
+        const daysRunningDisplay = `${daysRunning} ${daysRunning === 1 ? 'day' : 'days'}`;
+
+        return `
+            <div class="header">
+                <h1>📋 Batch Detail - ${batch.id}</h1>
+            </div>
+            <div class="container" id="batchDetailPage">
+                <button class="back-btn" onclick="app.navigate('dashboard')" style="margin-bottom: 20px;">
+                    ← Back to Dashboard
+                </button>
+
+                <div class="card">
+                    <div class="card-header" style="margin-bottom: 0; padding-bottom: 0; border-bottom: none;">
+                        <h2 class="card-title">📊 Batch Information</h2>
+                        ${batch.status === 'active' ? `
+                            <div class="btn-group" style="justify-content: flex-end;">
+                                <button class="btn btn-danger" onclick="app.showFinishModal('${escapedRouteId}')">
+                                    🏁 Finish Batch
+                                </button>
+                            </div>
+                        ` : `<div></div>`}
+                    </div>
+                    <div class="batch-info" style="margin-top: 20px;">
+                        <div class="info-item">
+                            <span class="info-label">Batch ID</span>
+                            <span class="info-value">${batch.id}</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">Start Date</span>
+                            <span class="info-value">${this.formatDate(batch.startDate)}</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">Status</span>
+                            <span class="status-badge ${batch.status}">${batch.status === 'active' ? '🟡 Active' : '🟢 Finished'}</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">Manager</span>
+                            <span class="info-value">${batch.manager}</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">Location</span>
+                            <span class="info-value">${batch.location || '-'}</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">Notes</span>
+                            <span class="info-value">${batch.notes || '-'}</span>
+                        </div>
+                    </div>
+                </div>
+
+                ${this.renderCollaboratorManagement(batch)}
+
+                <div class="card activity-log-card">
+                    <div class="card-header">
+                        <h2 class="card-title">📜 Collaborator Activity Log</h2>
+                    </div>
+                    ${this.renderActivityLog(batch)}
+                </div>
+
+                <div class="card">
+                    <h2 class="card-title">📈 Batch Summary</h2>
+                    <div class="summary-grid">
+                        <div class="summary-item">
+                            <div class="summary-label">Batch Total Organic Input</div>
+                            <div class="summary-value">${totalOrganicInputDisplay}</div>
+                        </div>
+                        <div class="summary-item">
+                            <div class="summary-label">Organic Waste</div>
+                            <div class="summary-value">${organicWasteDisplay}</div>
+                        </div>
+                        <div class="summary-item">
+                            <div class="summary-label">Structural Material</div>
+                            <div class="summary-value">${structuralMaterialDisplay}</div>
+                        </div>
+                        <div class="summary-item">
+                            <div class="summary-label">Days Running</div>
+                            <div class="summary-value">${daysRunningDisplay}</div>
+                        </div>
+                        <div class="summary-item">
+                            <div class="summary-label">Last Activity</div>
+                            <div class="summary-value">${lastActivity}</div>
+                        </div>
+                        <div class="summary-item">
+                            <div class="summary-label">Current Phase</div>
+                            <div class="summary-value">${currentPhase}</div>
+                        </div>
+                    </div>
+                </div>
+
+                ${this.renderBatchTrendSection(batch)}
+
+                <div class="card">
+                    <div class="card-header">
+                        <h2 class="card-title">📝 Daily Records List</h2>
+                    </div>
+
+                    ${recordsDescending.length === 0 ? `
+                        <div class="empty-state">
+                            <div class="empty-state-icon">📋</div>
+                            <h3>No Records Yet</h3>
+                            <p>Start adding daily records to track this batch.</p>
+                        </div>
+                    ` : `
+                        <table class="table" id="dailyRecordsTable">
+                            <thead>
+                                <tr>
+                                    <th>Date</th>
+                                    <th>Composter ID</th>
+                                    <th>Visit Type</th>
+                                    <th>Temperature</th>
+                                    <th>Status</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${recordsDescending.map(record => {
+                                    const visitType = this.getVisitTypeInfo(record);
+                                    const hasMonitoring = this.hasMonitoringData(record);
+                                    const hasMaintenance = this.hasMaintenanceData(record);
+                                    const coreTemperature = record?.monitoring?.coreTemperature != null
+                                        ? (parseFloat(record.monitoring.coreTemperature) || 0)
+                                        : (record?.process?.core != null ? (parseFloat(record.process.core) || 0) : null);
+                                    const temperatureDisplay = coreTemperature != null && !isNaN(coreTemperature)
+                                        ? `${this.formatNumber(coreTemperature, 1)}°C`
+                                        : '—';
+
+                                    let status = '✅ Complete';
+                                    let statusClass = 'success';
+                                    if (!hasMonitoring && !hasMaintenance) {
+                                        status = '🟡 Draft';
+                                        statusClass = 'warning';
+                                    }
+
+                                    const recordIdAttr = String(record.id)
+                                        .replace(/&/g, '&amp;')
+                                        .replace(/</g, '&lt;')
+                                        .replace(/"/g, '&quot;');
+                                    return `
+                                        <tr>
+                                            <td>${this.formatDate(record.date)}</td>
+                                            <td>${record.composterId || '—'}</td>
+                                            <td><span class="visit-type-badge ${visitType.badgeClass}">${visitType.icon} ${visitType.label}</span></td>
+                                            <td>${temperatureDisplay}</td>
+                                            <td><span class="status-indicator ${statusClass}">${status}</span></td>
+                                            <td>
+                                                <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                                                    <button type="button" class="btn btn-secondary" style="padding: 6px 12px; font-size: 0.85rem;"
+                                                        data-action="edit" data-batch-id="${escapedRouteId}" data-record-id="${recordIdAttr}">
+                                                        ✏️ Edit
+                                                    </button>
+                                                    <button type="button" class="btn btn-danger" style="padding: 6px 12px; font-size: 0.85rem;"
+                                                        data-action="delete" data-record-id="${recordIdAttr}">
+                                                        🗑 Delete
+                                                    </button>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    `;
+                                }).join('')}
+                            </tbody>
+                        </table>
+                    `}
+                </div>
+
+                ${batch.status === 'finished' ? `
+                    <div class="alert alert-success finish-lock-alert">
+                        <strong>🔒 This batch has been completed.</strong><br>
+                        Daily Records are locked, but historical records remain available for viewing.
+                    </div>
+                ` : ''}
+
+                <div class="action-panel">
+                    <div class="btn-group">
+                        ${batch.status === 'active' ? `
+                            <button type="button" class="btn btn-primary" id="addDailyRecordBtn"
+                                data-batch-id="${escapedRouteId}">
+                                ➕ Add Daily Record
+                            </button>
+                        ` : `
+                            <button type="button" class="btn btn-secondary" onclick="app.navigate('output', {batchId: '${escapedRouteId}'})">
+                                📤 View Output
+                            </button>
+                        `}
+                        <button type="button" class="btn btn-secondary" onclick="app.navigate('export', {batchId: '${escapedRouteId}'})">
+                            📥 Export Data
+                        </button>
+                    </div>
+                </div>
+            </div>
+        `;
+    },
+
+    renderDailyRecord() {
+        const batch = this.data.currentBatch;
+        if (!batch) {
+            return `<div class="container"><p>Batch not found</p></div>`;
+        }
+
+        const record = this.data.editingRecord
+            ? batch.records.find(r => String(r.id) === String(this.data.editingRecord))
+            : null;
+
+        const isEdit = !!record;
+        const selectedDate = record ? record.date : new Date().toISOString().split('T')[0];
+        let composterId = record && record.composterId != null ? String(record.composterId) : '1';
+
+        const compostingInfo = batch.compostingSystemInformation || {};
+        const composterIdsFromTable = Array.isArray(compostingInfo.composters)
+            ? compostingInfo.composters
+                .map(c => (c && c.composterId != null) ? String(c.composterId).trim() : '')
+                .filter(v => !!v)
+            : [];
+        const fallbackCount = (compostingInfo.numberOfCompostersUsed != null && !isNaN(compostingInfo.numberOfCompostersUsed))
+            ? Math.max(1, Math.min(50, parseInt(compostingInfo.numberOfCompostersUsed, 10)))
+            : 2;
+        const composterIds = (composterIdsFromTable.length > 0
+            ? Array.from(new Set(composterIdsFromTable))
+            : Array.from({ length: fallbackCount }, (_, i) => String(i + 1)));
+        if (!composterIds.includes(composterId)) composterId = composterIds[0] || '1';
+        const composterOptionsHtml = composterIds
+            .map(id => `<option value="${String(id).replace(/"/g, '&quot;')}" ${composterId === id ? 'selected' : ''}>Composter ${String(id).replace(/</g, '&lt;')}</option>`)
+            .join('');
+
+        const monitoringState = this.getICTAMonitoringState(record);
+        const isICTA = this.isICTAUser();
+        const maintenanceState = isICTA
+            ? this.getICTAMaintenanceState(record, batch)
+            : this.getNonICTAMaintenanceState(record, batch);
+        const actionTakenState = this.getICTAActionTakenState(record);
+        const photosState = this.getICTAPhotosState(record);
+        const notesState = this.getICTANotesState(record);
+        this.data.ictaPhotoDraft = [...photosState];
+        this.data.ictaPhotoReplaceIndex = null;
+
+        return `
+            <div class="header">
+                <h1>${isEdit ? '✏️ Edit Daily Record' : '➕ Add Daily Record'}</h1>
+            </div>
+            <div class="container">
+                <button class="back-btn" onclick="app.navigate('batchDetail', {batchId: '${this.escapeAttr(this.getBatchRouteId(batch))}'})" style="margin-bottom: 20px;">
+                    ← Back to Batch Detail
+                </button>
+
+                <form id="dailyRecordForm">
+                    <div class="card">
+                        <h2 class="card-title">📋 Basic Information</h2>
+                        <div class="form-row" style="margin-top: 20px;">
+                            <div class="form-group">
+                                <label class="form-label required">Date</label>
+                                <input type="date" class="form-input" id="recordDate" value="${selectedDate}" required>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Batch ID</label>
+                                <input type="text" class="form-input" value="${batch.id}" readonly>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label required">Composter ID</label>
+                                <select class="form-input" id="composterId" required>
+                                    ${composterOptionsHtml}
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    ${isICTA ? this.renderICTAMonitoringModule(monitoringState) : this.renderNonICTAMonitoringModule(monitoringState)}
+
+                    ${isICTA ? this.renderICTAMaintenanceModule(batch, maintenanceState) : this.renderNonICTAMaintenanceModule(batch, maintenanceState)}
+
+                    ${this.renderICTAActionTakenModule(actionTakenState)}
+                    ${this.renderICTAPhotoUploadModule(photosState)}
+                    ${this.renderICTANotesModule(notesState)}
+
+                    <div class="action-panel">
+                        <div class="btn-group">
+                            <button type="submit" class="btn btn-primary">
+                                Submit Daily Record
+                            </button>
+                            <button type="button" class="btn btn-secondary"
+                                onclick="app.confirmCancelDailyRecord('${batch.id}')">
+                                Cancel
+                            </button>
+                        </div>
+                    </div>
+                </form>
+            </div>
+        `;
+    },
+
+    renderOutput() {
+        const batch = this.data.currentBatch;
+        if (!batch || batch.status !== 'finished') {
+            return `<div class="container"><p>Batch not found or not finished</p></div>`;
+        }
+
+        const inputUnit = this.getBatchInputUnitName(batch);
+        const initialStockAmount = this.calculateInitialStockAmount(batch);
+        const totalOrganicInput = this.calculateTotalInput(batch);
+        const totalWaterAdded = this.calculateTotalWaterAdded(batch);
+        const totalSystemInput = initialStockAmount + totalOrganicInput + totalWaterAdded;
+        const output = batch.output || {};
+        const harvestStatus = output.harvestStatus || 'pending';
+        const estimatedOutput = output.estimatedOutput != null ? output.estimatedOutput : this.calculateEstimatedCompostOutput(batch);
+        const harvestDate = output.date || '';
+        const compostOutput = output.compostOutput != null && !isNaN(output.compostOutput) ? output.compostOutput : '';
+        const harvestNotes = output.notes || '';
+        const showHarvestForm = harvestStatus === 'completed';
+        const finishedDate = batch.finishedDate || this.getTodayISODateInTimeZone('Europe/Madrid');
+        const durationDays = (() => {
+            const startMs = this.parseDateToUTCms(batch.startDate);
+            const endMs = this.parseDateToUTCms(finishedDate);
+            if (startMs == null || endMs == null) return 0;
+            const diff = Math.floor((endMs - startMs) / (1000 * 60 * 60 * 24));
+            return diff >= 0 ? diff : 0;
+        })();
+
+        return `
+            <div class="header">
+                <h1>📤 Batch Output</h1>
+            </div>
+            <div class="container">
+                <button class="back-btn" onclick="app.navigate('dashboard')" style="margin-bottom: 20px;">
+                    ← Back to Batch Overview
+                </button>
+
+                <form id="outputForm">
+                    <div class="card">
+                        <h2 class="card-title">📋 Basic Information</h2>
+                        <div style="margin-top: 16px; overflow-x: auto;">
+                            <table class="table">
+                                <thead>
+                                    <tr>
+                                        <th>Batch ID</th>
+                                        <th>Start Date</th>
+                                        <th>End Date</th>
+                                        <th>Duration</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr>
+                                        <td>${batch.id}</td>
+                                        <td>${this.formatDate(batch.startDate)}</td>
+                                        <td>${this.formatDate(finishedDate)}</td>
+                                        <td><span id="outputDuration">${durationDays} days</span></td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <h2 class="card-title">📊 Input Summary</h2>
+                        <div class="summary-grid" style="margin-top: 18px;">
+                            <div class="summary-item">
+                                <div class="summary-value">${this.formatNumber(totalSystemInput, 1)}</div>
+                                <div class="summary-label">Batch Total System Input (${inputUnit})</div>
+                                <div style="margin-top: 6px; color: var(--gray); font-size: 0.9rem;">
+                                    (Initial Composting Stock + Batch Total Organic Input + Total Water Added)
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <h2 class="card-title">📦 Harvest Record</h2>
+                        <div class="summary-grid" style="margin-top: 18px;">
+                            <div class="summary-item">
+                                <div class="summary-value">${this.formatNumber(estimatedOutput, 1)}</div>
+                                <div class="summary-label">Estimated Compost Output (${inputUnit})</div>
+                                <div style="margin-top: 6px; color: var(--gray); font-size: 0.9rem;">
+                                    Read-only estimate based on total material input and conversion rate
+                                </div>
+                            </div>
+                            <div class="summary-item">
+                                <div class="summary-value">${harvestStatus === 'completed' ? 'Completed' : 'Pending'}</div>
+                                <div class="summary-label">Harvest Status</div>
+                                <div style="margin-top: 6px;">
+                                    <span class="status-badge ${harvestStatus === 'completed' ? 'finished' : 'active'}">${harvestStatus === 'completed' ? '🟢 Completed' : '🟡 Pending'}</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div style="margin-top: 10px;">
+                            <button type="button" class="btn btn-secondary" onclick="app.toggleHarvestForm()">
+                                ${harvestStatus === 'completed' ? '✏️ Edit Harvest' : '📝 Record Harvest'}
+                            </button>
+                        </div>
+
+                        <div id="harvestFormSection" style="${showHarvestForm ? '' : 'display:none;'} margin-top: 18px;">
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label class="form-label required">Harvest Date</label>
+                                    <input type="date" class="form-input" id="outputDate" value="${harvestDate}">
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label required">Actual Compost Output (${inputUnit})</label>
+                                    <input type="number" class="form-input" id="compostOutput" min="0" step="0.1" value="${compostOutput}" placeholder="Enter number">
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Notes</label>
+                                <textarea class="form-input" id="harvestNotes" rows="3" placeholder="Add harvest notes...">${String(harvestNotes).replace(/</g, '&lt;')}</textarea>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="action-panel">
+                        <div class="btn-group">
+                            <button type="submit" class="btn btn-primary" id="saveHarvestBtn" style="${showHarvestForm ? '' : 'display:none;'}">
+                                💾 Save Harvest
+                            </button>
+                            <button type="button" class="btn btn-secondary"
+                                onclick="app.navigate('dashboard')">
+                                Return to Batch Overview
+                            </button>
+                        </div>
+                    </div>
+                </form>
+            </div>
+        `;
+    },
+
+    renderExportFieldOption(moduleId, checkboxId, title, description, checked = true) {
+        return `
+            <label class="checkbox-item export-field-item" data-export-module="${moduleId}">
+                <input type="checkbox" id="${checkboxId}" ${checked ? 'checked' : ''}>
+                <div class="export-field-copy">
+                    <div class="export-field-title">${title}</div>
+                    <div class="export-field-description">${description}</div>
+                </div>
+            </label>
+        `;
+    },
+
+    renderExport() {
+        const batch = this.data.currentBatch;
+        const isICTA = this.isICTAUser();
+
+        return `
+            <div class="header">
+                <h1>📥 Export Data</h1>
+            </div>
+            <div class="container">
+                <button class="back-btn" onclick="app.navigate('batchDetail', {batchId: '${batch ? this.escapeAttr(this.getBatchRouteId(batch)) : ''}'})" style="margin-bottom: 20px;">
+                    ← Back to Batch Detail
+                </button>
+
+                <form id="exportForm">
+                    <div class="card">
+                        <h2 class="card-title">📋 Export Configuration</h2>
+
+                        <div class="form-group" style="margin-top: 20px;">
+                            <label class="form-label required">Select Batch</label>
+                            <select class="form-input" id="exportBatchId" required>
+                                <option value="">Choose a batch...</option>
+                                ${this.data.batches.map(b => `
+                                    <option value="${this.escapeAttr(this.getBatchRouteId(b))}" ${batch && this.getBatchRouteId(b) === this.getBatchRouteId(batch) ? 'selected' : ''}>
+                                        ${b.id} - ${this.formatDate(b.startDate)} (${b.status})
+                                    </option>
+                                `).join('')}
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Date Range (Optional)</label>
+                            <div class="form-row">
+                                <div>
+                                    <label class="form-label" style="font-size: 0.9rem;">From</label>
+                                    <input type="date" class="form-input" id="exportDateFrom">
+                                </div>
+                                <div>
+                                    <label class="form-label" style="font-size: 0.9rem;">To</label>
+                                    <input type="date" class="form-input" id="exportDateTo">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <h2 class="card-title">☑️ Field Selection</h2>
+
+                        <div class="export-selection-helper">
+                            Choose modules first, then expand each module to fine-tune specific fields.
+                        </div>
+
+                        <div class="export-options export-options-modular">
+                            <div class="export-module-card" id="exportModuleCard-batchSummary">
+                                <div class="export-module-header">
+                                    <label class="export-module-main">
+                                        <input type="checkbox" id="exportModule-batchSummary" checked onchange="app.setExportModule('batchSummary', this.checked)">
+                                        <div>
+                                            <div class="export-module-title">📋 Batch Summary</div>
+                                            <div class="export-module-subtitle">Overview, dates, totals, and calculation settings</div>
+                                        </div>
+                                    </label>
+                                    <button type="button" class="export-module-expand" onclick="app.toggleExportModule('batchSummary')">
+                                        <span id="exportModuleIcon-batchSummary">▾</span>
+                                    </button>
+                                </div>
+                                <div class="export-module-content" id="exportModuleContent-batchSummary">
+                                    <div class="export-module-fields">
+                                        ${this.renderExportFieldOption('batchSummary', 'exportSummaryBasic', 'Basic Overview', 'Exports batch ID, status, organization, community type, and input unit.')}
+                                        ${this.renderExportFieldOption('batchSummary', 'exportSummaryDates', 'Dates and Filters', 'Exports batch start date, finished date, selected date range, and record count.')}
+                                        ${this.renderExportFieldOption('batchSummary', 'exportSummaryTotals', 'System Totals', 'Exports initial stock, total organic input, total water added, and batch total system input.')}
+                                        ${this.renderExportFieldOption('batchSummary', 'exportSummaryCalculation', 'Calculation Settings', 'Exports the compost conversion rate used for estimation.')}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="export-module-card" id="exportModuleCard-dailyRecords">
+                                <div class="export-module-header">
+                                    <label class="export-module-main">
+                                        <input type="checkbox" id="exportModule-dailyRecords" checked onchange="app.setExportModule('dailyRecords', this.checked)">
+                                        <div>
+                                            <div class="export-module-title">🗂️ Daily Records</div>
+                                            <div class="export-module-subtitle">Inputs, monitoring, actions, and observations by record date</div>
+                                        </div>
+                                    </label>
+                                    <button type="button" class="export-module-expand" onclick="app.toggleExportModule('dailyRecords')">
+                                        <span id="exportModuleIcon-dailyRecords">▾</span>
+                                    </button>
+                                </div>
+                                <div class="export-module-content" id="exportModuleContent-dailyRecords">
+                                    <div class="export-module-fields">
+                                        ${this.renderExportFieldOption('dailyRecords', 'exportTotalInput', 'Organic / Structural / Total Input', 'Exports the total organic waste, total structural material, and total input for each daily record.')}
+                                        ${isICTA ? `
+                                            ${this.renderExportFieldOption('dailyRecords', 'exportCocinaPlanta', 'Cocina / Planta Breakdown', 'Exports the ICTA food waste breakdown by Cocina and Planta collection points.')}
+                                            ${this.renderExportFieldOption('dailyRecords', 'exportStructural', 'Structuring Material Breakdown', 'Exports ICTA structural inputs such as ratio, wood, and wood chips.')}
+                                        ` : `
+                                            ${this.renderExportFieldOption('dailyRecords', 'exportTotalWasteInput', 'Regular Organic Waste', 'Exports the main organic waste amount entered for each record, before additional materials are added.')}
+                                            ${this.renderExportFieldOption('dailyRecords', 'exportStructuralMaterials', 'Structural Materials', 'Exports the detailed list of structural materials entered for each record.')}
+                                        `}
+                                        ${this.renderExportFieldOption('dailyRecords', 'exportAdditionalInput', 'Additional Input Breakdown', 'Exports extra materials added to the system, including their source, type, and amount.')}
+                                        ${this.renderExportFieldOption('dailyRecords', 'exportQuality', 'Input Quality', 'Exports the quality rating or condition of the input materials.')}
+                                        ${this.renderExportFieldOption('dailyRecords', 'exportTemperature', 'Temperature', 'Exports ambient, core, transition, outer, and average temperature values.')}
+                                        ${this.renderExportFieldOption('dailyRecords', 'exportMoisture', 'Moisture', 'Exports moisture type, moisture percentage, or qualitative moisture assessment.')}
+                                        ${this.renderExportFieldOption('dailyRecords', 'exportOxygen', 'Oxygen', 'Exports oxygen measurement values when available.')}
+                                        ${this.renderExportFieldOption('dailyRecords', 'exportPhase', 'Phase', 'Exports the composting phase tracked for each record.')}
+                                        ${this.renderExportFieldOption('dailyRecords', 'exportOperations', 'Actions and Operations', 'Exports turning, mixing, water added, water added amount, and no-action status.')}
+                                        ${this.renderExportFieldOption('dailyRecords', 'exportOdour', 'Odour', 'Exports odour observation and any odour notes recorded on that date.')}
+                                        ${this.renderExportFieldOption('dailyRecords', 'exportLeachate', 'Leachate', 'Exports leachate observation and any related notes recorded on that date.')}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="export-module-card" id="exportModuleCard-harvest">
+                                <div class="export-module-header">
+                                    <label class="export-module-main">
+                                        <input type="checkbox" id="exportModule-harvest" checked onchange="app.setExportModule('harvest', this.checked)">
+                                        <div>
+                                            <div class="export-module-title">📦 Harvest Summary</div>
+                                            <div class="export-module-subtitle">Estimated output, actual output, and optional final moisture</div>
+                                        </div>
+                                    </label>
+                                    <button type="button" class="export-module-expand" onclick="app.toggleExportModule('harvest')">
+                                        <span id="exportModuleIcon-harvest">▾</span>
+                                    </button>
+                                </div>
+                                <div class="export-module-content" id="exportModuleContent-harvest">
+                                    <div class="export-module-fields">
+                                        ${this.renderExportFieldOption('harvest', 'exportOutput', 'Harvest Output Details', 'Exports harvest status, estimated output, harvest date, actual compost output, and notes.')}
+                                        ${this.renderExportFieldOption('harvest', 'exportMoistureFinal', 'Final Moisture in Harvest Summary', 'Adds final moisture type, value, and assessment into the harvest summary section.')}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="export-module-card" id="exportModuleCard-finalAssessment">
+                                <div class="export-module-header">
+                                    <label class="export-module-main">
+                                        <input type="checkbox" id="exportModule-finalAssessment" checked onchange="app.setExportModule('finalAssessment', this.checked)">
+                                        <div>
+                                            <div class="export-module-title">🟣 Final Assessment</div>
+                                            <div class="export-module-subtitle">Final compost measurements and assessment details</div>
+                                        </div>
+                                    </label>
+                                    <button type="button" class="export-module-expand" onclick="app.toggleExportModule('finalAssessment')">
+                                        <span id="exportModuleIcon-finalAssessment">▾</span>
+                                    </button>
+                                </div>
+                                <div class="export-module-content" id="exportModuleContent-finalAssessment">
+                                    <div class="export-module-fields">
+                                        ${this.renderExportFieldOption('finalAssessment', 'exportFinalAssessment', 'Final Compost Assessment', 'Exports final temperature, moisture, odour, and final compost photo count.')}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <h2 class="card-title">📄 Export Format</h2>
+                        <div class="radio-group" style="margin-top: 15px;">
+                            <label class="radio-item">
+                                <input type="radio" name="exportFormat" value="csv" checked>
+                                ○ CSV
+                            </label>
+                            <label class="radio-item">
+                                <input type="radio" name="exportFormat" value="excel">
+                                ○ Excel (.xls)
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="action-panel">
+                        <div class="btn-group">
+                            <button type="button" class="btn btn-primary" onclick="app.exportData()">
+                                📥 Export Data
+                            </button>
+                        </div>
+                    </div>
+                </form>
+            </div>
+        `;
+    },
+
+    toggleExportModule(moduleId) {
+        const content = document.getElementById(`exportModuleContent-${moduleId}`);
+        const icon = document.getElementById(`exportModuleIcon-${moduleId}`);
+        if (!content || !icon) return;
+        const isHidden = content.style.display === 'none';
+        content.style.display = isHidden ? 'block' : 'none';
+        icon.textContent = isHidden ? '▾' : '▸';
+    },
+
+    setExportModule(moduleId, checked) {
+        const card = document.getElementById(`exportModuleCard-${moduleId}`);
+        const fieldItems = Array.from(document.querySelectorAll(`[data-export-module="${moduleId}"]`));
+        fieldItems.forEach((item) => {
+            item.classList.toggle('export-field-item-disabled', !checked);
+            const input = item.querySelector('input[type="checkbox"]');
+            if (input) input.disabled = !checked;
+        });
+        if (card) card.classList.toggle('export-module-card-disabled', !checked);
+    },
+
+    initializeExportFieldSelection() {
+        ['batchSummary', 'dailyRecords', 'harvest', 'finalAssessment'].forEach((moduleId) => {
+            const master = document.getElementById(`exportModule-${moduleId}`);
+            this.setExportModule(moduleId, !!master?.checked);
+        });
+    },
+
+    attachEventListeners() {
+        const loginForm = document.getElementById('loginForm');
+        if (loginForm) {
+            loginForm.addEventListener('submit', (e) => {
+                e.preventDefault();
+                this.handleLoginSubmit();
+            });
+        }
+        const rememberMeEl = document.getElementById('loginRememberMe');
+        if (rememberMeEl) {
+            rememberMeEl.addEventListener('change', () => {
+                this.data.rememberMe = !!rememberMeEl.checked;
+                localStorage.setItem('compostRememberMe', this.data.rememberMe ? 'true' : 'false');
+            });
+        }
+
+        const registerForm = document.getElementById('registerForm');
+        if (registerForm) {
+            registerForm.addEventListener('submit', (e) => {
+                e.preventDefault();
+                this.handleRegisterSubmit();
+            });
+        }
+
+        const communityTypeOther = document.getElementById('registerCommunityTypeOther');
+        const communityTypeRadios = document.querySelectorAll('input[name="registerCommunityType"]');
+        if (communityTypeRadios && communityTypeRadios.length > 0 && communityTypeOther) {
+            communityTypeRadios.forEach((radio) => {
+                radio.addEventListener('change', () => {
+                    this.updateRegisterCommunityTypeOtherVisibility();
+                });
+            });
+            this.updateRegisterCommunityTypeOtherVisibility();
+        }
+
+        const createBatchForm = document.getElementById('createBatchForm');
+        if (createBatchForm) {
+            createBatchForm.addEventListener('submit', (e) => {
+                e.preventDefault();
+                this.saveBatch();
+            });
+        }
+        const inputMethodRadios = document.querySelectorAll('input[name="inputMethod"]');
+        if (inputMethodRadios && inputMethodRadios.length > 0) {
+            inputMethodRadios.forEach((radio) => {
+                radio.addEventListener('change', () => {
+                    this.updateCreateBatchMeasurementSettingsVisibility();
+                });
+            });
+            this.updateCreateBatchMeasurementSettingsVisibility();
+        }
+        const bucketSizeRadios = document.querySelectorAll('input[name="bucketSize"]');
+        if (bucketSizeRadios && bucketSizeRadios.length > 0) {
+            bucketSizeRadios.forEach((radio) => {
+                radio.addEventListener('change', () => {
+                    this.updateCreateBatchBucketCustomVisibility();
+                });
+            });
+            this.updateCreateBatchBucketCustomVisibility();
+        }
+        const conversionRateRadios = document.querySelectorAll('input[name="conversionRateMode"]');
+        if (conversionRateRadios && conversionRateRadios.length > 0) {
+            conversionRateRadios.forEach((radio) => {
+                radio.addEventListener('change', () => {
+                    this.updateCreateBatchCalculationSettingsVisibility();
+                });
+            });
+            this.updateCreateBatchCalculationSettingsVisibility();
+        }
+        const numCompostersEl = document.getElementById('numComposters');
+        if (numCompostersEl) {
+            numCompostersEl.addEventListener('input', () => {
+                this.updateCreateBatchComposterTable();
+            });
+            numCompostersEl.addEventListener('change', () => {
+                this.updateCreateBatchComposterTable();
+            });
+            this.updateCreateBatchComposterTable();
+        }
+        const collaborationRadios = document.querySelectorAll('input[name="collaborationType"]');
+        if (collaborationRadios && collaborationRadios.length > 0) {
+            collaborationRadios.forEach((radio) => {
+                radio.addEventListener('change', () => {
+                    this.updateCreateBatchCollaborationVisibility();
+                });
+            });
+            this.updateCreateBatchCollaborationVisibility();
+        }
+
+        const dailyRecordForm = document.getElementById('dailyRecordForm');
+        if (dailyRecordForm) {
+            dailyRecordForm.addEventListener('submit', (e) => {
+                e.preventDefault();
+                this.saveDailyRecord();
+            });
+        }
+
+        const outputForm = document.getElementById('outputForm');
+        if (outputForm) {
+            outputForm.addEventListener('submit', (e) => {
+                e.preventDefault();
+                this.saveOutput();
+            });
+        }
+
+        if (this.data.currentPage === 'export') {
+            this.initializeExportFieldSelection();
+        }
+
+        if (this.data.currentPage === 'dailyRecord') {
+            this.updateICTAMoistureAssessmentVisibility();
+            this.updateMaintenanceTotals();
+            this.updateICTAActionTakenVisibility();
+            this.updateICTAPhotoGridDom();
+            if (!this.isICTAUser()) {
+                this.updateNonICTAMaintenanceRowVisibility();
+                this.updateNonICTAMaintenanceTotals();
+            }
+
+            const takeInput = document.getElementById('ictaTakePhotoInput');
+            if (takeInput) {
+                takeInput.addEventListener('change', () => {
+                    const files = Array.from(takeInput.files || []);
+                    this.handleICTAPhotoFiles(files);
+                    takeInput.value = '';
+                });
+            }
+            const uploadInput = document.getElementById('ictaUploadPhotoInput');
+            if (uploadInput) {
+                uploadInput.addEventListener('change', () => {
+                    const files = Array.from(uploadInput.files || []);
+                    this.handleICTAPhotoFiles(files);
+                    uploadInput.value = '';
+                });
+            }
+            const chooseInput = document.getElementById('ictaChooseFileInput');
+            if (chooseInput) {
+                chooseInput.addEventListener('change', () => {
+                    const files = Array.from(chooseInput.files || []);
+                    this.handleICTAPhotoFiles(files);
+                    chooseInput.value = '';
+                });
+            }
+            const replaceInput = document.getElementById('ictaReplacePhotoInput');
+            if (replaceInput) {
+                replaceInput.addEventListener('change', () => {
+                    const files = Array.from(replaceInput.files || []);
+                    this.handleICTAReplacePhotoFiles(files);
+                    replaceInput.value = '';
+                });
+            }
+        }
+    },
+
+    async handleLoginSubmit() {
+        if (this.data.authSubmitting) return;
+        const email = this.normalizeEmail(document.getElementById('loginEmail')?.value);
+        const password = document.getElementById('loginPassword')?.value || '';
+        if (!email || !password) {
+            alert('Please fill in all required fields');
+            return;
+        }
+        this.data.authSubmitting = true;
+        const submitBtn = document.querySelector('#loginForm button[type="submit"]');
+        if (submitBtn) submitBtn.disabled = true;
+        try {
+            await this.loginUser(email, password);
+        } finally {
+            this.data.authSubmitting = false;
+            if (submitBtn) submitBtn.disabled = false;
+        }
+    },
+
+    updateRegisterCommunityTypeOtherVisibility() {
+        const otherInput = document.getElementById('registerCommunityTypeOther');
+        if (!otherInput) return;
+        const selected = document.querySelector('input[name="registerCommunityType"]:checked')?.value || '';
+        const isOther = selected === 'Other';
+        otherInput.style.display = isOther ? 'block' : 'none';
+        if (!isOther) otherInput.value = '';
+    },
+
+    updateCreateBatchMeasurementSettingsVisibility() {
+        const method = document.querySelector('input[name="inputMethod"]:checked')?.value || 'weight';
+        const volumeSettings = document.getElementById('volumeSettings');
+        const otherUnitSettings = document.getElementById('otherUnitSettings');
+        if (volumeSettings) volumeSettings.style.display = method === 'volume' ? 'block' : 'none';
+        if (otherUnitSettings) otherUnitSettings.style.display = method === 'other' ? 'block' : 'none';
+        if (method !== 'other') {
+            const customUnitName = document.getElementById('customUnitName');
+            if (customUnitName) customUnitName.value = '';
+        }
+        if (method !== 'volume') {
+            const customBucketSize = document.getElementById('customBucketSizeL');
+            if (customBucketSize) customBucketSize.value = '';
+        }
+        this.updateCreateBatchBucketCustomVisibility();
+        this.updateCreateBatchInitialStockVisibility();
+    },
+
+    updateCreateBatchInitialStockVisibility() {
+        const details = document.getElementById('initialStockDetails');
+        const amountEl = document.getElementById('initialStockAmount');
+        const composterEl = document.getElementById('initialStockComposterId');
+        const heightEl = document.getElementById('initialStockHeight');
+        const otherTypeEl = document.getElementById('initialStockOtherType');
+        const labelEl = document.getElementById('initialStockAmountLabel');
+        const composterLabel = document.getElementById('initialStockComposterLabel');
+        const heightLabel = document.getElementById('initialStockHeightLabel');
+        const typeLabel = document.getElementById('initialStockTypeLabel');
+        const otherTypeLabel = document.getElementById('initialStockOtherTypeLabel');
+        if (!details || !amountEl || !labelEl) return;
+
+        const selected = document.querySelector('input[name="initialStockExists"]:checked')?.value || 'no';
+        const show = selected === 'yes';
+        details.style.display = show ? 'block' : 'none';
+        amountEl.required = show;
+        if (composterEl) composterEl.required = show;
+        if (heightEl) heightEl.required = show;
+        if (!show) {
+            amountEl.value = '';
+            if (composterEl) composterEl.value = '';
+            if (heightEl) heightEl.value = '';
+            if (otherTypeEl) otherTypeEl.value = '';
+            const checkedType = document.querySelector('input[name="initialStockType"]:checked');
+            if (checkedType) checkedType.checked = false;
+        }
+
+        const method = document.querySelector('input[name="inputMethod"]:checked')?.value || 'weight';
+        let unit = 'kg';
+        if (method === 'volume') unit = 'L';
+        if (method === 'other') {
+            const custom = document.getElementById('customUnitName')?.value || '';
+            unit = String(custom).trim() || 'Unit';
+        }
+        labelEl.textContent = `Initial Stock Amount (${unit})`;
+        labelEl.classList.toggle('required', show);
+        if (composterLabel) composterLabel.classList.toggle('required', show);
+        if (heightLabel) heightLabel.classList.toggle('required', show);
+        if (typeLabel) typeLabel.classList.toggle('required', show);
+        if (otherTypeLabel) otherTypeLabel.classList.toggle('required', show && (document.querySelector('input[name="initialStockType"]:checked')?.value === 'Other'));
+        if (amountEl) amountEl.disabled = !show;
+        if (composterEl) composterEl.disabled = !show;
+        if (heightEl) heightEl.disabled = !show;
+        this.updateCreateBatchInitialStockComposterOptions();
+        this.updateCreateBatchInitialStockTypeVisibility();
+    },
+
+    updateCreateBatchInitialStockComposterOptions() {
+        const selectEl = document.getElementById('initialStockComposterId');
+        if (!selectEl) return;
+        const previousValue = selectEl.value;
+        const numEl = document.getElementById('numComposters');
+        let count = numEl ? parseInt(numEl.value, 10) : 0;
+        if (isNaN(count) || count < 1) count = 0;
+        const options = [];
+        for (let i = 1; i <= count; i++) {
+            const rawId = document.getElementById(`composterId_${i}`)?.value || '';
+            const composterId = String(rawId).trim() || String(i);
+            options.push(composterId);
+        }
+        const uniqueOptions = [...new Set(options)];
+        selectEl.innerHTML = `
+            <option value="">Select composter</option>
+            ${uniqueOptions.map((id) => `<option value="${String(id).replace(/"/g, '&quot;')}">${String(id).replace(/</g, '&lt;')}</option>`).join('')}
+        `;
+        if (uniqueOptions.includes(previousValue)) {
+            selectEl.value = previousValue;
+        }
+    },
+
+    updateCreateBatchInitialStockTypeVisibility() {
+        const selectedType = document.querySelector('input[name="initialStockType"]:checked')?.value || '';
+        const exists = document.querySelector('input[name="initialStockExists"]:checked')?.value === 'yes';
+        const otherGroup = document.getElementById('initialStockOtherTypeGroup');
+        const otherInput = document.getElementById('initialStockOtherType');
+        const otherLabel = document.getElementById('initialStockOtherTypeLabel');
+        const showOther = exists && selectedType === 'Other';
+        if (otherGroup) otherGroup.style.display = showOther ? 'block' : 'none';
+        if (otherInput) {
+            otherInput.required = showOther;
+            otherInput.disabled = !exists;
+            if (!showOther) otherInput.value = '';
+        }
+        if (otherLabel) otherLabel.classList.toggle('required', showOther);
+    },
+
+    updateCreateBatchCalculationSettingsVisibility() {
+        const selected = document.querySelector('input[name="conversionRateMode"]:checked')?.value || 'default';
+        const customSection = document.getElementById('customConversionRateSection');
+        const customInput = document.getElementById('customConversionRate');
+        const isCustom = selected === 'custom';
+        if (customSection) customSection.style.display = isCustom ? 'block' : 'none';
+        if (customInput) {
+            customInput.required = isCustom;
+            if (!isCustom) customInput.value = '';
+        }
+    },
+
+    updateCreateBatchBucketCustomVisibility() {
+        const method = document.querySelector('input[name="inputMethod"]:checked')?.value || 'weight';
+        const customInput = document.getElementById('customBucketSizeL');
+        if (!customInput) return;
+        if (method !== 'volume') {
+            customInput.style.display = 'none';
+            return;
+        }
+        const bucketSize = document.querySelector('input[name="bucketSize"]:checked')?.value || '2';
+        const isCustom = bucketSize === 'custom';
+        customInput.style.display = isCustom ? 'block' : 'none';
+        if (!isCustom) customInput.value = '';
+    },
+
+    updateCreateBatchCollaborationVisibility() {
+        const type = document.querySelector('input[name="collaborationType"]:checked')?.value || 'private';
+        const invite = document.getElementById('inviteCollaboratorsSection');
+        if (!invite) return;
+        const isShared = type === 'shared';
+        invite.style.display = isShared ? 'block' : 'none';
+        if (!isShared) {
+            const emailsEl = document.getElementById('collaboratorsEmails');
+            if (emailsEl) emailsEl.value = '';
+        }
+    },
+
+    async addBatchCollaborators(batchId) {
+        const batch = this.findBatchByRouteId(batchId);
+        if (!batch) return;
+        if (!this.isBatchOwner(batch)) {
+            alert('Only the batch owner can add collaborators.');
+            return;
+        }
+        const inputEl = document.getElementById('batchCollaboratorInput');
+        const raw = inputEl?.value || '';
+        const emails = raw
+            .split(/[,\n;]+/)
+            .map((value) => this.normalizeEmail(value))
+            .filter(Boolean);
+
+        if (emails.length === 0) {
+            alert('Please enter at least one collaborator email.');
+            return;
+        }
+
+        const invalid = emails.filter((email) => !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email));
+        if (invalid.length > 0) {
+            alert(`Invalid email(s): ${invalid.join(', ')}`);
+            return;
+        }
+
+        const ownerEmail = this.normalizeEmail(batch.ownerEmail || this.data.currentUser?.email || '');
+        const current = this.getBatchCollaborators(batch);
+        const merged = Array.from(new Set([...current, ...emails])).filter((email) => email !== ownerEmail);
+
+        if (merged.length === current.length) {
+            alert('All of these collaborators are already added.');
+            return;
+        }
+
+        this.updateBatchCollaborationFields(batch, merged);
+        this.appendBatchActivity(
+            batch,
+            'collaborators_added',
+            `${emails.length === 1 ? 'Added collaborator' : 'Added collaborators'}: ${emails.join(', ')}`,
+            { collaborators: emails }
+        );
+        await this.syncBatchCollaboration(batch);
+        if (inputEl) inputEl.value = '';
+        this.render();
+        this.showTransientSuccessMessage('✅ Collaborators updated successfully', 2200);
+    },
+
+    async removeBatchCollaborator(batchId, email) {
+        const batch = this.findBatchByRouteId(batchId);
+        if (!batch) return;
+        if (!this.isBatchOwner(batch)) {
+            alert('Only the batch owner can remove collaborators.');
+            return;
+        }
+
+        const targetEmail = this.normalizeEmail(email);
+        if (!targetEmail) return;
+        if (!confirm(`Remove ${targetEmail} from this shared batch?`)) return;
+
+        const next = this.getBatchCollaborators(batch).filter((value) => value !== targetEmail);
+        this.updateBatchCollaborationFields(batch, next);
+        this.appendBatchActivity(
+            batch,
+            'collaborator_removed',
+            `Removed collaborator: ${targetEmail}`,
+            { collaborator: targetEmail }
+        );
+        await this.syncBatchCollaboration(batch);
+        this.render();
+        this.showTransientSuccessMessage('✅ Collaborator removed', 2200);
+    },
+
+    async leaveSharedBatch(batchId) {
+        const batch = this.findBatchByRouteId(batchId);
+        if (!batch) return;
+        if (!this.isCurrentUserCollaborator(batch)) {
+            alert('You are not listed as a collaborator on this batch.');
+            return;
+        }
+
+        const currentEmail = this.normalizeEmail(this.data.currentUser?.email || '');
+        if (!currentEmail) return;
+        if (!confirm('Leave this shared batch? You can only access it again if the owner shares it with you again.')) return;
+
+        const next = this.getBatchCollaborators(batch).filter((email) => email !== currentEmail);
+        this.updateBatchCollaborationFields(batch, next);
+        this.appendBatchActivity(
+            batch,
+            'collaborator_left',
+            `Left shared batch: ${currentEmail}`,
+            { collaborator: currentEmail }
+        );
+        await this.syncBatchCollaboration(batch);
+        this.data.batches = this.data.batches.filter((item) => this.getBatchRouteId(item) !== this.getBatchRouteId(batch));
+        if (this.data.currentBatch && this.getBatchRouteId(this.data.currentBatch) === this.getBatchRouteId(batch)) {
+            this.data.currentBatch = null;
+        }
+        this.saveData();
+        this.navigate('dashboard');
+        this.showTransientSuccessMessage('✅ You left the shared batch', 2200);
+    },
+
+    updateCreateBatchComposterTable() {
+        const numEl = document.getElementById('numComposters');
+        const container = document.getElementById('composterTableContainer');
+        if (!numEl || !container) return;
+
+        let count = parseInt(numEl.value, 10);
+        if (isNaN(count) || count < 1) count = 1;
+        if (count > 50) count = 50;
+        if (String(count) !== String(numEl.value)) numEl.value = String(count);
+
+        const existing = [];
+        for (let i = 1; i <= 50; i++) {
+            const idEl = document.getElementById(`composterId_${i}`);
+            const capEl = document.getElementById(`composterCap_${i}`);
+            if (!idEl && !capEl) continue;
+            const idVal = idEl ? String(idEl.value || '').trim() : '';
+            const capVal = capEl && capEl.value !== '' ? parseFloat(capEl.value) : null;
+            existing[i] = { id: idVal, cap: capVal };
+        }
+
+        const rowsHtml = Array.from({ length: count }, (_, idx) => {
+            const i = idx + 1;
+            const prev = existing[i] || {};
+            const idValue = prev.id ? String(prev.id) : '';
+            const capValue = (prev.cap != null && !isNaN(prev.cap)) ? prev.cap : '';
+            return `
+                <tr>
+                    <td><input type="text" class="form-input" id="composterId_${i}" value="${String(idValue).replace(/"/g, '&quot;')}" placeholder="Composter ID"></td>
+                    <td><input type="number" class="form-input" id="composterCap_${i}" step="any" value="${capValue}" placeholder="Capacity (L)"></td>
+                </tr>
+            `;
+        }).join('');
+
+        container.innerHTML = `
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>Composter ID</th>
+                        <th>Capacity (L)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${rowsHtml}
+                </tbody>
+            </table>
+        `;
+        const composterIdInputs = container.querySelectorAll('input[id^="composterId_"]');
+        composterIdInputs.forEach((input) => {
+            input.addEventListener('input', () => {
+                this.updateCreateBatchInitialStockComposterOptions();
+            });
+            input.addEventListener('change', () => {
+                this.updateCreateBatchInitialStockComposterOptions();
+            });
+        });
+        this.updateCreateBatchInitialStockComposterOptions();
+    },
+
+    togglePasswordVisibility(inputId, toggleId) {
+        const input = document.getElementById(inputId);
+        const toggle = document.getElementById(toggleId);
+        if (!input || !toggle) return;
+        const isPassword = input.type === 'password';
+        input.type = isPassword ? 'text' : 'password';
+        toggle.textContent = isPassword ? '🙈' : '👀';
+    },
+
+    toggleObservations() {
+        const content = document.getElementById('observationsContent');
+        const icon = document.getElementById('observationsToggleIcon');
+        if (!content || !icon) return;
+        const isHidden = content.style.display === 'none' || content.style.display === '';
+        content.style.display = isHidden ? 'block' : 'none';
+        icon.textContent = isHidden ? '▾' : '▸';
+    },
+
+    toggleICTAMonitoringModule() {
+        const content = document.getElementById('monitoringModuleContent');
+        const icon = document.getElementById('monitoringModuleToggleIcon');
+        const text = document.getElementById('monitoringModuleToggleText');
+        if (!content || !icon || !text) return;
+        const isHidden = content.style.display === 'none' || content.style.display === '';
+        content.style.display = isHidden ? 'block' : 'none';
+        icon.textContent = isHidden ? '▾' : '▸';
+        this.syncModuleToggleText(text, 'Monitoring Module');
+    },
+
+    updateICTAMoistureAssessmentVisibility() {
+        const type = document.querySelector('input[name="moistureAssessmentType"]:checked')?.value || 'quantitative';
+        const quantitativeSection = document.getElementById('moistureQuantitativeSection');
+        const qualitativeSection = document.getElementById('moistureQualitativeSection');
+        if (quantitativeSection) quantitativeSection.style.display = type === 'quantitative' ? 'block' : 'none';
+        if (qualitativeSection) qualitativeSection.style.display = type === 'qualitative' ? 'block' : 'none';
+        if (type === 'quantitative') {
+            const qualitative = document.querySelectorAll('input[name="moistureQualitative"]');
+            qualitative.forEach(radio => { radio.checked = false; });
+        } else {
+            const moistureValue = document.getElementById('moistureValue');
+            if (moistureValue) moistureValue.value = '';
+        }
+    },
+
+    toggleICTAMaintenanceModule() {
+        const content = document.getElementById('maintenanceModuleContent');
+        const icon = document.getElementById('maintenanceModuleToggleIcon');
+        const text = document.getElementById('maintenanceModuleToggleText');
+        if (!content || !icon || !text) return;
+        const isHidden = content.style.display === 'none' || content.style.display === '';
+        content.style.display = isHidden ? 'block' : 'none';
+        icon.textContent = isHidden ? '▾' : '▸';
+        this.syncModuleToggleText(text, 'Maintenance Module');
+    },
+
+    toggleICTAOtherOrganicInput() {
+        const content = document.getElementById('otherOrganicContent');
+        const icon = document.getElementById('otherOrganicToggleIcon');
+        const text = document.getElementById('otherOrganicToggleText');
+        if (!content || !icon || !text) return;
+        const isHidden = content.style.display === 'none' || content.style.display === '';
+        content.style.display = isHidden ? 'block' : 'none';
+        icon.textContent = isHidden ? '▾' : '▸';
+        text.textContent = isHidden ? '☑ Other Organic Input (Optional)' : '☐ Other Organic Input (Optional)';
+        if (isHidden) this.updateMaintenanceTotals();
+    },
+
+    addMaintenanceAdditionalInputRow() {
+        const list = document.getElementById('maintenanceAdditionalInputsList');
+        if (!list) return;
+        const idx = list.querySelectorAll('.maintenance-additional-row').length;
+        const inputUnit = this.getBatchInputUnitName(this.data.currentBatch);
+        const sourceOptions = [
+            'Organic waste generated during events',
+            'Garden clean-up residues',
+            'Seasonal pruning residues',
+            'Research or experimental materials',
+            'Other occasional organic inputs'
+        ];
+        const row = document.createElement('div');
+        row.className = 'maintenance-additional-row';
+        row.innerHTML = `
+            <div class="maintenance-additional-grid">
+                <div class="form-group">
+                    <label class="form-label">Source</label>
+                    <select class="form-input maintenance-additional-source">
+                        <option value="">Select source...</option>
+                        ${sourceOptions.map(opt => `<option value="${opt.replace(/"/g, '&quot;')}">${opt}</option>`).join('')}
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Type</label>
+                    <div class="radio-group" style="gap: 14px;">
+                        <label class="radio-item">
+                            <input type="radio" name="maintenanceAdditionalType_${idx}" value="organic" checked>
+                            Organic Material
+                        </label>
+                        <label class="radio-item">
+                            <input type="radio" name="maintenanceAdditionalType_${idx}" value="structural">
+                            Structural Material
+                        </label>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Material Description</label>
+                    <input type="text" class="form-input maintenance-additional-desc" value="">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Amount (${inputUnit})</label>
+                    <input type="number" class="form-input maintenance-additional-amount" step="any" value="" />
+                </div>
+            </div>
+            <div style="display:flex; justify-content:flex-end; margin-top: 10px;">
+                <button type="button" class="btn btn-secondary" style="padding: 8px 12px;">− Remove</button>
+            </div>
+        `;
+        const removeBtn = row.querySelector('button');
+        if (removeBtn) removeBtn.onclick = () => this.removeMaintenanceAdditionalInputRow(removeBtn);
+        const inputs = row.querySelectorAll('input, select');
+        inputs.forEach((el) => {
+            el.addEventListener('input', () => this.updateMaintenanceTotals());
+            el.addEventListener('change', () => this.updateMaintenanceTotals());
+        });
+        list.appendChild(row);
+        this.updateMaintenanceTotals();
+    },
+
+    removeMaintenanceAdditionalInputRow(buttonEl) {
+        const row = buttonEl?.closest?.('.maintenance-additional-row');
+        const list = document.getElementById('maintenanceAdditionalInputsList');
+        if (!row || !list) return;
+        row.remove();
+        if (list.querySelectorAll('.maintenance-additional-row').length === 0) {
+            this.addMaintenanceAdditionalInputRow();
+            return;
+        }
+        this.updateMaintenanceTotals();
+    },
+
+    updateMaintenanceTotals() {
+        if (this.isICTAUser()) this.updateICTAMaintenanceTotals();
+        else this.updateNonICTAMaintenanceTotals();
+    },
+
+    updateICTAMaintenanceTotals() {
+        if (!this.isICTAUser()) return;
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+        const method = this.getBatchMeasurementSettings(batch)?.inputMethod || '';
+        const getNumber = (id) => {
+            const el = document.getElementById(id);
+            if (!el || el.value === '') return 0;
+            const n = parseFloat(el.value);
+            return isNaN(n) ? 0 : n;
+        };
+        const regularOrganicWaste = getNumber('foodWasteCocina') + getNumber('foodWastePlanta0') + getNumber('foodWastePlanta1') + getNumber('foodWastePlanta3');
+        const regularStructuralMaterial = getNumber('woodFusta') + getNumber('woodChips');
+        const additionalRows = Array.from(document.querySelectorAll('#maintenanceAdditionalInputsList .maintenance-additional-row'));
+        const additionalInputs = additionalRows.map((row) => {
+            const type = row.querySelector('input[type="radio"]:checked')?.value || 'organic';
+            const amountEl = row.querySelector('.maintenance-additional-amount');
+            const n = (amountEl && amountEl.value !== '') ? parseFloat(amountEl.value) : 0;
+            return { type, amount: isNaN(n) ? 0 : n };
+        });
+        const additionalTotals = this.calculateAdditionalInputTotals(additionalInputs);
+        const totalOrganicWaste = regularOrganicWaste + additionalTotals.additionalOrganicMaterial;
+        const totalStructuralMaterial = regularStructuralMaterial + additionalTotals.additionalStructuralMaterial;
+        const totalOrganicInput = totalOrganicWaste + totalStructuralMaterial;
+
+        const regularOrganicWasteEl = document.getElementById('regularOrganicWaste');
+        const regularStructuralEl = document.getElementById('regularStructuralMaterial');
+        const additionalOrganicEl = document.getElementById('additionalOrganicMaterial');
+        const additionalStructuralEl = document.getElementById('additionalStructuralMaterial');
+        const totalAdditionalEl = document.getElementById('totalAdditionalInput');
+        const totalOrganicWasteEl = document.getElementById('totalOrganicWaste');
+        const totalStructuralOverallEl = document.getElementById('totalStructuralMaterialOverall');
+        const totalOrganicEl = document.getElementById('totalOrganicInput');
+        if (regularOrganicWasteEl) regularOrganicWasteEl.textContent = this.formatNumber(regularOrganicWaste, 3);
+        if (regularStructuralEl) regularStructuralEl.textContent = this.formatNumber(regularStructuralMaterial, 3);
+        if (additionalOrganicEl) additionalOrganicEl.textContent = this.formatNumber(additionalTotals.additionalOrganicMaterial, 3);
+        if (additionalStructuralEl) additionalStructuralEl.textContent = this.formatNumber(additionalTotals.additionalStructuralMaterial, 3);
+        if (totalAdditionalEl) totalAdditionalEl.textContent = this.formatNumber(additionalTotals.totalAdditionalInput, 3);
+        if (totalOrganicWasteEl) totalOrganicWasteEl.textContent = this.formatNumber(totalOrganicWaste, 3);
+        if (totalStructuralOverallEl) totalStructuralOverallEl.textContent = this.formatNumber(totalStructuralMaterial, 3);
+        if (totalOrganicEl) totalOrganicEl.textContent = this.formatNumber(totalOrganicInput, 3);
+
+        const ratioEl = document.getElementById('foodStructuralRatio');
+        if (ratioEl) {
+            ratioEl.textContent = method === 'volume' ? this.simplifyRatio(totalOrganicWaste, totalStructuralMaterial) : '';
+        }
+    },
+
+    updateNonICTAMaintenanceRowVisibility() {
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+        const foodRows = Array.from(document.querySelectorAll('#nonIctaFoodWasteRows .nonicta-row'));
+        foodRows.forEach((row) => {
+            const typeSelect = row.querySelector('.nonicta-food-type');
+            const otherInput = row.querySelector('.nonicta-food-type-other');
+            const selected = typeSelect ? (typeSelect.value || '') : '';
+            if (otherInput) otherInput.style.display = selected === 'Other' ? 'block' : 'none';
+        });
+
+        const structRows = Array.from(document.querySelectorAll('#nonIctaStructuralRows .nonicta-row'));
+        structRows.forEach((row) => {
+            const typeSelect = row.querySelector('.nonicta-struct-type');
+            const otherInput = row.querySelector('.nonicta-struct-other');
+            const selected = typeSelect ? (typeSelect.value || '') : '';
+            if (otherInput) otherInput.style.display = selected === 'Other' ? 'block' : 'none';
+        });
+    },
+
+    addNonICTAFoodWasteRow() {
+        const list = document.getElementById('nonIctaFoodWasteRows');
+        if (!list) return;
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+        const idx = list.querySelectorAll('.nonicta-row').length;
+        const foodTypeOptions = [
+            'Fruit & Vegetable Waste',
+            'Cooked Food Waste',
+            'Coffee Grounds',
+            'Bread & Bakery Waste',
+            'Garden Waste',
+            'Mixed Organic Waste',
+            'Other'
+        ];
+        const row = document.createElement('div');
+        row.className = 'nonicta-row nonicta-row-grid three';
+        row.setAttribute('data-row-index', String(idx));
+        row.innerHTML = `
+            <div class="form-group" style="margin: 0;">
+                <input type="text" class="form-input nonicta-food-source" value="" placeholder="e.g., Kitchen, Restaurant, Market">
+            </div>
+            <div class="form-group" style="margin: 0;">
+                <select class="form-input nonicta-food-type">
+                    <option value="">Select type...</option>
+                    ${foodTypeOptions.map(opt => `<option value="${opt}">${opt}</option>`).join('')}
+                </select>
+                <input type="text" class="form-input nonicta-food-type-other" value="" placeholder="Specify Type" style="margin-top: 8px; display:none;">
+            </div>
+            <div class="form-group" style="margin: 0;">
+                <input type="number" class="form-input nonicta-food-amount" step="any" value="" placeholder="Enter number">
+            </div>
+            <div class="nonicta-row-actions">
+                <button type="button" class="btn btn-secondary" style="padding: 8px 12px;">− Remove</button>
+            </div>
+        `;
+        const removeBtn = row.querySelector('button');
+        if (removeBtn) removeBtn.onclick = () => this.removeNonICTAFoodWasteRow(removeBtn);
+        const inputs = row.querySelectorAll('input, select');
+        inputs.forEach((el) => {
+            el.addEventListener('input', () => { this.updateNonICTAMaintenanceRowVisibility(); this.updateNonICTAMaintenanceTotals(); });
+            el.addEventListener('change', () => { this.updateNonICTAMaintenanceRowVisibility(); this.updateNonICTAMaintenanceTotals(); });
+        });
+        list.appendChild(row);
+        this.updateNonICTAMaintenanceRowVisibility();
+        this.updateNonICTAMaintenanceTotals();
+    },
+
+    removeNonICTAFoodWasteRow(arg) {
+        const list = document.getElementById('nonIctaFoodWasteRows');
+        if (!list) return;
+        const row = (typeof arg === 'number')
+            ? Array.from(list.querySelectorAll('.nonicta-row'))[arg]
+            : arg?.closest?.('.nonicta-row');
+        if (!row) return;
+        row.remove();
+        if (list.querySelectorAll('.nonicta-row').length === 0) {
+            this.addNonICTAFoodWasteRow();
+            return;
+        }
+        this.updateNonICTAMaintenanceRowVisibility();
+        this.updateNonICTAMaintenanceTotals();
+    },
+
+    addNonICTAStructuralRow() {
+        const list = document.getElementById('nonIctaStructuralRows');
+        if (!list) return;
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+        const idx = list.querySelectorAll('.nonicta-row').length;
+        const options = ['Wood Chips', 'Dry Leaves', 'Pruning Waste', 'Sawdust', 'Other'];
+        const row = document.createElement('div');
+        row.className = 'nonicta-row nonicta-row-grid three';
+        row.setAttribute('data-row-index', String(idx));
+        row.innerHTML = `
+            <div class="form-group" style="margin: 0;">
+                <select class="form-input nonicta-struct-type">
+                    <option value="">Select type...</option>
+                    ${options.map(opt => `<option value="${opt}">${opt}</option>`).join('')}
+                </select>
+            </div>
+            <div class="form-group" style="margin: 0;">
+                <input type="text" class="form-input nonicta-struct-other" value="" placeholder="Specify Material" style="display:none;">
+            </div>
+            <div class="form-group" style="margin: 0;">
+                <input type="number" class="form-input nonicta-struct-amount" step="any" value="" placeholder="Enter number">
+            </div>
+            <div class="nonicta-row-actions">
+                <button type="button" class="btn btn-secondary" style="padding: 8px 12px;">− Remove</button>
+            </div>
+        `;
+        const removeBtn = row.querySelector('button');
+        if (removeBtn) removeBtn.onclick = () => this.removeNonICTAStructuralRow(removeBtn);
+        const inputs = row.querySelectorAll('input, select');
+        inputs.forEach((el) => {
+            el.addEventListener('input', () => { this.updateNonICTAMaintenanceRowVisibility(); this.updateNonICTAMaintenanceTotals(); });
+            el.addEventListener('change', () => { this.updateNonICTAMaintenanceRowVisibility(); this.updateNonICTAMaintenanceTotals(); });
+        });
+        list.appendChild(row);
+        this.updateNonICTAMaintenanceRowVisibility();
+        this.updateNonICTAMaintenanceTotals();
+    },
+
+    removeNonICTAStructuralRow(arg) {
+        const list = document.getElementById('nonIctaStructuralRows');
+        if (!list) return;
+        const row = (typeof arg === 'number')
+            ? Array.from(list.querySelectorAll('.nonicta-row'))[arg]
+            : arg?.closest?.('.nonicta-row');
+        if (!row) return;
+        row.remove();
+        if (list.querySelectorAll('.nonicta-row').length === 0) {
+            this.addNonICTAStructuralRow();
+            return;
+        }
+        this.updateNonICTAMaintenanceRowVisibility();
+        this.updateNonICTAMaintenanceTotals();
+    },
+
+    updateNonICTAMaintenanceTotals() {
+        if (this.isICTAUser()) return;
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+
+        const foodRows = Array.from(document.querySelectorAll('#nonIctaFoodWasteRows .nonicta-row'));
+        const regularOrganicWaste = foodRows.reduce((s, row) => {
+            const amountEl = row.querySelector('.nonicta-food-amount');
+            const n = (amountEl && amountEl.value !== '') ? parseFloat(amountEl.value) : 0;
+            return s + (isNaN(n) ? 0 : n);
+        }, 0);
+
+        const structRows = Array.from(document.querySelectorAll('#nonIctaStructuralRows .nonicta-row'));
+        const regularStructuralMaterial = structRows.reduce((s, row) => {
+            const amountEl = row.querySelector('.nonicta-struct-amount');
+            const n = (amountEl && amountEl.value !== '') ? parseFloat(amountEl.value) : 0;
+            return s + (isNaN(n) ? 0 : n);
+        }, 0);
+
+        const additionalRows = Array.from(document.querySelectorAll('#maintenanceAdditionalInputsList .maintenance-additional-row'));
+        const additionalInputs = additionalRows.map((row) => {
+            const type = row.querySelector('input[type="radio"]:checked')?.value || 'organic';
+            const amountEl = row.querySelector('.maintenance-additional-amount');
+            const n = (amountEl && amountEl.value !== '') ? parseFloat(amountEl.value) : 0;
+            return { type, amount: isNaN(n) ? 0 : n };
+        });
+        const additionalTotals = this.calculateAdditionalInputTotals(additionalInputs);
+        const totalOrganicWaste = regularOrganicWaste + additionalTotals.additionalOrganicMaterial;
+        const totalStructuralMaterial = regularStructuralMaterial + additionalTotals.additionalStructuralMaterial;
+        const totalOrganicInput = totalOrganicWaste + totalStructuralMaterial;
+
+        const regularOrganicWasteEl = document.getElementById('regularOrganicWaste');
+        const regularStructuralEl = document.getElementById('regularStructuralMaterial');
+        const additionalOrganicEl = document.getElementById('additionalOrganicMaterial');
+        const additionalStructuralEl = document.getElementById('additionalStructuralMaterial');
+        const totalAdditionalEl = document.getElementById('totalAdditionalInput');
+        const totalOrganicWasteEl = document.getElementById('totalOrganicWaste');
+        const totalStructuralOverallEl = document.getElementById('totalStructuralMaterialOverall');
+        const totalOrganicEl = document.getElementById('totalOrganicInput');
+        if (regularOrganicWasteEl) regularOrganicWasteEl.textContent = this.formatNumber(regularOrganicWaste, 3);
+        if (regularStructuralEl) regularStructuralEl.textContent = this.formatNumber(regularStructuralMaterial, 3);
+        if (additionalOrganicEl) additionalOrganicEl.textContent = this.formatNumber(additionalTotals.additionalOrganicMaterial, 3);
+        if (additionalStructuralEl) additionalStructuralEl.textContent = this.formatNumber(additionalTotals.additionalStructuralMaterial, 3);
+        if (totalAdditionalEl) totalAdditionalEl.textContent = this.formatNumber(additionalTotals.totalAdditionalInput, 3);
+        if (totalOrganicWasteEl) totalOrganicWasteEl.textContent = this.formatNumber(totalOrganicWaste, 3);
+        if (totalStructuralOverallEl) totalStructuralOverallEl.textContent = this.formatNumber(totalStructuralMaterial, 3);
+        if (totalOrganicEl) totalOrganicEl.textContent = this.formatNumber(totalOrganicInput, 3);
+    },
+
+    toggleICTAActionTakenModule() {
+        const content = document.getElementById('actionTakenContent');
+        const icon = document.getElementById('actionTakenToggleIcon');
+        const text = document.getElementById('actionTakenToggleText');
+        if (!content || !icon || !text) return;
+        const isHidden = content.style.display === 'none' || content.style.display === '';
+        content.style.display = isHidden ? 'block' : 'none';
+        icon.textContent = isHidden ? '▾' : '▸';
+        this.syncModuleToggleText(text, 'Action Taken');
+    },
+
+    updateICTAActionTakenVisibility() {
+        const chips = Array.from(document.querySelectorAll('.action-chip'));
+        chips.forEach((chip) => {
+            const cb = chip.querySelector('input[type="checkbox"]');
+            if (cb && cb.checked) chip.classList.add('selected');
+            else chip.classList.remove('selected');
+        });
+
+        const addedWater = !!document.getElementById('actionAddedWater')?.checked;
+        const removedImpurities = !!document.getElementById('actionRemovedImpurities')?.checked;
+        const other = !!document.getElementById('actionOther')?.checked;
+
+        const waterFields = document.getElementById('actionWaterFields');
+        const removedFields = document.getElementById('actionRemovedFields');
+        const otherFields = document.getElementById('actionOtherFields');
+
+        if (waterFields) waterFields.style.display = addedWater ? 'block' : 'none';
+        if (removedFields) removedFields.style.display = removedImpurities ? 'block' : 'none';
+        if (otherFields) otherFields.style.display = other ? 'block' : 'none';
+
+        if (!addedWater) {
+            const amount = document.getElementById('waterAddedAmount');
+            if (amount) amount.value = '';
+        }
+        if (!removedImpurities) {
+            const desc = document.getElementById('removedImpuritiesDescription');
+            if (desc) desc.value = '';
+        }
+        if (!other) {
+            const desc = document.getElementById('otherActionDescription');
+            if (desc) desc.value = '';
+        }
+    },
+
+    toggleICTAPhotoUploadModule() {
+        const content = document.getElementById('photoUploadContent');
+        const icon = document.getElementById('photoUploadToggleIcon');
+        const text = document.getElementById('photoUploadToggleText');
+        if (!content || !icon || !text) return;
+        const isHidden = content.style.display === 'none' || content.style.display === '';
+        content.style.display = isHidden ? 'block' : 'none';
+        icon.textContent = isHidden ? '▾' : '▸';
+        this.syncModuleToggleText(text, 'Photo Upload');
+        if (isHidden) this.updateICTAPhotoGridDom();
+    },
+
+    toggleICTANotesModule() {
+        const content = document.getElementById('ictaNotesContent');
+        const icon = document.getElementById('ictaNotesToggleIcon');
+        const text = document.getElementById('ictaNotesToggleText');
+        if (!content || !icon || !text) return;
+        const isHidden = content.style.display === 'none' || content.style.display === '';
+        content.style.display = isHidden ? 'block' : 'none';
+        icon.textContent = isHidden ? '▾' : '▸';
+        this.syncModuleToggleText(text, 'Notes (Optional)');
+    },
+
+    openICTAPhotoPicker(type) {
+        this.data.ictaPhotoReplaceIndex = null;
+        const input = type === 'take'
+            ? document.getElementById('ictaTakePhotoInput')
+            : type === 'upload'
+                ? document.getElementById('ictaUploadPhotoInput')
+                : document.getElementById('ictaChooseFileInput');
+        if (!input) return;
+        input.click();
+    },
+
+    openICTAPhotoReplace(index) {
+        this.data.ictaPhotoReplaceIndex = Number.isFinite(index) ? index : null;
+        const input = document.getElementById('ictaReplacePhotoInput');
+        if (!input) return;
+        input.click();
+    },
+
+    async handleICTAPhotoFiles(files) {
+        if (!Array.isArray(this.data.ictaPhotoDraft)) this.data.ictaPhotoDraft = [];
+        const validFiles = files.filter((file) => {
+            const type = String(file?.type || '').toLowerCase();
+            return type === 'image/jpeg' || type === 'image/jpg' || type === 'image/png';
+        });
+        if (validFiles.length !== files.length) {
+            alert('Only JPG, JPEG, and PNG files are supported.');
+        }
+        const remaining = Math.max(0, 9 - this.data.ictaPhotoDraft.length);
+        const picked = validFiles.slice(0, remaining);
+        if (validFiles.length > remaining) {
+            alert(`You can upload up to 9 photos. Only ${remaining} more photo(s) can be added.`);
+        }
+        for (const file of picked) {
+            const dataUrl = await this.convertImageFileToDataUrl(file);
+            if (!dataUrl) continue;
+            this.data.ictaPhotoDraft.push(dataUrl);
+        }
+        this.data.ictaPhotoDraft = this.data.ictaPhotoDraft.slice(0, 9);
+        this.updateICTAPhotoGridDom();
+    },
+
+    async handleICTAReplacePhotoFiles(files) {
+        if (!Array.isArray(this.data.ictaPhotoDraft)) this.data.ictaPhotoDraft = [];
+        const idx = this.data.ictaPhotoReplaceIndex;
+        if (idx == null || idx < 0 || idx >= this.data.ictaPhotoDraft.length) {
+            await this.handleICTAPhotoFiles(files);
+            return;
+        }
+        const file = files[0];
+        if (!file) return;
+        const type = String(file.type || '').toLowerCase();
+        if (!(type === 'image/jpeg' || type === 'image/jpg' || type === 'image/png')) {
+            alert('Only JPG, JPEG, and PNG files are supported.');
+            return;
+        }
+        const dataUrl = await this.convertImageFileToDataUrl(file);
+        if (!dataUrl) return;
+        this.data.ictaPhotoDraft[idx] = dataUrl;
+        this.updateICTAPhotoGridDom();
+    },
+
+    async convertImageFileToDataUrl(file) {
+        if (!file) return null;
+        const type = (file.type || '').toLowerCase();
+        if (!(type === 'image/jpeg' || type === 'image/jpg' || type === 'image/png')) return null;
+        const dataUrl = await new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result || ''));
+            reader.onerror = () => resolve(null);
+            reader.readAsDataURL(file);
+        });
+        if (!dataUrl) return null;
+        const img = await new Promise((resolve) => {
+            const i = new Image();
+            i.onload = () => resolve(i);
+            i.onerror = () => resolve(null);
+            i.src = dataUrl;
+        });
+        if (!img) return null;
+
+        const maxDim = 1280;
+        const scale = Math.min(1, maxDim / Math.max(img.width || 1, img.height || 1));
+        const w = Math.max(1, Math.round((img.width || 1) * scale));
+        const h = Math.max(1, Math.round((img.height || 1) * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return dataUrl;
+        ctx.drawImage(img, 0, 0, w, h);
+
+        const outType = type === 'image/png' ? 'image/png' : 'image/jpeg';
+        const out = outType === 'image/jpeg'
+            ? canvas.toDataURL(outType, 0.85)
+            : canvas.toDataURL(outType);
+        return out || dataUrl;
+    },
+
+    updateICTAPhotoGridDom() {
+        const grid = document.getElementById('ictaPhotoGrid');
+        if (!grid) return;
+        const photos = Array.isArray(this.data.ictaPhotoDraft) ? this.data.ictaPhotoDraft : [];
+        grid.innerHTML = this.renderICTAPhotoGridHtml(photos);
+    },
+
+    viewICTAPhoto(index) {
+        const photos = Array.isArray(this.data.ictaPhotoDraft) ? this.data.ictaPhotoDraft : [];
+        const src = this.getPhotoPreviewSrc(photos[index]);
+        if (!src) return;
+        const body = `<img src="${src}" alt="Photo ${index + 1}" style="max-width: 100%; border-radius: 12px;">`;
+        this.showInfoModal(`Photo ${index + 1}`, body);
+    },
+
+    deleteICTAPhoto(index) {
+        if (!Array.isArray(this.data.ictaPhotoDraft)) return;
+        this.data.ictaPhotoDraft.splice(index, 1);
+        this.updateICTAPhotoGridDom();
+    },
+
+    showOrganicStructuralRatioGuide() {
+        const body = `
+            <div style="line-height: 1.8;">
+                <div style="font-weight: 700; margin-bottom: 8px;">Recommended Ratio</div>
+                <div style="margin-bottom: 14px;">
+                    <div style="color: var(--gray);">Food Waste : Structural Material</div>
+                    <div style="font-weight: 700;">Recommended: 2 : 1 to 1 : 1</div>
+                </div>
+                <div style="font-weight: 700; margin-bottom: 8px;">Example</div>
+                <div style="margin-bottom: 10px;">2 buckets food waste + 1 bucket structural material = <strong>2 : 1</strong></div>
+                <div>1 bucket food waste + 1 bucket structural material = <strong>1 : 1</strong></div>
+            </div>
+        `;
+        this.showInfoModal('ⓘ Organic : Structural Ratio Guide', body);
+    },
+
+    showTemperatureGuide(type) {
+        const labelMap = {
+            core: 'Core Temperature',
+            transition: 'Transition Temperature',
+            outer: 'Outer Temperature'
+        };
+        const title = `How to Measure ${labelMap[type] || 'Temperature'}`;
+        const guideImgMap = {
+            core: 'assets/temperature-guides/core.jpg',
+            transition: 'assets/temperature-guides/transition.jpg',
+            outer: 'assets/temperature-guides/outer.jpg'
+        };
+        const guideSrc = guideImgMap[type] || '';
+        const illustration = guideSrc
+            ? `
+                <div class="temperature-guide-illustration">
+                    <img class="temperature-guide-image" src="${guideSrc}" alt="${labelMap[type] || 'Temperature'} guide image" onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">
+                    <div style="display:none;">${this.renderMonitoringPlaceholder('Thermometer insertion into compost pile')}</div>
+                </div>
+            `
+            : this.renderMonitoringPlaceholder('Thermometer insertion into compost pile');
+        const body = `
+            <div style="margin-bottom: 16px;">
+                <div style="font-weight: 700; margin-bottom: 8px;">Illustration:</div>
+                ${illustration}
+            </div>
+            <div style="font-weight: 700; margin-bottom: 8px;">Procedure</div>
+            <ol style="padding-left: 20px; line-height: 1.7;">
+                <li>Insert the thermometer into the compost pile.</li>
+                <li>Ensure a depth of approximately 30–50 cm.</li>
+                <li>Wait at least 2 minutes.</li>
+                <li>Measure temperature before turning or mixing the compost.</li>
+            </ol>
+        `;
+        this.showInfoModal(title, body);
+    },
+
+    showOdourGuide() {
+        const body = `
+            <div style="line-height: 1.8;">
+                <div style="margin-bottom: 10px;">• <strong>No odour:</strong><br>No noticeable smell.</div>
+                <div style="margin-bottom: 10px;">• <strong>Detected &lt;1 m:</strong><br>Odour only noticeable close to the composter.</div>
+                <div style="margin-bottom: 10px;">• <strong>Detected 1–5 m:</strong><br>Odour detectable around the composting area.</div>
+                <div>• <strong>Detected &gt;5 m:</strong><br>Strong odour detectable at a considerable distance.</div>
+            </div>
+        `;
+        this.showInfoModal('🌿 Odour Assessment Guide', body);
+    },
+
+    showMaintenanceSummaryInfo(title, description) {
+        const body = `
+            <div style="line-height: 1.75;">
+                <div style="font-weight: 700; margin-bottom: 8px;">How this value is calculated</div>
+                <div style="color: var(--gray);">${description}</div>
+            </div>
+        `;
+        this.showInfoModal(`ⓘ ${title}`, body);
+    },
+
+    showInfoModal(title, bodyHtml) {
+        this.closeInfoModal();
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.id = 'infoModal';
+        modal.innerHTML = `
+            <div class="modal" style="max-width: 640px;">
+                <div class="modal-header">
+                    <h2 class="modal-title">${title}</h2>
+                </div>
+                <div class="modal-body">${bodyHtml}</div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" onclick="app.closeInfoModal()">Close</button>
+                </div>
+            </div>
+        `;
+        modal.addEventListener('click', (event) => {
+            if (event.target === modal) this.closeInfoModal();
+        });
+        document.body.appendChild(modal);
+    },
+
+    closeInfoModal() {
+        const modal = document.getElementById('infoModal');
+        if (modal) modal.remove();
+    },
+
+    showConfirmModal(options = {}) {
+        const {
+            id = 'confirmModal',
+            title = 'Confirm',
+            message = '',
+            confirmText = 'Confirm',
+            cancelText = 'Cancel',
+            confirmClass = 'btn btn-danger',
+            cancelClass = 'btn btn-secondary',
+            onConfirm = null,
+            onCancel = null
+        } = options;
+
+        const existing = document.getElementById(id);
+        if (existing) existing.remove();
+
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.id = id;
+        modal.innerHTML = `
+            <div class="modal" style="max-width: 520px;">
+                <div class="modal-header">
+                    <h2 class="modal-title">${title}</h2>
+                </div>
+                <div class="modal-body">${message}</div>
+                <div class="modal-footer">
+                    <button class="${cancelClass}" data-role="cancel">${cancelText}</button>
+                    <button class="${confirmClass}" data-role="confirm">${confirmText}</button>
+                </div>
+            </div>
+        `;
+
+        modal.addEventListener('click', (event) => {
+            if (event.target === modal) {
+                modal.remove();
+                if (typeof onCancel === 'function') onCancel();
+            }
+        });
+
+        const cancelBtn = modal.querySelector('[data-role="cancel"]');
+        const confirmBtn = modal.querySelector('[data-role="confirm"]');
+        if (cancelBtn) {
+            cancelBtn.addEventListener('click', () => {
+                modal.remove();
+                if (typeof onCancel === 'function') onCancel();
+            });
+        }
+        if (confirmBtn) {
+            confirmBtn.addEventListener('click', () => {
+                modal.remove();
+                if (typeof onConfirm === 'function') onConfirm();
+            });
+        }
+
+        document.body.appendChild(modal);
+    },
+
+    showTransientSuccessMessage(message, duration = 2300) {
+        const existing = document.getElementById('transientSuccessMessage');
+        if (existing) existing.remove();
+        const toast = document.createElement('div');
+        toast.id = 'transientSuccessMessage';
+        toast.className = 'transient-success-message';
+        toast.textContent = message;
+        document.body.appendChild(toast);
+        window.setTimeout(() => {
+            const current = document.getElementById('transientSuccessMessage');
+            if (current) current.remove();
+        }, duration);
+    },
+
+    confirmCancelDailyRecord(batchId) {
+        this.showConfirmModal({
+            id: 'discardDailyRecordModal',
+            title: 'Discard Changes?',
+            message: 'Any unsaved changes will be lost.<br>Are you sure you want to leave this page?',
+            confirmText: 'Yes, Discard',
+            cancelText: 'No, Continue Editing',
+            confirmClass: 'btn btn-danger',
+            cancelClass: 'btn btn-secondary',
+            onConfirm: () => this.navigate('batchDetail', { batchId })
+        });
+    },
+
+    toggleContaminantDetail(type) {
+        const checkbox = document.getElementById(`contaminant${type.charAt(0).toUpperCase()}${type.slice(1)}`);
+        const detail = document.getElementById(`contaminant${type.charAt(0).toUpperCase()}${type.slice(1)}Detail`);
+        if (!checkbox || !detail) return;
+        if (checkbox.checked) {
+            detail.style.display = 'block';
+        } else {
+            detail.style.display = 'none';
+            detail.value = '';
+        }
+    },
+
+    async handleForgotPassword() {
+        const email = document.getElementById('loginEmail')?.value.trim() || '';
+        if (!email) {
+            alert('Please enter your email first, then click Forgot Password.');
+            return;
+        }
+        try {
+            await firebaseAuth.sendPasswordResetEmail(email);
+            alert('Password reset email sent. Please check your inbox.');
+        } catch (error) {
+            alert(error.message || 'Failed to send password reset email');
+        }
+    },
+
+    async handleRegisterSubmit() {
+        if (this.data.authSubmitting) return;
+        const organization = document.getElementById('registerOrganization')?.value.trim() || '';
+        const communityType = document.querySelector('input[name="registerCommunityType"]:checked')?.value || '';
+        const communityTypeOther = document.getElementById('registerCommunityTypeOther')?.value.trim() || '';
+        const email = this.normalizeEmail(document.getElementById('registerEmail')?.value);
+        const password = document.getElementById('registerPassword')?.value || '';
+        const confirmPassword = document.getElementById('registerConfirmPassword')?.value || '';
+        if (!organization || !communityType || !email || !password || !confirmPassword) {
+            alert('Please fill in all required fields');
+            return;
+        }
+        if (communityType === 'Other' && !communityTypeOther) {
+            alert('Please specify your Community Type');
+            return;
+        }
+        if (password !== confirmPassword) {
+            alert('Passwords do not match');
+            return;
+        }
+        this.data.authSubmitting = true;
+        const submitBtn = document.querySelector('#registerForm button[type="submit"]');
+        if (submitBtn) submitBtn.disabled = true;
+        try {
+            await this.registerUser(email, password, {
+                organization,
+                communityType,
+                communityTypeOther: communityType === 'Other' ? communityTypeOther : ''
+            });
+        } finally {
+            this.data.authSubmitting = false;
+            if (submitBtn) submitBtn.disabled = false;
+        }
+    },
+
+    async registerUser(email, password, profile) {
+        try {
+            const credential = await firebaseAuth.createUserWithEmailAndPassword(email, password);
+            const uid = credential?.user?.uid;
+            if (uid) await this.saveUserProfile(uid, profile);
+            alert('Register successful');
+        } catch (error) {
+            const code = error?.code || '';
+            if (code === 'auth/email-already-in-use') {
+                let methods = null;
+                try {
+                    methods = await firebaseAuth.fetchSignInMethodsForEmail(this.normalizeEmail(email));
+                } catch (e) {
+                    methods = null;
+                }
+                const details = (methods && methods.length > 0) ? `\nSign-in methods: ${methods.join(', ')}` : '';
+                alert(`This email is already registered.\nEmail: ${email}${details}\n\nPlease go back to Login or use Forgot Password.`);
+                return;
+            }
+            alert(`${error?.message || 'Register failed'}${code ? ` (${code})` : ''}${email ? `\nEmail: ${email}` : ''}`);
+        }
+    },
+
+    async loginUser(email, password) {
+        try {
+            const persistence = this.data.rememberMe
+                ? firebase.auth.Auth.Persistence.LOCAL
+                : firebase.auth.Auth.Persistence.SESSION;
+            await firebaseAuth.setPersistence(persistence);
+            await firebaseAuth.signInWithEmailAndPassword(this.normalizeEmail(email), password);
+        } catch (error) {
+            const code = error?.code || '';
+            const normalizedEmail = this.normalizeEmail(email);
+
+            if (code === 'auth/invalid-credential' || code === 'auth/user-not-found' || code === 'auth/wrong-password') {
+                let methods = null;
+                try {
+                    methods = await firebaseAuth.fetchSignInMethodsForEmail(normalizedEmail);
+                } catch (e) {
+                    methods = null;
+                }
+                if (!methods) {
+                    alert(`Login failed.\nEmail: ${normalizedEmail}\n\nUnable to verify account status right now. Please check your network / Firebase configuration, then try again. You can also click Forgot Password.`);
+                    return;
+                }
+                if (methods.length === 0) {
+                    alert(`No account found for:\n${normalizedEmail}\n\nPlease Register first.`);
+                    return;
+                }
+                if (!methods.includes('password')) {
+                    alert(`This email is registered, but not with a password.\nEmail: ${normalizedEmail}\nSign-in methods: ${methods.join(', ')}\n\nPlease use the correct sign-in method for this account.`);
+                    return;
+                }
+                alert(`Incorrect email or password.\nEmail: ${normalizedEmail}\n\nTry again, or click Forgot Password.`);
+                return;
+            }
+
+            if (code === 'auth/too-many-requests') {
+                alert('Too many attempts. Please wait a bit and try again, or use Forgot Password.');
+                return;
+            }
+
+            alert(`${error?.message || 'Login failed'}${code ? ` (${code})` : ''}${normalizedEmail ? `\nEmail: ${normalizedEmail}` : ''}`);
+        }
+    },
+
+    async logoutUser() {
+        try {
+            await firebaseAuth.signOut();
+        } catch (error) {
+            alert(error.message || 'Logout failed');
+        }
+    },
+
+    async saveBatch() {
+        const batchId = document.getElementById('batchId').value.trim();
+        const startDate = document.getElementById('startDate').value;
+        const manager = document.getElementById('manager').value.trim();
+        const location = document.getElementById('location').value.trim();
+        const notes = document.getElementById('notes').value.trim();
+        const inputMethod = document.querySelector('input[name="inputMethod"]:checked')?.value || '';
+
+        if (!batchId || !startDate || !manager || !inputMethod) {
+            alert('Please fill in all required fields');
+            return;
+        }
+
+        let measurementSettings = null;
+        if (inputMethod === 'weight') {
+            measurementSettings = { inputMethod: 'weight', unitName: 'kg', bucketSizeL: null, bucketConversionEnabled: false, customUnitName: '' };
+        } else if (inputMethod === 'volume') {
+            const bucketSizeValue = document.querySelector('input[name="bucketSize"]:checked')?.value || '2';
+            const customBucketSizeL = document.getElementById('customBucketSizeL')?.value;
+            let bucketSizeL = null;
+            if (bucketSizeValue === 'custom') {
+                bucketSizeL = (customBucketSizeL !== '' && customBucketSizeL != null) ? parseFloat(customBucketSizeL) : null;
+            } else {
+                bucketSizeL = parseFloat(bucketSizeValue);
+            }
+            if (bucketSizeL == null || isNaN(bucketSizeL) || bucketSizeL <= 0) {
+                alert('Please enter a valid Bucket Size (L)');
+                return;
+            }
+            measurementSettings = { inputMethod: 'volume', unitName: 'L', bucketSizeL, bucketConversionEnabled: false, customUnitName: '' };
+        } else if (inputMethod === 'other') {
+            const customUnitName = document.getElementById('customUnitName')?.value.trim() || '';
+            if (!customUnitName) {
+                alert('Please enter Custom Unit Name');
+                return;
+            }
+            measurementSettings = { inputMethod: 'other', unitName: customUnitName, bucketSizeL: null, bucketConversionEnabled: false, customUnitName };
+        } else {
+            alert('Please select an Input Method');
+            return;
+        }
+
+        const numCompostersEl = document.getElementById('numComposters');
+        let numberOfCompostersUsed = numCompostersEl ? parseInt(numCompostersEl.value, 10) : 2;
+        if (isNaN(numberOfCompostersUsed) || numberOfCompostersUsed < 1) numberOfCompostersUsed = 1;
+        if (numberOfCompostersUsed > 50) numberOfCompostersUsed = 50;
+        const composters = Array.from({ length: numberOfCompostersUsed }, (_, idx) => {
+            const i = idx + 1;
+            const idEl = document.getElementById(`composterId_${i}`);
+            const capEl = document.getElementById(`composterCap_${i}`);
+            const composterId = idEl ? (idEl.value || '').trim() : '';
+            const capacityL = capEl && capEl.value !== '' ? parseFloat(capEl.value) : null;
+            return {
+                composterId: composterId || String(i),
+                capacityL: (capacityL != null && !isNaN(capacityL) && capacityL >= 0) ? capacityL : null
+            };
+        });
+        const compostingSystemInformation = { numberOfCompostersUsed, composters };
+
+        const collaborationType = document.querySelector('input[name="collaborationType"]:checked')?.value || 'private';
+        const collaboratorsRaw = document.getElementById('collaboratorsEmails')?.value || '';
+        const ownerEmail = this.normalizeEmail(this.data.currentUser?.email || '');
+        const collaborators = collaborationType === 'shared'
+            ? this.normalizeCollaboratorEmails(
+                collaboratorsRaw
+                    .split(/[,\n;]+/)
+                    .map((s) => s.trim())
+                    .filter(Boolean)
+            ).filter((email) => email !== ownerEmail)
+            : [];
+        const invalid = collaborators.filter(e => !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e));
+        if (invalid.length > 0) {
+            alert(`Invalid email(s): ${invalid.join(', ')}`);
+            return;
+        }
+        const collaborationSettings = {
+            type: collaborationType,
+            collaborators
+        };
+
+        const initialStockSelected = document.querySelector('input[name="initialStockExists"]:checked')?.value || 'no';
+        const hasInitialStock = initialStockSelected === 'yes';
+        const initialStockAmountRaw = document.getElementById('initialStockAmount')?.value;
+        const initialStockComposterId = document.getElementById('initialStockComposterId')?.value || '';
+        const initialStockHeightRaw = document.getElementById('initialStockHeight')?.value;
+        const initialStockType = document.querySelector('input[name="initialStockType"]:checked')?.value || '';
+        const initialStockOtherType = document.getElementById('initialStockOtherType')?.value.trim() || '';
+        let initialStockAmount = 0;
+        let initialStockHeight = null;
+        if (hasInitialStock) {
+            const parsed = initialStockAmountRaw != null && String(initialStockAmountRaw).trim() !== '' ? parseFloat(initialStockAmountRaw) : NaN;
+            if (isNaN(parsed) || parsed < 0) {
+                alert(`Please enter a valid Initial Stock Amount (${measurementSettings.unitName})`);
+                return;
+            }
+            initialStockAmount = parsed;
+            if (!initialStockComposterId) {
+                alert('Please select the Composter ID for the Initial Composting Stock');
+                return;
+            }
+            if (!initialStockType) {
+                alert('Please select the Initial Stock Type');
+                return;
+            }
+            if (initialStockType === 'Other' && !initialStockOtherType) {
+                alert('Please specify the Initial Stock Type');
+                return;
+            }
+            const heightValue = initialStockHeightRaw != null && String(initialStockHeightRaw).trim() !== '' ? parseFloat(initialStockHeightRaw) : NaN;
+            if (isNaN(heightValue) || heightValue < 0) {
+                alert('Please enter a valid Approximate Initial Stock Height (cm)');
+                return;
+            }
+            initialStockHeight = heightValue;
+        }
+        const initialStock = {
+            exists: hasInitialStock,
+            amount: initialStockAmount,
+            type: hasInitialStock ? initialStockType : '',
+            otherType: hasInitialStock && initialStockType === 'Other' ? initialStockOtherType : '',
+            composterId: hasInitialStock ? initialStockComposterId : '',
+            height: hasInitialStock ? initialStockHeight : null
+        };
+
+        const conversionRateMode = document.querySelector('input[name="conversionRateMode"]:checked')?.value || 'default';
+        const customConversionRateRaw = document.getElementById('customConversionRate')?.value;
+        let compostConversionRate = 0.36;
+        if (conversionRateMode === 'custom') {
+            const parsed = customConversionRateRaw != null && String(customConversionRateRaw).trim() !== '' ? parseFloat(customConversionRateRaw) : NaN;
+            if (isNaN(parsed) || parsed < 0) {
+                alert('Please enter a valid Conversion Rate (%)');
+                return;
+            }
+            compostConversionRate = parsed / 100;
+        }
+        const settings = {
+            useCustomConversionRate: conversionRateMode === 'custom',
+            compostConversionRate
+        };
+
+        const existingIndex = this.data.batches.findIndex((b) => (
+            String(b.id || '') === batchId && (this.isBatchOwner(b) || !b.ownerUid)
+        ));
+        if (existingIndex >= 0 && this.data.editingBatch === null) {
+            alert('Batch ID already exists. Please use a unique ID.');
+            return;
+        }
+
+        const previousBatch = this.data.editingBatch !== null ? this.data.batches[this.data.editingBatch] : null;
+        const batch = {
+            id: batchId,
+            startDate,
+            manager,
+            location,
+            notes,
+            measurementSettings,
+            settings,
+            initialStock,
+            compostingSystemInformation,
+            collaborationSettings,
+            status: 'active',
+            records: [],
+            output: null,
+            ownerUid: previousBatch?.ownerUid || this.data.currentUser?.uid || '',
+            ownerEmail: previousBatch?.ownerEmail || this.normalizeEmail(this.data.currentUser?.email || ''),
+            cloudId: previousBatch?.cloudId || null
+        };
+        if (!previousBatch && collaborationSettings.type === 'shared' && collaborators.length > 0) {
+            this.appendBatchActivity(
+                batch,
+                'collaborators_added',
+                `${collaborators.length === 1 ? 'Added collaborator' : 'Added collaborators'} during batch creation: ${collaborators.join(', ')}`,
+                { collaborators }
+            );
+        }
+
+        if (this.data.editingBatch !== null) {
+            this.data.batches[this.data.editingBatch] = batch;
+        } else {
+            this.data.batches.push(batch);
+        }
+
+        this.saveData();
+        try {
+            await this.upsertBatchToCloud(batch);
+            this.saveData();
+        } catch (error) {
+            alert('Batch saved locally, but cloud sync failed. Please try again after refreshing.');
+        }
+        this.navigate('batchDetail', { batchId: this.getBatchRouteId(batch) });
+    },
+
+    async saveDailyRecord() {
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+        const batchRouteId = this.getBatchRouteId(batch);
+        const previousRecord = this.data.editingRecord
+            ? batch.records.find((r) => String(r.id) === String(this.data.editingRecord)) || null
+            : null;
+
+        const date = document.getElementById('recordDate').value;
+        const composterId = (document.getElementById('composterId')?.value || '').trim();
+
+        const isICTA = this.isICTAUser();
+
+        const safeChecked = (id) => {
+            const el = document.getElementById(id);
+            return !!(el && el.checked);
+        };
+
+        const contaminants = {
+            plastic: safeChecked('contaminantPlastic'),
+            paper: safeChecked('contaminantPaper'),
+            metal: safeChecked('contaminantMetal'),
+            glass: safeChecked('contaminantGlass'),
+            other: safeChecked('contaminantOther')
+        };
+
+        const hasAdditionalInputEl = document.getElementById('hasAdditionalInput');
+        const qualityEl = document.getElementById('quality');
+
+        const input = {
+            additionalInput: {
+                enabled: !!(hasAdditionalInputEl && hasAdditionalInputEl.checked)
+            },
+            additionalInputs: [],
+            regularOrganicWaste: 0,
+            additionalOrganicMaterial: 0,
+            additionalStructuralMaterial: 0,
+            totalAdditionalInput: 0,
+            totalOrganicWaste: 0,
+            regularStructuralMaterial: 0,
+            totalStructuralMaterial: 0,
+            totalOrganicInput: 0,
+            quality: qualityEl ? qualityEl.value : '',
+            contaminants,
+            contaminantDetails: {
+                plastic: contaminants.plastic ? (document.getElementById('contaminantPlasticDetail')?.value || '') : '',
+                paper: contaminants.paper ? (document.getElementById('contaminantPaperDetail')?.value || '') : '',
+                metal: contaminants.metal ? (document.getElementById('contaminantMetalDetail')?.value || '') : '',
+                glass: contaminants.glass ? (document.getElementById('contaminantGlassDetail')?.value || '') : '',
+                other: contaminants.other ? (document.getElementById('contaminantOtherDetail')?.value || '') : ''
+            }
+        };
+
+        if (!isICTA && input.additionalInput.enabled) {
+            const rows = Array.from(document.querySelectorAll('#additionalInputsList .additional-row'));
+            input.additionalInputs = rows.map(row => {
+                const source = row.querySelector('.additional-source')?.value || '';
+                const type = row.querySelector('.additional-type')?.value || '';
+                const weightVal = row.querySelector('.additional-weight')?.value;
+                const weight = (weightVal !== '' && weightVal != null) ? parseFloat(weightVal) : null;
+                return { source, type, weight };
+            }).filter(a => (a.source || '') !== '' || (a.type || '') !== '' || (a.weight != null && !isNaN(a.weight)));
+        } else {
+            input.additionalInputs = [];
+        }
+
+        let maintenance = null;
+        if (isICTA) {
+            const getNumber = (id) => {
+                const el = document.getElementById(id);
+                if (!el || el.value === '') return 0;
+                const n = parseFloat(el.value);
+                return isNaN(n) ? 0 : n;
+            };
+
+            const foodWasteCocina = getNumber('foodWasteCocina');
+            const foodWastePlanta0 = getNumber('foodWastePlanta0');
+            const foodWastePlanta1 = getNumber('foodWastePlanta1');
+            const foodWastePlanta3 = getNumber('foodWastePlanta3');
+            const totalFoodWaste = foodWasteCocina + foodWastePlanta0 + foodWastePlanta1 + foodWastePlanta3;
+
+            const woodFusta = getNumber('woodFusta');
+            const woodChips = getNumber('woodChips');
+            const regularStructuralMaterial = woodFusta + woodChips;
+
+            const additionalRows = Array.from(document.querySelectorAll('#maintenanceAdditionalInputsList .maintenance-additional-row'));
+            const additionalInputs = additionalRows.map((row) => {
+                const source = row.querySelector('.maintenance-additional-source')?.value || '';
+                const type = row.querySelector('input[type="radio"]:checked')?.value || 'organic';
+                const description = row.querySelector('.maintenance-additional-desc')?.value || '';
+                const amountVal = row.querySelector('.maintenance-additional-amount')?.value;
+                const amount = (amountVal !== '' && amountVal != null) ? parseFloat(amountVal) : 0;
+                return { source, type, description, amount: isNaN(amount) ? 0 : amount };
+            }).filter(a => (a.source || '') !== '' || (a.description || '') !== '' || (a.amount || 0) > 0);
+            const additionalTotals = this.calculateAdditionalInputTotals(additionalInputs);
+            const totalOrganicWaste = totalFoodWaste + additionalTotals.additionalOrganicMaterial;
+            const totalStructuralMaterial = regularStructuralMaterial + additionalTotals.additionalStructuralMaterial;
+            const totalOrganicInput = totalOrganicWaste + totalStructuralMaterial;
+            const inputMethod = this.getBatchMeasurementSettings(batch)?.inputMethod || '';
+            const foodStructuralRatio = inputMethod === 'volume' ? this.simplifyRatio(totalOrganicWaste, totalStructuralMaterial) : '';
+
+            maintenance = {
+                foodWasteCocina,
+                foodWastePlanta0,
+                foodWastePlanta1,
+                foodWastePlanta3,
+                totalFoodWaste,
+                woodFusta,
+                woodChips,
+                regularStructuralMaterial,
+                additionalOrganicMaterial: additionalTotals.additionalOrganicMaterial,
+                additionalStructuralMaterial: additionalTotals.additionalStructuralMaterial,
+                totalStructuralMaterial,
+                additionalInputs,
+                totalAdditionalInput: additionalTotals.totalAdditionalInput,
+                totalOrganicWaste,
+                totalOrganicInput,
+                foodStructuralRatio
+            };
+
+            input.cocina = foodWasteCocina;
+            input.planta0 = foodWastePlanta0;
+            input.planta1 = foodWastePlanta1;
+            input.planta3 = foodWastePlanta3;
+            input.woodFusta = woodFusta;
+            input.woodChips = woodChips;
+            input.additionalInputs = additionalInputs.map(a => ({
+                source: a.source,
+                type: a.type === 'structural' ? 'Structural Material' : 'Organic Material',
+                description: a.description,
+                weight: a.amount
+            }));
+            input.additionalInput = { enabled: input.additionalInputs.length > 0 };
+            input.regularOrganicWaste = totalFoodWaste;
+            input.additionalOrganicMaterial = additionalTotals.additionalOrganicMaterial;
+            input.additionalStructuralMaterial = additionalTotals.additionalStructuralMaterial;
+            input.totalAdditionalInput = additionalTotals.totalAdditionalInput;
+            input.totalOrganicWaste = totalOrganicWaste;
+            input.regularStructuralMaterial = regularStructuralMaterial;
+            input.totalStructuralMaterial = totalStructuralMaterial;
+            input.totalOrganicInput = totalOrganicInput;
+            input.totalWasteInput = totalOrganicWaste;
+            input.ratio = (totalOrganicWaste > 0) ? `1:${Math.round((totalStructuralMaterial / totalOrganicWaste) * 100) / 100}` : '';
+        } else {
+            const parseAmount = (value) => {
+                if (value === '' || value == null) return 0;
+                const n = parseFloat(value);
+                return isNaN(n) ? 0 : n;
+            };
+
+            const foodRows = Array.from(document.querySelectorAll('#nonIctaFoodWasteRows .nonicta-row'));
+            const foodWasteSources = foodRows.map((row) => {
+                const source = row.querySelector('.nonicta-food-source')?.value || '';
+                const type = row.querySelector('.nonicta-food-type')?.value || '';
+                const otherType = row.querySelector('.nonicta-food-type-other')?.value || '';
+                const amount = parseAmount(row.querySelector('.nonicta-food-amount')?.value);
+                return { source, type, otherType, amount };
+            }).filter((r) => (r.source || '') !== '' || (r.type || '') !== '' || (r.otherType || '') !== '' || (r.amount || 0) > 0);
+
+            const structRows = Array.from(document.querySelectorAll('#nonIctaStructuralRows .nonicta-row'));
+            const structuralMaterials = structRows.map((row) => {
+                const type = row.querySelector('.nonicta-struct-type')?.value || '';
+                const otherType = row.querySelector('.nonicta-struct-other')?.value || '';
+                const amount = parseAmount(row.querySelector('.nonicta-struct-amount')?.value);
+                return { type, otherType, amount };
+            }).filter((r) => (r.type || '') !== '' || (r.otherType || '') !== '' || (r.amount || 0) > 0);
+
+            const totalFoodWaste = foodWasteSources.reduce((s, r) => s + ((r && r.amount != null && !isNaN(r.amount)) ? (parseFloat(r.amount) || 0) : 0), 0);
+            const regularStructuralMaterial = structuralMaterials.reduce((s, r) => s + ((r && r.amount != null && !isNaN(r.amount)) ? (parseFloat(r.amount) || 0) : 0), 0);
+
+            const additionalRows = Array.from(document.querySelectorAll('#maintenanceAdditionalInputsList .maintenance-additional-row'));
+            const additionalInputs = additionalRows.map((row) => {
+                const source = row.querySelector('.maintenance-additional-source')?.value || '';
+                const type = row.querySelector('input[type="radio"]:checked')?.value || 'organic';
+                const description = row.querySelector('.maintenance-additional-desc')?.value || '';
+                const amount = parseAmount(row.querySelector('.maintenance-additional-amount')?.value);
+                return { source, type, description, amount };
+            }).filter(a => (a.source || '') !== '' || (a.description || '') !== '' || (a.amount || 0) > 0);
+            const additionalTotals = this.calculateAdditionalInputTotals(additionalInputs);
+            const totalOrganicWaste = totalFoodWaste + additionalTotals.additionalOrganicMaterial;
+            const totalStructuralMaterial = regularStructuralMaterial + additionalTotals.additionalStructuralMaterial;
+            const totalOrganicInput = totalOrganicWaste + totalStructuralMaterial;
+
+            maintenance = {
+                foodWasteSources,
+                totalFoodWaste,
+                structuralMaterials,
+                regularStructuralMaterial,
+                additionalOrganicMaterial: additionalTotals.additionalOrganicMaterial,
+                additionalStructuralMaterial: additionalTotals.additionalStructuralMaterial,
+                totalStructuralMaterial,
+                additionalInputs,
+                totalAdditionalInput: additionalTotals.totalAdditionalInput,
+                totalOrganicWaste,
+                totalOrganicInput
+            };
+
+            input.regularOrganicWaste = totalFoodWaste;
+            input.structuringMaterials = structuralMaterials.map((m) => ({
+                type: m.otherType ? `${m.type} - ${m.otherType}` : (m.type || ''),
+                kg: (m.amount != null && !isNaN(m.amount)) ? (parseFloat(m.amount) || 0) : 0
+            })).filter(m => (m.type || '') !== '' || (m.kg != null && !isNaN(m.kg)));
+            input.additionalInputs = additionalInputs.map(a => ({
+                source: a.source,
+                type: a.type === 'structural' ? 'Structural Material' : 'Organic Material',
+                description: a.description,
+                weight: a.amount
+            }));
+            input.additionalInput = { enabled: input.additionalInputs.length > 0 };
+            input.additionalOrganicMaterial = additionalTotals.additionalOrganicMaterial;
+            input.additionalStructuralMaterial = additionalTotals.additionalStructuralMaterial;
+            input.totalAdditionalInput = additionalTotals.totalAdditionalInput;
+            input.totalOrganicWaste = totalOrganicWaste;
+            input.totalWasteInput = totalOrganicWaste;
+            input.regularStructuralMaterial = regularStructuralMaterial;
+            input.totalStructuralMaterial = totalStructuralMaterial;
+            input.totalOrganicInput = totalOrganicInput;
+            input.ratio = (totalOrganicWaste > 0) ? `1:${Math.round((totalStructuralMaterial / totalOrganicWaste) * 100) / 100}` : '';
+        }
+
+        const getNumericValue = (id) => {
+            const el = document.getElementById(id);
+            if (!el || el.value === '') return null;
+            return parseFloat(el.value);
+        };
+        let monitoring = null;
+        let process;
+        let observation;
+        let notes = '';
+        let uploadedPhotos = [];
+        let actionTaken = null;
+        let actionTurning = false;
+        let actionMixing = false;
+        let actionAddedWater = false;
+        let waterAddedAmount = 0;
+        let actionRemovedImpurities = false;
+        let removedImpuritiesDescription = '';
+        let actionOther = false;
+        let otherActionDescription = '';
+
+        notes = document.getElementById('ictaNotesTextarea')?.value || '';
+        uploadedPhotos = Array.isArray(this.data.ictaPhotoDraft) ? this.data.ictaPhotoDraft.slice(0, 9) : [];
+
+        actionTurning = !!document.getElementById('actionTurning')?.checked;
+        actionMixing = !!document.getElementById('actionMixing')?.checked;
+        actionAddedWater = !!document.getElementById('actionAddedWater')?.checked;
+        waterAddedAmount = actionAddedWater ? (parseFloat(document.getElementById('waterAddedAmount')?.value) || 0) : 0;
+        actionRemovedImpurities = !!document.getElementById('actionRemovedImpurities')?.checked;
+        removedImpuritiesDescription = actionRemovedImpurities ? (document.getElementById('removedImpuritiesDescription')?.value || '') : '';
+        actionOther = !!document.getElementById('actionOther')?.checked;
+        otherActionDescription = actionOther ? (document.getElementById('otherActionDescription')?.value || '') : '';
+        actionTaken = {
+            actionTurning,
+            actionMixing,
+            actionAddedWater,
+            waterAddedAmount,
+            actionRemovedImpurities,
+            removedImpuritiesDescription,
+            actionOther,
+            otherActionDescription
+        };
+
+        const moistureAssessmentType = document.querySelector('input[name="moistureAssessmentType"]:checked')?.value || 'quantitative';
+        const moistureValue = moistureAssessmentType === 'quantitative' ? getNumericValue('moistureValue') : null;
+        const moistureQualitative = moistureAssessmentType === 'qualitative'
+            ? (document.querySelector('input[name="moistureQualitative"]:checked')?.value || '')
+            : '';
+        const odourLevel = document.querySelector('input[name="odourLevel"]:checked')?.value || 'no_odour';
+        const leachateObserved = document.querySelector('input[name="leachateObserved"]:checked')?.value || 'not_assessed';
+
+        monitoring = {
+            ambientTemperature: getNumericValue('ambientTemperature'),
+            coreTemperature: getNumericValue('coreTemperature'),
+            transitionTemperature: getNumericValue('transitionTemperature'),
+            outerTemperature: getNumericValue('outerTemperature'),
+            moistureAssessmentType,
+            moistureValue,
+            moistureQualitative,
+            odourLevel,
+            leachateObserved
+        };
+
+        let odour = 'None';
+        if (odourLevel === 'greater_than_5m') odour = 'Strong';
+        else if (odourLevel === 'less_than_1m' || odourLevel === 'between_1_and_5m') odour = 'Slight';
+
+        let leachate = 'None';
+        if (leachateObserved === 'yes') leachate = 'Yes';
+        else if (leachateObserved === 'no') leachate = 'No';
+
+        process = {
+            ambient: monitoring.ambientTemperature,
+            core: monitoring.coreTemperature,
+            transition: monitoring.transitionTemperature,
+            outer: monitoring.outerTemperature,
+            moisture: moistureValue,
+            oxygen: null,
+            turning: false,
+            mixing: false,
+            waterAdded: false,
+            waterAddedAmount: 0,
+            none: false
+        };
+
+        observation = {
+            odour,
+            odourNote: '',
+            leachate,
+            leachateNote: '',
+            notes
+        };
+
+        const record = {
+            id: this.data.editingRecord ? String(this.data.editingRecord) : String(Date.now()),
+            date,
+            composterId,
+            input,
+            process,
+            observation,
+            monitoring,
+            maintenance,
+            actionTaken,
+            actionTurning,
+            actionMixing,
+            actionAddedWater,
+            waterAddedAmount,
+            actionRemovedImpurities,
+            removedImpuritiesDescription,
+            actionOther,
+            otherActionDescription,
+            uploadedPhotos,
+            notes
+        };
+
+        const isNewRecord = !this.data.editingRecord && !previousRecord;
+
+        if (this.data.editingRecord) {
+            const index = batch.records.findIndex(r => r.id === this.data.editingRecord);
+            if (index >= 0) {
+                batch.records[index] = record;
+            }
+        } else {
+            const existingIndex = batch.records.findIndex(r => r.date === date);
+            if (existingIndex >= 0) {
+                if (!confirm(`A record for ${this.formatDate(date)} already exists. Do you want to update it?`)) {
+                    return;
+                }
+                record.id = String(batch.records[existingIndex].id);
+                batch.records[existingIndex] = record;
+            } else {
+                batch.records.push(record);
+            }
+        }
+
+        try {
+            if (!batch.cloudId) {
+                await this.upsertBatchToCloud(batch, { skipCreatedAt: false });
+            }
+        } catch (error) {
+        }
+
+        const cloudPhotosEnabled = this.isCloudPhotoStorageEnabled();
+        const sharedBatch = this.isBatchShared(batch);
+        const priorPhotoPaths = cloudPhotosEnabled ? this.getPhotoStoragePaths(previousRecord?.uploadedPhotos || []) : [];
+        const priorPhotoCount = cloudPhotosEnabled ? this.normalizePhotoList(previousRecord?.uploadedPhotos || []).length : 0;
+        let removedPhotoPaths = [];
+        let nextPhotoCount = this.normalizePhotoList(record.uploadedPhotos).length;
+        if (cloudPhotosEnabled) {
+            record.uploadedPhotos = await this.syncPhotoListToCloud(batch, record.uploadedPhotos, 'daily-record', record.id);
+            const nextPhotoPaths = this.getPhotoStoragePaths(record.uploadedPhotos);
+            removedPhotoPaths = priorPhotoPaths.filter((path) => !nextPhotoPaths.includes(path));
+            nextPhotoCount = this.normalizePhotoList(record.uploadedPhotos).length;
+        }
+
+        if (isNewRecord) {
+            this.appendBatchActivity(
+                batch,
+                'record_added',
+                `Added daily record for ${this.formatDate(record.date)}${record.composterId ? ` (Composter ${record.composterId})` : ''}`,
+                { recordId: record.id, date: record.date, composterId: record.composterId || '' }
+            );
+        }
+        if (cloudPhotosEnabled && nextPhotoCount > priorPhotoCount) {
+            const addedPhotoCount = nextPhotoCount - priorPhotoCount;
+            this.appendBatchActivity(
+                batch,
+                'record_photos_uploaded',
+                `Uploaded ${addedPhotoCount} photo${addedPhotoCount === 1 ? '' : 's'} to daily record ${this.formatDate(record.date)}`,
+                { recordId: record.id, date: record.date, addedPhotoCount }
+            );
+        }
+
+        batch.records.sort((a, b) => new Date(a.date) - new Date(b.date));
+        this.saveData();
+        try {
+            await this.upsertBatchToCloud(batch, { skipCreatedAt: true });
+            await this.upsertDailyRecordToCloud(batch, record);
+            if (cloudPhotosEnabled) {
+                await this.deleteStorageFiles(removedPhotoPaths);
+            }
+            this.saveData();
+        } catch (error) {
+            alert('Daily Record saved locally, but cloud sync failed. Please try again after refreshing.');
+        }
+        const successMessage = sharedBatch && !cloudPhotosEnabled && nextPhotoCount > 0
+            ? '✅ Daily Record Submitted (Photos saved locally only)'
+            : '✅ Daily Record Submitted Successfully';
+        this.showTransientSuccessMessage(successMessage, 2300);
+        window.setTimeout(() => {
+            if (this.getBatchRouteId(this.data.currentBatch) === batchRouteId) {
+                this.navigate('batchDetail', { batchId: batchRouteId });
+            }
+        }, 2300);
+    },
+
+    async saveOutput() {
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+
+        const outputDate = document.getElementById('outputDate')?.value;
+        const compostOutputRaw = document.getElementById('compostOutput')?.value;
+        const notes = document.getElementById('harvestNotes')?.value.trim() || '';
+        if (!outputDate) {
+            alert('Please select the Harvest Date.');
+            return;
+        }
+        if (compostOutputRaw == null || String(compostOutputRaw).trim() === '') {
+            alert('Please enter the Actual Compost Output before saving.');
+            return;
+        }
+        const compostOutput = parseFloat(compostOutputRaw);
+        if (isNaN(compostOutput) || compostOutput < 0) {
+            alert('Please enter a valid Actual Compost Output.');
+            return;
+        }
+
+        batch.output = {
+            ...(batch.output || {}),
+            estimatedOutput: batch.output?.estimatedOutput != null ? batch.output.estimatedOutput : this.calculateEstimatedCompostOutput(batch),
+            harvestStatus: 'completed',
+            date: outputDate,
+            compostOutput,
+            notes
+        };
+
+        this.saveData();
+        try {
+            await this.upsertBatchToCloud(batch, { skipCreatedAt: true });
+        } catch (error) {
+            alert('Harvest saved locally, but cloud sync failed. Please try again after refreshing.');
+        }
+        this.showTransientSuccessMessage('✅ Harvest Saved Successfully', 2300);
+    },
+
+    toggleHarvestForm() {
+        const section = document.getElementById('harvestFormSection');
+        const saveBtn = document.getElementById('saveHarvestBtn');
+        if (!section) return;
+        const hidden = section.style.display === 'none' || section.style.display === '';
+        section.style.display = hidden ? 'block' : 'none';
+        if (saveBtn) saveBtn.style.display = hidden ? '' : 'none';
+    },
+
+    updateInputTotals() {
+        const totalWasteInputEl = document.getElementById('totalWasteInput');
+        const hasNonICTAInput = !!totalWasteInputEl;
+
+        const getNumber = (el) => {
+            if (!el || el.value === '') return 0;
+            const n = parseFloat(el.value);
+            return isNaN(n) ? 0 : n;
+        };
+
+        const totalWaste = hasNonICTAInput
+            ? getNumber(totalWasteInputEl)
+            : (getNumber(document.getElementById('cocina')) + getNumber(document.getElementById('planta0')) + getNumber(document.getElementById('planta1')) + getNumber(document.getElementById('planta3')));
+
+        const woodFustaEl = document.getElementById('woodFusta');
+        const woodChipsEl = document.getElementById('woodChips');
+        const totalStructuring = (woodFustaEl && woodChipsEl)
+            ? (getNumber(woodFustaEl) + getNumber(woodChipsEl))
+            : Array.from(document.querySelectorAll('#structuringMaterialsList .struct-kg')).reduce((s, el) => s + getNumber(el), 0);
+
+        const additionalEnabled = !!document.getElementById('hasAdditionalInput')?.checked;
+        const additionalRows = additionalEnabled ? Array.from(document.querySelectorAll('#additionalInputsList .additional-row')) : [];
+        const additionalInputs = additionalRows.map((row) => ({
+            type: row.querySelector('.additional-type')?.value || 'organic',
+            amount: getNumber(row.querySelector('.additional-weight'))
+        }));
+        const additionalTotals = this.calculateAdditionalInputTotals(additionalInputs);
+        const totalOrganicWaste = totalWaste + additionalTotals.additionalOrganicMaterial;
+        const totalStructuralMaterial = totalStructuring + additionalTotals.additionalStructuralMaterial;
+        const totalInput = totalOrganicWaste + totalStructuralMaterial;
+
+        const totalWasteEl = document.getElementById('totalWaste');
+        const totalStructuringEl = document.getElementById('totalStructuring');
+        const totalInputEl = document.getElementById('totalInput');
+        const autoRatioValueEl = document.getElementById('autoRatioValue');
+        const autoRatioNoteEl = document.getElementById('autoRatioNote');
+
+        if (totalWasteEl) totalWasteEl.textContent = this.formatNumber(totalOrganicWaste, 3);
+        if (totalStructuringEl) totalStructuringEl.textContent = this.formatNumber(totalStructuralMaterial, 3);
+        if (totalInputEl) totalInputEl.textContent = this.formatNumber(totalInput, 3);
+        if (autoRatioValueEl) {
+            if (totalOrganicWaste > 0) {
+                const ratio = totalStructuralMaterial / totalOrganicWaste;
+                autoRatioValueEl.textContent = `1 : ${this.formatNumber(ratio, 2)}`;
+                if (autoRatioNoteEl) {
+                    autoRatioNoteEl.textContent = ratio < 0.6 ? 'Low structural ratio → consider adding more structural material.' : '';
+                }
+            } else {
+                autoRatioValueEl.textContent = '-';
+                if (autoRatioNoteEl) autoRatioNoteEl.textContent = '';
+            }
+        }
+    },
+
+    addStructuringMaterialRow() {
+        const list = document.getElementById('structuringMaterialsList');
+        if (!list) return;
+        const row = document.createElement('div');
+        row.className = 'struct-row';
+        row.style.display = 'flex';
+        row.style.gap = '10px';
+        row.style.alignItems = 'center';
+        row.style.marginBottom = '10px';
+        row.innerHTML = `
+            <input type="text" class="form-input struct-type" placeholder="Structural Material Type">
+            <input type="number" class="form-input struct-kg" step="any" placeholder="kg" style="width: 120px;">
+            <button type="button" class="btn btn-secondary" style="padding: 8px 12px;">−</button>
+        `;
+        const removeBtn = row.querySelector('button');
+        const kgInput = row.querySelector('.struct-kg');
+        if (removeBtn) removeBtn.onclick = () => this.removeStructuringMaterialRow(removeBtn);
+        if (kgInput) kgInput.oninput = () => this.updateInputTotals();
+        list.appendChild(row);
+        this.updateInputTotals();
+    },
+
+    removeStructuringMaterialRow(buttonEl) {
+        const row = buttonEl?.closest?.('.struct-row');
+        if (!row) return;
+        row.remove();
+        this.updateInputTotals();
+    },
+
+    toggleAdditionalInput() {
+        const checkbox = document.getElementById('hasAdditionalInput');
+        const section = document.getElementById('additionalInputSection');
+        const list = document.getElementById('additionalInputsList');
+
+        if (checkbox.checked) {
+            section.style.display = 'block';
+            if (list && list.querySelectorAll('.additional-row').length === 0) {
+                this.addAdditionalInputRow();
+            }
+        } else {
+            section.style.display = 'none';
+            if (list) {
+                list.innerHTML = '';
+                const row = document.createElement('div');
+                row.className = 'additional-row';
+                row.style.display = 'flex';
+                row.style.gap = '10px';
+                row.style.alignItems = 'center';
+                row.style.marginBottom = '10px';
+                row.innerHTML = `
+                    <input type="text" class="form-input additional-source" placeholder="Source 1">
+                    <input type="text" class="form-input additional-type" placeholder="Type">
+                    <input type="number" class="form-input additional-weight" step="any" placeholder="kg" style="width: 140px;">
+                    <button type="button" class="btn btn-secondary" style="padding: 8px 12px;" onclick="app.removeAdditionalInputRow(this)">−</button>
+                `;
+                const w = row.querySelector('.additional-weight');
+                if (w) w.oninput = () => this.updateInputTotals();
+                list.appendChild(row);
+            }
+            this.updateInputTotals();
+        }
+    },
+
+    addAdditionalInputRow() {
+        const list = document.getElementById('additionalInputsList');
+        if (!list) return;
+        const row = document.createElement('div');
+        row.className = 'additional-row';
+        row.style.display = 'flex';
+        row.style.gap = '10px';
+        row.style.alignItems = 'center';
+        row.style.marginBottom = '10px';
+        row.innerHTML = `
+            <input type="text" class="form-input additional-source" placeholder="">
+            <input type="text" class="form-input additional-type" placeholder="Type">
+            <input type="number" class="form-input additional-weight" step="any" placeholder="kg" style="width: 140px;">
+            <button type="button" class="btn btn-secondary" style="padding: 8px 12px;">−</button>
+        `;
+        const removeBtn = row.querySelector('button');
+        const weightInput = row.querySelector('.additional-weight');
+        if (removeBtn) removeBtn.onclick = () => this.removeAdditionalInputRow(removeBtn);
+        if (weightInput) weightInput.oninput = () => this.updateInputTotals();
+        list.appendChild(row);
+        this.renumberAdditionalInputRows();
+        this.updateInputTotals();
+    },
+
+    removeAdditionalInputRow(buttonEl) {
+        const list = document.getElementById('additionalInputsList');
+        const row = buttonEl?.closest?.('.additional-row');
+        if (!list || !row) return;
+        row.remove();
+        if (list.querySelectorAll('.additional-row').length === 0) {
+            this.addAdditionalInputRow();
+            return;
+        }
+        this.renumberAdditionalInputRows();
+        this.updateInputTotals();
+    },
+
+    renumberAdditionalInputRows() {
+        const rows = Array.from(document.querySelectorAll('#additionalInputsList .additional-row'));
+        rows.forEach((row, idx) => {
+            const source = row.querySelector('.additional-source');
+            if (source) source.placeholder = `Source ${idx + 1}`;
+        });
+    },
+
+    toggleWaterAdded() {
+        const checkbox = document.getElementById('waterAdded');
+        const amountInput = document.getElementById('waterAddedAmount');
+
+        if (checkbox.checked) {
+            amountInput.style.display = 'inline-block';
+            amountInput.disabled = false;
+        } else {
+            amountInput.style.display = 'none';
+            amountInput.disabled = true;
+            amountInput.value = 0;
+        }
+    },
+
+    updateTempAverage() {
+        const getVal = (id) => {
+            const el = document.getElementById(id);
+            return (el && el.value !== '') ? parseFloat(el.value) : null;
+        };
+
+        const core = getVal('core');
+        const transition = getVal('transition');
+        const outer = getVal('outer');
+
+        const tempValues = [core, transition, outer].filter(v => v !== null && !isNaN(v));
+        const avg = tempValues.length > 0 ? (tempValues.reduce((s, v) => s + v, 0) / tempValues.length) : null;
+        
+        const avgTempEl = document.getElementById('avgTemp');
+
+        if (avgTempEl) {
+            avgTempEl.textContent = avg !== null ? Math.round(avg * 10) / 10 : '-';
+        }
+
+        this.updateSystemDiagnosis();
+    },
+
+    updateSystemDiagnosis() {
+        const getVal = (id) => {
+            const el = document.getElementById(id);
+            return (el && el.value !== '') ? parseFloat(el.value) : null;
+        };
+
+        const isICTA = this.isICTAUser();
+        const moisture = getVal('moisture');
+        const oxygen = getVal('oxygen');
+        const core = getVal('core');
+        const transition = getVal('transition');
+        const outer = getVal('outer');
+        const odour = document.querySelector('input[name="odour"]:checked')?.value;
+        const leachate = document.querySelector('input[name="leachate"]:checked')?.value;
+
+        const tempValues = [core, transition, outer].filter(v => v !== null && !isNaN(v));
+        const avgTemp = tempValues.length > 0 ? (tempValues.reduce((s, v) => s + v, 0) / tempValues.length) : null;
+
+        const alertsEl = document.getElementById('diagnosisAlerts');
+        if (!alertsEl) return;
+
+        // Check if there are any valid inputs
+        const hasValidInputs = (moisture !== null) || (oxygen !== null) || (avgTemp !== null) || (leachate === 'Yes') || (odour === 'Strong');
+
+        // If no valid inputs, hide the entire diagnosis section
+        if (!hasValidInputs) {
+            alertsEl.innerHTML = '';
+            return;
+        }
+
+        if (!isICTA) {
+            const checklist = [];
+            const recommendations = [];
+            let severity = 'success';
+
+            if (avgTemp === null) {
+                checklist.push({ icon: '⚪', text: 'Temperature: no data' });
+            } else if (avgTemp >= 70) {
+                checklist.push({ icon: '🔴', text: `Temperature high (${Math.round(avgTemp * 10) / 10}°C)` });
+                recommendations.push('Turn compost and add water to prevent overheating.');
+                severity = 'danger';
+            } else {
+                checklist.push({ icon: '✅', text: `Temperature OK (${Math.round(avgTemp * 10) / 10}°C)` });
+            }
+
+            if (moisture === null) {
+                checklist.push({ icon: '⚪', text: 'Moisture: not provided' });
+            } else if (moisture < 50) {
+                checklist.push({ icon: '⚠️', text: `Moisture low (${moisture}%)` });
+                recommendations.push('Material is too dry → consider adding water.');
+                if (severity !== 'danger') severity = 'warning';
+            } else if (moisture > 60) {
+                checklist.push({ icon: '⚠️', text: `Moisture high (${moisture}%)` });
+                recommendations.push('Material is too wet → consider adding structural material.');
+                if (severity !== 'danger') severity = 'warning';
+            } else {
+                checklist.push({ icon: '✅', text: `Moisture OK (${moisture}%)` });
+            }
+
+            if (oxygen === null) {
+                checklist.push({ icon: '⚪', text: 'Oxygen: not provided' });
+            } else if (oxygen < 10) {
+                checklist.push({ icon: '🔴', text: `Oxygen very low (${oxygen}%)` });
+                recommendations.push('Turn compost to improve aeration; consider adding structural material.');
+                severity = 'danger';
+            } else if (oxygen < 15) {
+                checklist.push({ icon: '⚠️', text: `Oxygen slightly low (${oxygen}%)` });
+                recommendations.push('Consider turning to improve aeration.');
+                if (severity !== 'danger') severity = 'warning';
+            } else {
+                checklist.push({ icon: '✅', text: `Oxygen OK (${oxygen}%)` });
+            }
+
+            if (leachate === 'Yes') {
+                checklist.push({ icon: '⚠️', text: 'Leachate detected' });
+                recommendations.push('Check drainage and consider adding dry structural material.');
+                if (severity !== 'danger') severity = 'warning';
+            }
+
+            if (odour === 'Strong') {
+                checklist.push({ icon: '⚠️', text: 'Strong odour detected' });
+                recommendations.push('Potential anaerobic conditions → turn immediately.');
+                if (severity !== 'danger') severity = 'warning';
+            }
+
+            const totalWasteInputEl = document.getElementById('totalWasteInput');
+            if (totalWasteInputEl) {
+                const totalWaste = totalWasteInputEl.value === '' ? 0 : parseFloat(totalWasteInputEl.value);
+                const totalStructuring = Array.from(document.querySelectorAll('#structuringMaterialsList .struct-kg')).reduce((s, el) => {
+                    if (!el || el.value === '') return s;
+                    const n = parseFloat(el.value);
+                    return s + (isNaN(n) ? 0 : n);
+                }, 0);
+                if (!isNaN(totalWaste) && totalWaste > 0) {
+                    const ratio = totalStructuring / totalWaste;
+                    if (ratio < 0.6) {
+                        recommendations.push('Low structural ratio → consider adding more structural material.');
+                        if (severity !== 'danger') severity = 'warning';
+                    }
+                }
+            }
+
+            const checklistHtml = checklist.map(i => `<div style="margin: 6px 0;">${i.icon} ${i.text}</div>`).join('');
+            const recHtml = recommendations.length > 0
+                ? `<div style="margin-top: 12px;"><strong>Recommendation:</strong><br><small>${recommendations.join('<br>')}</small></div>`
+                : '';
+
+            alertsEl.innerHTML = `
+                <div class="alert alert-${severity}">
+                    <div><strong>System Feedback</strong></div>
+                    ${checklistHtml}
+                    ${recHtml}
+                </div>
+            `;
+            return;
+        }
+
+        let alerts = [];
+
+        // Temperature Logic - Only if avgTemp is not null
+        if (avgTemp !== null && avgTemp >= 70) {
+            alerts.push({
+                type: 'danger',
+                icon: '🔴',
+                text: `Temperature too high (${Math.round(avgTemp * 10) / 10}°C)`,
+                action: 'Turn compost and add water to prevent overheating.'
+            });
+        }
+
+        // Oxygen Logic - ONLY if oxygen is NOT null
+        if (oxygen !== null && !isNaN(oxygen)) {
+            if (oxygen < 10) {
+                alerts.push({
+                    type: 'danger',
+                    icon: '🔴',
+                    text: `Low oxygen level detected (${oxygen}%)`,
+                    action: 'Check aeration conditions and turn compost. <br>→ Consider adding structuring material. <br>→ If bad odour is also observed, strong intervention is recommended.'
+                });
+            } else if (oxygen < 15) {
+                alerts.push({
+                    type: 'warning',
+                    icon: '⚠️',
+                    text: `Oxygen borderline low (${oxygen}%)`,
+                    action: 'Consider turning to improve aeration.'
+                });
+            }
+        }
+
+        // Moisture Logic - ONLY if moisture is NOT null
+        if (moisture !== null && !isNaN(moisture)) {
+            if (moisture < 50 || moisture > 60) {
+                let action = '';
+                if (moisture < 50) {
+                    action = 'Material is too dry → consider adding water.';
+                } else {
+                    action = 'Material is too wet → consider adding dry/structuring material.';
+                }
+                alerts.push({
+                    type: 'warning',
+                    icon: '⚠️',
+                    text: `Moisture is outside the optimal range (50–60%) - Current: ${moisture}%`,
+                    action: action
+                });
+            } else {
+                alerts.push({
+                    type: 'success',
+                    icon: '✅',
+                    text: `Moisture optimal (${moisture}%)`,
+                    action: 'Moisture within ideal range (50-60%).'
+                });
+            }
+        }
+
+        // Leachate Logic
+        if (leachate === 'Yes') {
+            alerts.push({
+                type: 'warning',
+                icon: '⚠️',
+                text: 'Leachate detected',
+                action: 'Check drainage and consider adding dry material'
+            });
+        }
+
+        // Odour Logic
+        if (odour === 'Strong') {
+            alerts.push({
+                type: 'warning',
+                icon: '⚠️',
+                text: 'Strong odour detected',
+                action: 'Potential anaerobic conditions - turn immediately'
+            });
+        }
+
+        if (alerts.length === 0) {
+            alerts.push({
+                type: 'success',
+                icon: '✅',
+                text: 'All parameters within normal range',
+                action: 'Continue regular monitoring.'
+            });
+        }
+
+        alertsEl.innerHTML = alerts.map(alert => `
+            <div class="alert alert-${alert.type}">
+                <span style="font-size: 1.5rem; margin-right: 10px;">${alert.icon}</span>
+                <div>
+                    <strong>${alert.text}</strong><br>
+                    <small>${alert.action}</small>
+                </div>
+            </div>
+        `).join('');
+    },
+
+    updateLossCalculation() {
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+
+        const totalInput = this.calculateTotalInput(batch);
+        const compostOutput = parseFloat(document.getElementById('compostOutput')?.value) || 0;
+        const estimatedLoss = totalInput - compostOutput;
+
+        const estimatedLossEl = document.getElementById('estimatedLoss');
+        if (estimatedLossEl) {
+            estimatedLossEl.textContent = estimatedLoss;
+        }
+    },
+
+    getFinalAssessmentState(batch) {
+        const finalAssessment = batch?.finalAssessment || {};
+        const photos = this.normalizePhotoList(finalAssessment.finalCompostPhotos || []);
+        return {
+            finalCoreTemperature: finalAssessment.finalCoreTemperature != null ? finalAssessment.finalCoreTemperature : '',
+            ambientTemperature: finalAssessment.ambientTemperature != null ? finalAssessment.ambientTemperature : '',
+            finalMoistureType: finalAssessment.finalMoistureType || 'quantitative',
+            finalMoistureValue: finalAssessment.finalMoistureValue != null ? finalAssessment.finalMoistureValue : '',
+            finalMoistureAssessment: finalAssessment.finalMoistureAssessment || '',
+            finalOdour: finalAssessment.finalOdour || '',
+            finalCompostPhotos: photos
+        };
+    },
+
+    renderFinishPhotoGridHtml(photos) {
+        if (!Array.isArray(photos) || photos.length === 0) {
+            return `<div class="icta-photo-empty">No final compost photos uploaded yet.</div>`;
+        }
+        return photos.map((photo, idx) => `
+            <div class="icta-photo-tile">
+                <img class="icta-photo-thumb" src="${this.getPhotoPreviewSrc(photo)}" alt="Final compost photo ${idx + 1}">
+                <div class="icta-photo-actions">
+                    <button type="button" class="btn btn-secondary icta-photo-btn" onclick="app.viewFinishPhoto(${idx})">View</button>
+                    <button type="button" class="btn btn-secondary icta-photo-btn" onclick="app.openFinishPhotoReplace(${idx})">Replace</button>
+                    <button type="button" class="btn btn-danger icta-photo-btn" onclick="app.deleteFinishPhoto(${idx})">Delete</button>
+                </div>
+            </div>
+        `).join('');
+    },
+
+    showFinalCoreTemperatureGuide() {
+        const body = `
+            <ol style="padding-left: 20px; line-height: 1.8; margin: 0;">
+                <li>Insert thermometer into the center of the compost pile.</li>
+                <li>Ensure a depth of approximately 30–50 cm.</li>
+                <li>Wait at least 2 minutes.</li>
+                <li>Measure before turning or mixing.</li>
+            </ol>
+        `;
+        this.showInfoModal('How to Measure Final Core Temperature', body);
+    },
+
+    updateFinishTemperatureAssessment() {
+        const coreEl = document.getElementById('finishFinalCoreTemperature');
+        const ambientEl = document.getElementById('finishAmbientTemperature');
+        const diffValueEl = document.getElementById('finishTemperatureDifferenceValue');
+        const validationEl = document.getElementById('finishTemperatureValidation');
+        if (!coreEl || !ambientEl || !diffValueEl || !validationEl) return;
+
+        const core = coreEl.value === '' ? null : parseFloat(coreEl.value);
+        const ambient = ambientEl.value === '' ? null : parseFloat(ambientEl.value);
+        if (core == null || ambient == null || isNaN(core) || isNaN(ambient)) {
+            diffValueEl.textContent = '—';
+            validationEl.style.display = 'none';
+            validationEl.className = 'alert';
+            validationEl.innerHTML = '';
+            return;
+        }
+
+        const difference = Math.abs(core - ambient);
+        diffValueEl.textContent = `${this.formatNumber(difference, 1)} °C`;
+        validationEl.style.display = 'block';
+        if (difference > 8) {
+            validationEl.className = 'alert alert-warning finish-validation-box';
+            validationEl.innerHTML = `
+                <strong>⚠ Warning</strong><br>
+                The compost temperature is still significantly higher than ambient temperature.
+                It is recommended to continue maturation until the temperature difference is below 8°C.
+            `;
+        } else {
+            validationEl.className = 'alert alert-success finish-validation-box';
+            validationEl.innerHTML = `<strong>✅ Temperature Stability Achieved</strong>`;
+        }
+    },
+
+    updateFinishMoistureAssessmentVisibility() {
+        const type = document.querySelector('input[name="finishMoistureType"]:checked')?.value || 'quantitative';
+        const quantitative = document.getElementById('finishMoistureQuantitativeSection');
+        const qualitative = document.getElementById('finishMoistureQualitativeSection');
+        if (quantitative) quantitative.style.display = type === 'quantitative' ? 'block' : 'none';
+        if (qualitative) qualitative.style.display = type === 'qualitative' ? 'block' : 'none';
+        if (type === 'quantitative') {
+            const qualitativeOptions = document.querySelectorAll('input[name="finishMoistureAssessment"]');
+            qualitativeOptions.forEach((option) => { option.checked = false; });
+        } else {
+            const moistureValue = document.getElementById('finishMoistureValue');
+            if (moistureValue) moistureValue.value = '';
+        }
+    },
+
+    updateFinishOdourValidation() {
+        const odour = document.querySelector('input[name="finishOdour"]:checked')?.value || '';
+        const validationEl = document.getElementById('finishOdourValidation');
+        if (!validationEl) return;
+        if (!odour) {
+            validationEl.style.display = 'none';
+            validationEl.className = 'alert';
+            validationEl.innerHTML = '';
+            return;
+        }
+        const acceptable = ['earthy', 'musty', 'mushroom_like', 'odorless'];
+        validationEl.style.display = 'block';
+        if (acceptable.includes(odour)) {
+            validationEl.className = 'alert alert-success finish-validation-box';
+            validationEl.innerHTML = `<strong>✅ Odour indicates acceptable compost maturity.</strong>`;
+        } else {
+            validationEl.className = 'alert alert-danger finish-validation-box';
+            validationEl.innerHTML = `
+                <strong>❌ Compost should not be used at this stage.</strong><br>
+                Continue composting and adjust operating conditions.
+            `;
+        }
+    },
+
+    openFinishPhotoPicker(type) {
+        this.data.finishPhotoReplaceIndex = null;
+        const input = type === 'take'
+            ? document.getElementById('finishTakePhotoInput')
+            : type === 'upload'
+                ? document.getElementById('finishUploadPhotoInput')
+                : document.getElementById('finishChooseFileInput');
+        if (!input) return;
+        input.click();
+    },
+
+    openFinishPhotoReplace(index) {
+        this.data.finishPhotoReplaceIndex = Number.isFinite(index) ? index : null;
+        const input = document.getElementById('finishReplacePhotoInput');
+        if (!input) return;
+        input.click();
+    },
+
+    async handleFinishPhotoFiles(files) {
+        if (!Array.isArray(this.data.finishPhotoDraft)) this.data.finishPhotoDraft = [];
+        const validFiles = files.filter((file) => {
+            const type = String(file?.type || '').toLowerCase();
+            return type === 'image/jpeg' || type === 'image/jpg' || type === 'image/png';
+        });
+        if (validFiles.length !== files.length) {
+            alert('Only JPG, JPEG, and PNG files are supported.');
+        }
+        const remaining = Math.max(0, 9 - this.data.finishPhotoDraft.length);
+        const picked = validFiles.slice(0, remaining);
+        if (validFiles.length > remaining) {
+            alert(`You can upload up to 9 photos. Only ${remaining} more photo(s) can be added.`);
+        }
+        for (const file of picked) {
+            const dataUrl = await this.convertImageFileToDataUrl(file);
+            if (!dataUrl) continue;
+            this.data.finishPhotoDraft.push(dataUrl);
+        }
+        this.data.finishPhotoDraft = this.data.finishPhotoDraft.slice(0, 9);
+        this.updateFinishPhotoGridDom();
+    },
+
+    async handleFinishReplacePhotoFiles(files) {
+        if (!Array.isArray(this.data.finishPhotoDraft)) this.data.finishPhotoDraft = [];
+        const idx = this.data.finishPhotoReplaceIndex;
+        if (idx == null || idx < 0 || idx >= this.data.finishPhotoDraft.length) {
+            await this.handleFinishPhotoFiles(files);
+            return;
+        }
+        const file = files[0];
+        if (!file) return;
+        const type = String(file.type || '').toLowerCase();
+        if (!(type === 'image/jpeg' || type === 'image/jpg' || type === 'image/png')) {
+            alert('Only JPG, JPEG, and PNG files are supported.');
+            return;
+        }
+        const dataUrl = await this.convertImageFileToDataUrl(file);
+        if (!dataUrl) return;
+        this.data.finishPhotoDraft[idx] = dataUrl;
+        this.updateFinishPhotoGridDom();
+    },
+
+    updateFinishPhotoGridDom() {
+        const grid = document.getElementById('finishPhotoGrid');
+        if (!grid) return;
+        const photos = Array.isArray(this.data.finishPhotoDraft) ? this.data.finishPhotoDraft : [];
+        grid.innerHTML = this.renderFinishPhotoGridHtml(photos);
+    },
+
+    viewFinishPhoto(index) {
+        const photos = Array.isArray(this.data.finishPhotoDraft) ? this.data.finishPhotoDraft : [];
+        const src = this.getPhotoPreviewSrc(photos[index]);
+        if (!src) return;
+        this.showInfoModal(`Final Compost Photo ${index + 1}`, `<img src="${src}" alt="Final compost photo ${index + 1}" style="max-width: 100%; border-radius: 12px;">`);
+    },
+
+    deleteFinishPhoto(index) {
+        if (!Array.isArray(this.data.finishPhotoDraft)) return;
+        this.data.finishPhotoDraft.splice(index, 1);
+        this.updateFinishPhotoGridDom();
+    },
+
+    showFinishModal(batchId) {
+        const batch = this.findBatchByRouteId(batchId);
+        if (!batch) return;
+        const routeId = this.getBatchRouteId(batch);
+        const assessment = this.getFinalAssessmentState(batch);
+        const inputUnit = this.getBatchInputUnitName(batch);
+        const conversionSettings = this.getBatchCalculationSettings(batch);
+        const estimatedOutput = this.calculateEstimatedCompostOutput(batch);
+        const odourOptions = [
+            { value: 'earthy', label: 'Earthy' },
+            { value: 'musty', label: 'Musty' },
+            { value: 'mushroom_like', label: 'Mushroom-like' },
+            { value: 'odorless', label: 'Odorless' },
+            { value: 'ammonia', label: 'Ammonia' },
+            { value: 'urine_like', label: 'Urine-like' },
+            { value: 'rotten_odour', label: 'Rotten Odour' },
+            { value: 'sour', label: 'Sour' },
+            { value: 'vinegar_like', label: 'Vinegar-like' },
+            { value: 'rotten_egg_odour', label: 'Rotten Egg Odour' },
+            { value: 'fecal', label: 'Fecal' }
+        ];
+
+        this.data.finishPhotoDraft = [...assessment.finalCompostPhotos];
+        this.data.finishPhotoReplaceIndex = null;
+
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.id = 'finishModal';
+        modal.innerHTML = `
+            <div class="modal finish-assessment-modal">
+                <div class="modal-header">
+                    <h2 class="modal-title">Finish Batch Confirmation</h2>
+                </div>
+                <div class="modal-body">
+                    <div class="finish-batch-intro">
+                        <div><strong>Batch ID:</strong> ${batch.id}</div>
+                        <div style="margin-top: 8px; color: var(--gray);">Please complete the final compost assessment before closing this batch.</div>
+                    </div>
+
+                    <div class="finish-section-card">
+                        <h3 class="card-title" style="margin-bottom: 16px;">Final Compost Quality</h3>
+
+                        <div class="module" style="background: #F4FBF4; border-color: #C8E6C9;">
+                            <h3 class="module-title process">Final Temperature Assessment</h3>
+                            <div class="finish-temperature-grid">
+                                <div class="form-group">
+                                    <label class="form-label">Final Core Temperature (°C)</label>
+                                    <button type="button" class="btn btn-secondary monitoring-help-btn" onclick="app.showFinalCoreTemperatureGuide()">ⓘ How to Measure</button>
+                                    <input type="number" class="form-input" id="finishFinalCoreTemperature" step="any" value="${assessment.finalCoreTemperature}" oninput="app.updateFinishTemperatureAssessment()">
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">Ambient Temperature (°C)</label>
+                                    <input type="number" class="form-input" id="finishAmbientTemperature" step="any" value="${assessment.ambientTemperature}" oninput="app.updateFinishTemperatureAssessment()">
+                                </div>
+                            </div>
+                            <div class="finish-difference-row">Temperature Difference: <strong id="finishTemperatureDifferenceValue">—</strong></div>
+                            <div id="finishTemperatureValidation" class="alert finish-validation-box" style="display:none;"></div>
+                        </div>
+
+                        <div class="module" style="background: #FFFDF4; border-color: #FFE082;">
+                            <h3 class="module-title" style="color: #F57C00;">Final Moisture Assessment</h3>
+                            <div class="form-label" style="margin-bottom: 10px;">Moisture Assessment</div>
+                            <div class="radio-group" style="margin-bottom: 15px;">
+                                <label class="radio-item">
+                                    <input type="radio" name="finishMoistureType" value="quantitative" ${assessment.finalMoistureType === 'quantitative' ? 'checked' : ''} onchange="app.updateFinishMoistureAssessmentVisibility()">
+                                    Quantitative
+                                </label>
+                                <label class="radio-item">
+                                    <input type="radio" name="finishMoistureType" value="qualitative" ${assessment.finalMoistureType === 'qualitative' ? 'checked' : ''} onchange="app.updateFinishMoistureAssessmentVisibility()">
+                                    Qualitative
+                                </label>
+                            </div>
+                            <div id="finishMoistureQuantitativeSection" style="${assessment.finalMoistureType === 'quantitative' ? '' : 'display:none;'}">
+                                <div class="form-group">
+                                    <label class="form-label">Moisture (%)</label>
+                                    <input type="number" class="form-input" id="finishMoistureValue" step="any" value="${assessment.finalMoistureValue}">
+                                </div>
+                            </div>
+                            <div id="finishMoistureQualitativeSection" style="${assessment.finalMoistureType === 'qualitative' ? '' : 'display:none;'}">
+                                <div style="margin-bottom: 12px; color: var(--gray);">Take a handful of compost and squeeze firmly.</div>
+                                <div class="moisture-card-grid">
+                                    <label class="moisture-card">
+                                        <input type="radio" name="finishMoistureAssessment" value="dry" ${assessment.finalMoistureAssessment === 'dry' ? 'checked' : ''}>
+                                        <div class="moisture-card-content">
+                                            <div class="moisture-card-image">${this.renderMoistureGuideImage('dry', true)}</div>
+                                            <div class="moisture-card-title">Dry</div>
+                                            <div class="moisture-card-desc">No shape remains after squeezing</div>
+                                        </div>
+                                    </label>
+                                    <label class="moisture-card">
+                                        <input type="radio" name="finishMoistureAssessment" value="optimal" ${assessment.finalMoistureAssessment === 'optimal' ? 'checked' : ''}>
+                                        <div class="moisture-card-content">
+                                            <div class="moisture-card-image">${this.renderMoistureGuideImage('optimal', true)}</div>
+                                            <div class="moisture-card-title">Optimal</div>
+                                            <div class="moisture-card-desc">Keeps shape and releases 1–2 drops</div>
+                                        </div>
+                                    </label>
+                                    <label class="moisture-card">
+                                        <input type="radio" name="finishMoistureAssessment" value="wet" ${assessment.finalMoistureAssessment === 'wet' ? 'checked' : ''}>
+                                        <div class="moisture-card-content">
+                                            <div class="moisture-card-image">${this.renderMoistureGuideImage('wet', true)}</div>
+                                            <div class="moisture-card-title">Wet</div>
+                                            <div class="moisture-card-desc">Water flows out when squeezed</div>
+                                        </div>
+                                    </label>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="module" style="background: #F3F8FF; border-color: #BBDEFB;">
+                            <h3 class="module-title" style="color: #1976D2;">Final Odour Assessment</h3>
+                            <div class="finish-odour-grid">
+                                ${odourOptions.map((option) => `
+                                    <label class="radio-item finish-odour-option">
+                                        <input type="radio" name="finishOdour" value="${option.value}" ${assessment.finalOdour === option.value ? 'checked' : ''} onchange="app.updateFinishOdourValidation()">
+                                        ${option.label}
+                                    </label>
+                                `).join('')}
+                            </div>
+                            <div id="finishOdourValidation" class="alert finish-validation-box" style="display:none;"></div>
+                        </div>
+
+                        <div class="module" style="background: #F7FBF7; border-color: #C8E6C9;">
+                            <h3 class="module-title maintenance">Estimated Compost Output</h3>
+                            <div class="summary-grid" style="margin: 0;">
+                                <div class="summary-item">
+                                    <div class="summary-value">${this.formatNumber(estimatedOutput, 1)}</div>
+                                    <div class="summary-label">Estimated Compost Output (${inputUnit})</div>
+                                    <div style="margin-top: 6px; color: var(--gray); font-size: 0.9rem;">
+                                        (Initial Composting Stock + Total Organic Input + Total Water Added) × ${this.formatNumber(conversionSettings.compostConversionRate * 100, 2)}% conversion rate
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="module" style="background: #FAFFFA; border-color: #C8E6C9;">
+                            <h3 class="module-title maintenance" style="margin-bottom: 12px;">Final Compost Photos</h3>
+                            ${this.isBatchShared(batch) && !this.isCloudPhotoStorageEnabled()
+                                ? `<div class="alert alert-warning" style="margin-bottom: 14px;">
+                                        <strong>Photos are local-only</strong><br>
+                                        Photos will be saved on this device but will not be shared with collaborators until cloud photo storage is enabled.
+                                   </div>`
+                                : ''}
+                            <div class="icta-photo-toolbar">
+                                <button type="button" class="btn btn-secondary" onclick="app.openFinishPhotoPicker('take')">📷 Take Photo</button>
+                                <button type="button" class="btn btn-secondary" onclick="app.openFinishPhotoPicker('upload')">⬆ Upload Photo</button>
+                                <button type="button" class="btn btn-secondary" onclick="app.openFinishPhotoPicker('file')">📁 Choose File</button>
+                                <div class="icta-photo-hint">JPG / JPEG / PNG • Up to 9 photos</div>
+                            </div>
+                            <input id="finishTakePhotoInput" type="file" accept="image/jpeg,image/jpg,image/png" capture="environment" style="display:none;">
+                            <input id="finishUploadPhotoInput" type="file" accept="image/jpeg,image/jpg,image/png" multiple style="display:none;">
+                            <input id="finishChooseFileInput" type="file" accept="image/jpeg,image/jpg,image/png" multiple style="display:none;">
+                            <input id="finishReplacePhotoInput" type="file" accept="image/jpeg,image/jpg,image/png" style="display:none;">
+                            <div id="finishPhotoGrid" class="icta-photo-grid">
+                                ${this.renderFinishPhotoGridHtml(assessment.finalCompostPhotos)}
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="finish-confirm-card">
+                        <div class="finish-confirm-title">Finish Confirmation</div>
+                        <div>Are you sure you want to finish Batch <strong>${batch.id}</strong>?</div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" onclick="app.closeModal()">
+                        Go Back
+                    </button>
+                    <button class="btn btn-danger" onclick="app.finishBatch('${String(routeId).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}')">
+                        Continue to Finish
+                    </button>
+                </div>
+            </div>
+        `;
+        modal.addEventListener('click', (event) => {
+            if (event.target === modal) this.closeModal();
+        });
+        document.body.appendChild(modal);
+
+        const takeInput = document.getElementById('finishTakePhotoInput');
+        if (takeInput) {
+            takeInput.addEventListener('change', () => {
+                const files = Array.from(takeInput.files || []);
+                this.handleFinishPhotoFiles(files);
+                takeInput.value = '';
+            });
+        }
+        const uploadInput = document.getElementById('finishUploadPhotoInput');
+        if (uploadInput) {
+            uploadInput.addEventListener('change', () => {
+                const files = Array.from(uploadInput.files || []);
+                this.handleFinishPhotoFiles(files);
+                uploadInput.value = '';
+            });
+        }
+        const chooseInput = document.getElementById('finishChooseFileInput');
+        if (chooseInput) {
+            chooseInput.addEventListener('change', () => {
+                const files = Array.from(chooseInput.files || []);
+                this.handleFinishPhotoFiles(files);
+                chooseInput.value = '';
+            });
+        }
+        const replaceInput = document.getElementById('finishReplacePhotoInput');
+        if (replaceInput) {
+            replaceInput.addEventListener('change', () => {
+                const files = Array.from(replaceInput.files || []);
+                this.handleFinishReplacePhotoFiles(files);
+                replaceInput.value = '';
+            });
+        }
+
+        this.updateFinishTemperatureAssessment();
+        this.updateFinishMoistureAssessmentVisibility();
+        this.updateFinishOdourValidation();
+    },
+
+    closeModal() {
+        const modal = document.getElementById('finishModal');
+        if (modal) modal.remove();
+        this.data.finishPhotoDraft = null;
+        this.data.finishPhotoReplaceIndex = null;
+    },
+
+    async finishBatch(batchId) {
+        const batch = this.findBatchByRouteId(batchId);
+        if (!batch) return;
+        const routeId = this.getBatchRouteId(batch);
+        const previousFinalPhotos = this.normalizePhotoList(batch?.finalAssessment?.finalCompostPhotos || []);
+        const cloudPhotosEnabled = this.isCloudPhotoStorageEnabled();
+        const sharedBatch = this.isBatchShared(batch);
+        const getNumber = (id) => {
+            const el = document.getElementById(id);
+            if (!el || el.value === '') return null;
+            const value = parseFloat(el.value);
+            return isNaN(value) ? null : value;
+        };
+        const finalCoreTemperature = getNumber('finishFinalCoreTemperature');
+        const ambientTemperature = getNumber('finishAmbientTemperature');
+        const finalMoistureType = document.querySelector('input[name="finishMoistureType"]:checked')?.value || 'quantitative';
+        const finalMoistureValue = finalMoistureType === 'quantitative' ? getNumber('finishMoistureValue') : null;
+        const finalMoistureAssessment = finalMoistureType === 'qualitative'
+            ? (document.querySelector('input[name="finishMoistureAssessment"]:checked')?.value || '')
+            : '';
+        const finalOdour = document.querySelector('input[name="finishOdour"]:checked')?.value || '';
+        const temperatureDifference = (finalCoreTemperature != null && ambientTemperature != null)
+            ? Math.abs(finalCoreTemperature - ambientTemperature)
+            : null;
+
+        if (finalCoreTemperature == null || ambientTemperature == null) {
+            alert('Please complete the final temperature assessment before finishing this batch.');
+            return;
+        }
+        if (finalMoistureType === 'quantitative' && finalMoistureValue == null) {
+            alert('Please enter the final moisture percentage before finishing this batch.');
+            return;
+        }
+        if (finalMoistureType === 'qualitative' && !finalMoistureAssessment) {
+            alert('Please select the final qualitative moisture assessment before finishing this batch.');
+            return;
+        }
+        if (!finalOdour) {
+            alert('Please select the final odour assessment before finishing this batch.');
+            return;
+        }
+        if (temperatureDifference != null && temperatureDifference > 8) {
+            alert('The compost is not yet temperature-stable. Continue maturation until the temperature difference is 8°C or lower.');
+            return;
+        }
+        if (!['earthy', 'musty', 'mushroom_like', 'odorless'].includes(finalOdour)) {
+            alert('The final odour assessment indicates the compost is not mature enough to finish this batch yet.');
+            return;
+        }
+
+        try {
+            if (!batch.cloudId) {
+                await this.upsertBatchToCloud(batch, { skipCreatedAt: false });
+            }
+        } catch (error) {
+        }
+
+        batch.finalAssessment = {
+            finalCoreTemperature,
+            ambientTemperature,
+            temperatureDifference,
+            finalMoistureType,
+            finalMoistureValue,
+            finalMoistureAssessment,
+            finalOdour,
+            finalCompostPhotos: Array.isArray(this.data.finishPhotoDraft) ? this.data.finishPhotoDraft.slice(0, 9) : []
+        };
+        const previousFinalPhotoCount = cloudPhotosEnabled ? this.normalizePhotoList(previousFinalPhotos).length : 0;
+        let nextFinalPhotoCount = this.normalizePhotoList(batch.finalAssessment.finalCompostPhotos).length;
+        if (cloudPhotosEnabled) {
+            batch.finalAssessment.finalCompostPhotos = await this.syncPhotoListToCloud(
+                batch,
+                batch.finalAssessment.finalCompostPhotos,
+                'final-assessment',
+                'final'
+            );
+            nextFinalPhotoCount = this.normalizePhotoList(batch.finalAssessment.finalCompostPhotos).length;
+            if (nextFinalPhotoCount > previousFinalPhotoCount) {
+                const addedPhotoCount = nextFinalPhotoCount - previousFinalPhotoCount;
+                this.appendBatchActivity(
+                    batch,
+                    'batch_final_photos_uploaded',
+                    `Uploaded ${addedPhotoCount} final compost photo${addedPhotoCount === 1 ? '' : 's'}`,
+                    { addedPhotoCount }
+                );
+            }
+        }
+        const estimatedOutput = this.calculateEstimatedCompostOutput(batch);
+        batch.status = 'finished';
+        batch.currentPhase = 'Finished';
+        batch.finishedDate = this.getTodayISODateInTimeZone('Europe/Madrid');
+        batch.output = {
+            estimatedOutput,
+            harvestStatus: batch.output?.harvestStatus === 'completed' ? 'completed' : 'pending',
+            date: batch.output?.harvestStatus === 'completed' ? (batch.output?.date || '') : '',
+            compostOutput: batch.output?.harvestStatus === 'completed' ? batch.output?.compostOutput : null,
+            notes: batch.output?.notes || ''
+        };
+        this.appendBatchActivity(
+            batch,
+            'batch_finished',
+            `Finished batch ${batch.id}`,
+            {
+                batchId: batch.id,
+                estimatedOutput
+            }
+        );
+        this.saveData();
+        try {
+            await this.upsertBatchToCloud(batch, { skipCreatedAt: true });
+            if (cloudPhotosEnabled) {
+                const previousPaths = this.getPhotoStoragePaths(previousFinalPhotos);
+                const nextPaths = this.getPhotoStoragePaths(batch.finalAssessment.finalCompostPhotos);
+                await this.deleteStorageFiles(previousPaths.filter((path) => !nextPaths.includes(path)));
+            }
+        } catch (error) {
+            alert('Batch finished locally, but cloud sync failed. Please try again after refreshing.');
+        }
+        this.closeModal();
+        const successMessage = sharedBatch && !cloudPhotosEnabled && nextFinalPhotoCount > 0
+            ? '✅ Batch Successfully Finished (Photos saved locally only)'
+            : '✅ Batch Successfully Finished';
+        this.showTransientSuccessMessage(successMessage, 2300);
+        window.setTimeout(() => {
+            this.navigate('batchDetail', { batchId: routeId });
+        }, 2300);
+    },
+
+    async deleteBatch(batchId) {
+        const batch = this.findBatchByRouteId(batchId);
+        const index = batch ? this.data.batches.findIndex((item) => this.getBatchRouteId(item) === this.getBatchRouteId(batch)) : -1;
+        if (index < 0) return;
+        if (!this.canDeleteBatch(batch)) {
+            alert('Only the batch owner can delete this shared batch.');
+            return;
+        }
+
+        if (!confirm(`Delete batch ${batch.id}? This action cannot be undone.`)) {
+            return;
+        }
+
+        this.data.batches.splice(index, 1);
+        if (this.data.currentBatch && this.getBatchRouteId(this.data.currentBatch) === this.getBatchRouteId(batch)) {
+            this.data.currentBatch = null;
+        }
+        this.saveData();
+        try {
+            await this.deleteBatchFromCloud(batch);
+        } catch (error) {
+            alert('Batch deleted locally, but cloud delete failed. Please refresh and try again.');
+        }
+        this.navigate('dashboard');
+    },
+
+    exportData() {
+        const batchId = document.getElementById('exportBatchId')?.value;
+        if (!batchId) {
+            alert('Please select a batch to export');
+            return;
+        }
+
+        const batch = this.findBatchByRouteId(batchId);
+        if (!batch) return;
+
+        const dateFrom = document.getElementById('exportDateFrom')?.value;
+        const dateTo = document.getElementById('exportDateTo')?.value;
+        const format = document.querySelector('input[name="exportFormat"]:checked')?.value || 'csv';
+
+        let records = batch.records;
+        if (dateFrom) {
+            records = records.filter(r => r.date >= dateFrom);
+        }
+        if (dateTo) {
+            records = records.filter(r => r.date <= dateTo);
+        }
+
+        const isICTA = this.isICTAUser();
+        const batchSummaryEnabled = document.getElementById('exportModule-batchSummary')?.checked ?? true;
+        const dailyRecordsEnabled = document.getElementById('exportModule-dailyRecords')?.checked ?? true;
+        const harvestEnabled = document.getElementById('exportModule-harvest')?.checked ?? true;
+        const finalAssessmentEnabled = document.getElementById('exportModule-finalAssessment')?.checked ?? true;
+        const inputUnit = this.getBatchInputUnitName(batch);
+        const headers = ['Date', 'Composter'];
+        const finalAssessment = batch.finalAssessment || {};
+        const finishedDate = batch.finishedDate || '';
+        const initialStockAmount = this.calculateInitialStockAmount(batch);
+        const totalOrganicInput = this.calculateTotalInput(batch);
+        const totalWaterAdded = this.calculateTotalWaterAdded(batch);
+        const totalSystemInput = this.calculateTotalMaterialInput(batch);
+        const calculationSettings = this.getBatchCalculationSettings(batch);
+        const communityType = this.data.currentCommunityType === 'Other'
+            ? (this.data.currentCommunityTypeOther || 'Other')
+            : (this.data.currentCommunityType || '');
+        const getRecordWaterAddedAmount = (record) => {
+            const raw = record?.actionTaken?.waterAddedAmount != null ? record.actionTaken.waterAddedAmount : record?.waterAddedAmount;
+            const legacy = record?.process?.waterAddedAmount;
+            const picked = raw != null ? raw : legacy;
+            if (picked == null || picked === '') return '';
+            const value = parseFloat(picked);
+            return isNaN(value) ? '' : value;
+        };
+        const getRecordMoistureExportValues = (record) => {
+            const type = record?.monitoring?.moistureAssessmentType || ((record?.monitoring?.moistureQualitative || '') ? 'qualitative' : 'quantitative');
+            const quantitativeRaw = record?.monitoring?.moistureValue != null ? record.monitoring.moistureValue : record?.process?.moisture;
+            const quantitative = quantitativeRaw != null && quantitativeRaw !== '' && !isNaN(quantitativeRaw) ? (parseFloat(quantitativeRaw) || 0) : '';
+            const qualitative = record?.monitoring?.moistureQualitative || '';
+            return {
+                type,
+                value: type === 'quantitative' ? quantitative : '',
+                assessment: type === 'qualitative' ? qualitative : ''
+            };
+        };
+        if (dailyRecordsEnabled) {
+            if (document.getElementById('exportTotalInput')?.checked) headers.push(`Organic Waste (${inputUnit})`, `Structural Material (${inputUnit})`, `Total Organic Input (${inputUnit})`);
+            if (isICTA) {
+                if (document.getElementById('exportCocinaPlanta')?.checked) {
+                    headers.push(`Cocina (${inputUnit})`, `Planta 0 (${inputUnit})`, `Planta 1 (${inputUnit})`, `Planta 3 (${inputUnit})`);
+                }
+                if (document.getElementById('exportStructural')?.checked) headers.push('Ratio', `Wood (Fusta) (${inputUnit})`, `Wood chips (${inputUnit})`);
+            } else {
+                if (document.getElementById('exportTotalWasteInput')?.checked) headers.push(`Regular Organic Waste (${inputUnit})`);
+                if (document.getElementById('exportStructuralMaterials')?.checked) headers.push('Structural Materials (JSON)');
+            }
+            if (document.getElementById('exportAdditionalInput')?.checked) headers.push(`Additional Organic Material (${inputUnit})`, `Additional Structural Material (${inputUnit})`, `Total Additional Input (${inputUnit})`, 'Additional Source', 'Additional Type', `Additional Amount (${inputUnit})`);
+            if (document.getElementById('exportQuality')?.checked) headers.push('Quality');
+
+            if (document.getElementById('exportTemperature')?.checked) {
+                headers.push('Ambient (°C)', 'Core (°C)', 'Transition (°C)', 'Outer (°C)', 'Avg Temp (°C)');
+            }
+            if (document.getElementById('exportMoisture')?.checked) headers.push('Moisture Type', 'Moisture (%)', 'Moisture Assessment');
+            if (document.getElementById('exportOxygen')?.checked) headers.push('Oxygen (%)');
+            if (document.getElementById('exportPhase')?.checked) headers.push('Phase');
+            if (document.getElementById('exportOperations')?.checked) {
+                headers.push('Turning', 'Mixing', 'Water Added', `Water Added Amount (${inputUnit})`, 'None');
+            }
+
+            if (document.getElementById('exportOdour')?.checked) headers.push('Odour', 'Odour Note');
+            if (document.getElementById('exportLeachate')?.checked) headers.push('Leachate', 'Leachate Note');
+        }
+
+        const escapeCsv = (value) => {
+            if (value === null || value === undefined) return '';
+            const str = String(value);
+            if (/[",\n]/.test(str)) return `"${str.replace(/"/g, '""')}"`;
+            return str;
+        };
+
+        const escapeHtml = (value) => String(value == null ? '' : value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+
+        const csvRows = [];
+        const exportRows = [];
+        const addBlankRow = () => {
+            csvRows.push('');
+            exportRows.push({ kind: 'blank', values: [] });
+        };
+        const pushExportRow = (values = [], kind = 'data') => {
+            csvRows.push(values.map(escapeCsv).join(','));
+            exportRows.push({
+                kind,
+                values: values.map((value) => value == null ? '' : String(value))
+            });
+        };
+        const addSectionTitle = (title) => {
+            if (csvRows.length > 0) addBlankRow();
+            pushExportRow([title], 'section');
+        };
+        const addFieldValueSection = (title, entries) => {
+            addSectionTitle(title);
+            pushExportRow(['Field', 'Value'], 'header');
+            entries.forEach(([label, value]) => pushExportRow([label, value], 'data'));
+        };
+
+        if (batchSummaryEnabled) {
+            const batchSummaryEntries = [];
+            if (document.getElementById('exportSummaryBasic')?.checked) {
+                batchSummaryEntries.push(
+                    ['Batch ID', batch.id],
+                    ['Batch Status', batch.status || 'active'],
+                    ['Organization', this.data.currentOrganization || ''],
+                    ['Community Type', communityType],
+                    ['Input Unit', inputUnit]
+                );
+            }
+            if (document.getElementById('exportSummaryDates')?.checked) {
+                batchSummaryEntries.push(
+                    ['Start Date', batch.startDate ? this.formatDate(batch.startDate) : ''],
+                    ['Finished Date', finishedDate ? this.formatDate(finishedDate) : ''],
+                    ['Date Filter From', dateFrom ? this.formatDate(dateFrom) : 'All'],
+                    ['Date Filter To', dateTo ? this.formatDate(dateTo) : 'All'],
+                    ['Records Included', records.length]
+                );
+            }
+            if (document.getElementById('exportSummaryTotals')?.checked) {
+                batchSummaryEntries.push(
+                    [`Initial Composting Stock (${inputUnit})`, initialStockAmount],
+                    [`Total Organic Input (${inputUnit})`, totalOrganicInput],
+                    [`Total Water Added (${inputUnit})`, totalWaterAdded],
+                    [`Batch Total System Input (${inputUnit})`, totalSystemInput]
+                );
+            }
+            if (document.getElementById('exportSummaryCalculation')?.checked) {
+                batchSummaryEntries.push(
+                    ['Compost Conversion Rate', `${this.formatNumber(calculationSettings.compostConversionRate * 100, 2)}%`]
+                );
+            }
+            if (batchSummaryEntries.length > 0) {
+                addFieldValueSection('BATCH SUMMARY', batchSummaryEntries);
+            }
+        }
+
+        let phaseByRecordId = null;
+        if (dailyRecordsEnabled && document.getElementById('exportPhase')?.checked) {
+            phaseByRecordId = this.getBatchPhaseTracking(records).phaseByRecordId;
+        }
+
+        if (dailyRecordsEnabled) {
+            addSectionTitle('DAILY RECORDS');
+            if (records.length === 0) {
+                pushExportRow(['No daily records found for the selected date range.'], 'note');
+            } else {
+                pushExportRow(headers, 'header');
+            }
+
+            records.forEach(r => {
+                const row = [r.date, `Composter ${r.composterId}`];
+                const materialBreakdown = this.calculateRecordMaterialBreakdown(r);
+
+                if (document.getElementById('exportTotalInput')?.checked) {
+                    row.push(materialBreakdown.totalOrganicWaste, materialBreakdown.totalStructuralMaterial, materialBreakdown.totalOrganicInput);
+                }
+                if (isICTA) {
+                    if (document.getElementById('exportCocinaPlanta')?.checked) {
+                        if (r.input) {
+                            row.push(r.input.cocina || 0, r.input.planta0 || 0, r.input.planta1 || 0, r.input.planta3 || 0);
+                        } else {
+                            row.push(0, 0, 0, 0);
+                        }
+                    }
+                    if (document.getElementById('exportStructural')?.checked) {
+                        row.push(r.input?.ratio || '', r.input?.woodFusta || 0, r.input?.woodChips || 0);
+                    }
+                } else {
+                    if (document.getElementById('exportTotalWasteInput')?.checked) {
+                        row.push(materialBreakdown.regularOrganicWaste);
+                    }
+                    if (document.getElementById('exportStructuralMaterials')?.checked) {
+                        const materials = (r.input && Array.isArray(r.input.structuringMaterials)) ? r.input.structuringMaterials : [];
+                        row.push(JSON.stringify(materials));
+                    }
+                }
+                if (document.getElementById('exportAdditionalInput')?.checked) {
+                    const enabled = (r.input && r.input.additionalInput && r.input.additionalInput.enabled) || (r.input && Array.isArray(r.input.additionalInputs) && r.input.additionalInputs.length > 0);
+                    if (enabled && r.input) {
+                        const items = Array.isArray(r.input.additionalInputs)
+                            ? r.input.additionalInputs
+                            : [{ source: r.input.additionalInput?.source || '', type: r.input.additionalInput?.type || '', weight: r.input.additionalInput?.weight || 0 }];
+                        const sources = items.map(i => (i && i.source) ? i.source : '').filter(Boolean).join('; ');
+                        const types = items.map(i => (i && i.type) ? i.type : '').filter(Boolean).join('; ');
+                        const weights = items.reduce((s, i) => s + ((i && i.weight != null && !isNaN(i.weight)) ? (parseFloat(i.weight) || 0) : 0), 0);
+                        row.push(materialBreakdown.additionalOrganicMaterial, materialBreakdown.additionalStructuralMaterial, materialBreakdown.totalAdditionalInput, sources, types, weights);
+                    } else {
+                        row.push(0, 0, 0, '', '', 0);
+                    }
+                }
+                if (document.getElementById('exportQuality')?.checked) {
+                    row.push(r.input?.quality || '');
+                }
+
+                if (document.getElementById('exportTemperature')?.checked) {
+                    if (r.process) {
+                        const avg = this.calculateAvgTemperature(r);
+                        row.push(r.process.ambient, r.process.core, r.process.transition, r.process.outer, avg);
+                    } else {
+                        row.push('', '', '', '', '');
+                    }
+                }
+                if (document.getElementById('exportMoisture')?.checked) {
+                    const moistureExport = getRecordMoistureExportValues(r);
+                    row.push(moistureExport.type, moistureExport.value, moistureExport.assessment);
+                }
+                if (document.getElementById('exportOxygen')?.checked) {
+                    const oxygen = r.process?.oxygen;
+                    row.push(oxygen != null && oxygen !== '' ? oxygen : '');
+                }
+                if (document.getElementById('exportPhase')?.checked) {
+                    row.push(phaseByRecordId ? (phaseByRecordId.get(r.id) || '') : '');
+                }
+                if (document.getElementById('exportOperations')?.checked) {
+                    if (r.process) {
+                        const waterAddedAmount = getRecordWaterAddedAmount(r);
+                        row.push(r.process.turning ? 'Yes' : 'No');
+                        row.push(r.process.mixing ? 'Yes' : 'No');
+                        row.push(r.process.waterAdded ? 'Yes' : 'No');
+                        row.push(waterAddedAmount);
+                        row.push(r.process.none ? 'Yes' : 'No');
+                    } else {
+                        row.push('No', 'No', 'No', '', 'No');
+                    }
+                }
+
+                if (document.getElementById('exportOdour')?.checked) {
+                    row.push(r.observation?.odour || '');
+                    row.push(r.observation?.odourNote || '');
+                }
+                if (document.getElementById('exportLeachate')?.checked) {
+                    row.push(r.observation?.leachate || '');
+                    row.push(r.observation?.leachateNote || '');
+                }
+
+                pushExportRow(row, 'data');
+            });
+        }
+
+        if (harvestEnabled && batch.output) {
+            if (document.getElementById('exportOutput')?.checked) {
+                const harvestEntries = [
+                    ['Harvest Status', batch.output.harvestStatus || 'pending'],
+                    [`Estimated Compost Output (${inputUnit})`, batch.output.estimatedOutput ?? ''],
+                    ['Harvest Date', batch.output.date ? this.formatDate(batch.output.date) : ''],
+                    [`Actual Compost Output (${inputUnit})`, batch.output.compostOutput ?? '']
+                ];
+                if (document.getElementById('exportMoistureFinal')?.checked) {
+                    harvestEntries.push(
+                        ['Final Moisture Type', finalAssessment.finalMoistureType || ''],
+                        ['Final Moisture Value (%)', finalAssessment.finalMoistureValue ?? ''],
+                        ['Final Moisture Assessment', finalAssessment.finalMoistureAssessment || '']
+                    );
+                }
+                harvestEntries.push(['Notes', batch.output.notes || '']);
+                addFieldValueSection('HARVEST SUMMARY', harvestEntries);
+            }
+        }
+
+        if (finalAssessmentEnabled && document.getElementById('exportFinalAssessment')?.checked && batch.finalAssessment) {
+            addFieldValueSection('FINAL COMPOST ASSESSMENT', [
+                ['Final Core Temperature (°C)', finalAssessment.finalCoreTemperature ?? ''],
+                ['Ambient Temperature (°C)', finalAssessment.ambientTemperature ?? ''],
+                ['Temperature Difference (°C)', finalAssessment.temperatureDifference ?? ''],
+                ['Final Moisture Type', finalAssessment.finalMoistureType || ''],
+                ['Final Moisture Value (%)', finalAssessment.finalMoistureValue ?? ''],
+                ['Final Moisture Assessment', finalAssessment.finalMoistureAssessment || ''],
+                ['Final Odour', finalAssessment.finalOdour || ''],
+                ['Final Compost Photos Count', Array.isArray(finalAssessment.finalCompostPhotos) ? finalAssessment.finalCompostPhotos.length : 0]
+            ]);
+        }
+
+        if (exportRows.length === 0) {
+            alert('Please select at least one export module or field.');
+            return;
+        }
+
+        let blob;
+        let downloadName;
+        if (format === 'excel') {
+            const maxCols = Math.max(2, ...exportRows.map((row) => row.values.length || 0));
+            const renderExcelRow = (row) => {
+                if (row.kind === 'blank') {
+                    return `<tr><td colspan="${maxCols}" style="height:12px; border:none; background:#FFFFFF;"></td></tr>`;
+                }
+                if (row.kind === 'section') {
+                    return `<tr><td colspan="${maxCols}" style="background:#DCEBFF; color:#1E3A5F; font-weight:700; font-size:15px; padding:10px 12px; border:1px solid #BFD2EC;">${escapeHtml(row.values[0] || '')}</td></tr>`;
+                }
+                const isHeader = row.kind === 'header';
+                const isNote = row.kind === 'note';
+                const tag = isHeader ? 'th' : 'td';
+                const baseStyle = isHeader
+                    ? 'background:#EEF4FB; color:#2F3A48; font-weight:700; padding:8px 10px; border:1px solid #D7E2EE; text-align:left;'
+                    : isNote
+                        ? 'background:#FFFBEA; color:#7A6222; padding:9px 10px; border:1px solid #F1E1A6;'
+                        : 'background:#FFFFFF; color:#2F3A48; padding:8px 10px; border:1px solid #E3EAF2; vertical-align:top;';
+                const cells = [];
+                for (let i = 0; i < maxCols; i += 1) {
+                    const value = row.values[i] || '';
+                    cells.push(`<${tag} style="${baseStyle}">${escapeHtml(value)}</${tag}>`);
+                }
+                return `<tr>${cells.join('')}</tr>`;
+            };
+            const workbookHtml = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+body { font-family: Arial, sans-serif; }
+table { border-collapse: collapse; width: 100%; }
+</style>
+</head>
+<body>
+<table>
+${exportRows.map(renderExcelRow).join('\n')}
+</table>
+</body>
+</html>`;
+            blob = new Blob([workbookHtml], { type: 'application/vnd.ms-excel;charset=utf-8;' });
+            downloadName = `${batch.id}_export.xls`;
+        } else {
+            const csvContent = csvRows.join('\n');
+            blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            downloadName = `${batch.id}_export.csv`;
+        }
+        const link = document.createElement('a');
+        const url = URL.createObjectURL(blob);
+        link.setAttribute('href', url);
+        link.setAttribute('download', downloadName);
+        link.style.visibility = 'hidden';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+
+        alert(`Data exported successfully as ${format === 'excel' ? 'Excel (.xls)' : 'CSV'}!`);
+    }
+};
+
+document.addEventListener('DOMContentLoaded', () => {
+    window.app = App;
+    App.init();
+});

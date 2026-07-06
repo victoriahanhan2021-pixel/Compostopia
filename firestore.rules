@@ -1,0 +1,41 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isBatchOwner(batchData) {
+      return signedIn() && batchData.ownerUid == request.auth.uid;
+    }
+
+    function isCollaborator(batchData) {
+      return signedIn()
+        && request.auth.token.email != null
+        && request.auth.token.email in batchData.collaboratorEmails;
+    }
+
+    function canAccessBatch(batchData) {
+      return isBatchOwner(batchData) || isCollaborator(batchData);
+    }
+
+    match /users/{userId} {
+      allow read, write: if signedIn() && request.auth.uid == userId;
+    }
+
+    match /batches/{batchId} {
+      allow create: if signedIn() && request.resource.data.ownerUid == request.auth.uid;
+      allow read: if canAccessBatch(resource.data);
+      allow update: if canAccessBatch(resource.data)
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && request.resource.data.id == resource.data.id;
+      allow delete: if isBatchOwner(resource.data);
+
+      match /records/{recordId} {
+        allow read: if canAccessBatch(get(/databases/$(database)/documents/batches/$(batchId)).data);
+        allow create, update: if canAccessBatch(get(/databases/$(database)/documents/batches/$(batchId)).data);
+        allow delete: if canAccessBatch(get(/databases/$(database)/documents/batches/$(batchId)).data);
+      }
+    }
+  }
+}

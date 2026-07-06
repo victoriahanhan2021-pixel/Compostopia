@@ -1,0 +1,28 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function batchDoc(ownerUid, batchRouteId) {
+      return firestore.get(/databases/(default)/documents/batches/$(batchRouteId));
+    }
+
+    function canAccessBatch(ownerUid, batchRouteId) {
+      return signedIn()
+        && batchDoc(ownerUid, batchRouteId).data != null
+        && (
+          batchDoc(ownerUid, batchRouteId).data.ownerUid == request.auth.uid
+          || (
+            request.auth.token.email != null
+            && request.auth.token.email in batchDoc(ownerUid, batchRouteId).data.collaboratorEmails
+          )
+        );
+    }
+
+    match /batch-photos/{ownerUid}/{batchRouteId}/{allPaths=**} {
+      allow read, write: if canAccessBatch(ownerUid, batchRouteId);
+    }
+  }
+}
