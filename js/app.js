@@ -57,7 +57,27 @@ const App = {
         this.data.pendingRoute = this.parseRouteFromUrl();
         this.bindGlobalClickDelegation();
         this.bindAuthState();
+        this.cleanupOverlays();
         this.render();
+    },
+
+    cleanupOverlays() {
+        try {
+            const ids = [
+                'infoModal',
+                'confirmModal',
+                'deleteDailyRecordModal',
+                'finishModal'
+            ];
+            ids.forEach((id) => {
+                const el = document.getElementById(id);
+                if (el) el.remove();
+            });
+            document.querySelectorAll('.modal-overlay').forEach((el) => {
+                el.remove();
+            });
+        } catch (error) {
+        }
     },
 
     parseRouteFromUrl() {
@@ -2779,6 +2799,7 @@ const App = {
     },
 
     navigate(page, params = {}) {
+        this.cleanupOverlays();
         this.data.currentPage = page;
         if (params.batchId) {
             this.data.currentBatch = this.findBatchByRouteId(params.batchId);
