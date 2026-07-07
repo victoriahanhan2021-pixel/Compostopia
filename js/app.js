@@ -42,6 +42,7 @@ const App = {
         authSubmitting: false,
         editingBatch: null,
         editingRecord: null,
+        pendingRoute: null,
         globalClickDelegationBound: false,
         batchGalleryPhotos: [],
         batchInfoPanel: null,
@@ -53,9 +54,38 @@ const App = {
     init() {
         this.data.currentPage = 'login';
         this.data.rememberMe = localStorage.getItem('compostRememberMe') === 'true';
+        this.data.pendingRoute = this.parseRouteFromUrl();
         this.bindGlobalClickDelegation();
         this.bindAuthState();
         this.render();
+    },
+
+    parseRouteFromUrl() {
+        try {
+            const params = new URLSearchParams(window.location.search || '');
+            const page = String(params.get('page') || '').trim();
+            const batchId = String(params.get('batchId') || '').trim();
+            const recordId = params.get('recordId');
+            const allowedPages = new Set(['dashboard', 'createBatch', 'batchDetail', 'dailyRecord', 'output', 'export']);
+            if (!allowedPages.has(page)) return null;
+            const route = { page };
+            if (batchId) route.batchId = batchId;
+            if (recordId != null && String(recordId).trim() !== '') route.recordId = String(recordId);
+            return route;
+        } catch (error) {
+            return null;
+        }
+    },
+
+    clearUrlRouteParams() {
+        try {
+            const url = new URL(window.location.href);
+            url.searchParams.delete('page');
+            url.searchParams.delete('batchId');
+            url.searchParams.delete('recordId');
+            window.history.replaceState({}, document.title, url.pathname + url.search + url.hash);
+        } catch (error) {
+        }
     },
 
     bindGlobalClickDelegation() {
@@ -67,6 +97,7 @@ const App = {
 
             const addBtn = target.closest('#addDailyRecordBtn');
             if (addBtn) {
+                if (typeof event.preventDefault === 'function') event.preventDefault();
                 const batchId = addBtn.getAttribute('data-batch-id') || (this.data.currentBatch ? this.data.currentBatch.id : null);
                 if (batchId) this.navigate('dailyRecord', { batchId });
                 return;
@@ -112,9 +143,21 @@ const App = {
                 this.data.currentPage = 'login';
             }
 
-            if (this.data.currentUser && (this.data.currentPage === 'login' || this.data.currentPage === 'register')) {
-                this.navigate('dashboard');
-                return;
+            if (this.data.currentUser) {
+                const pending = this.data.pendingRoute || this.parseRouteFromUrl();
+                this.data.pendingRoute = null;
+                if (pending && pending.page) {
+                    this.clearUrlRouteParams();
+                    this.navigate(pending.page, {
+                        ...(pending.batchId ? { batchId: pending.batchId } : {}),
+                        ...(pending.recordId != null ? { recordId: pending.recordId } : {})
+                    });
+                    return;
+                }
+                if (this.data.currentPage === 'login' || this.data.currentPage === 'register') {
+                    this.navigate('dashboard');
+                    return;
+                }
             }
 
             this.render();
@@ -4551,6 +4594,7 @@ const App = {
         const routeId = this.getBatchRouteId(batch);
         const escapedRouteId = this.escapeAttr(routeId);
         const jsSafeRouteId = String(routeId).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+        const hrefBatchId = encodeURIComponent(String(routeId || ''));
 
         const sortedRecords = [...(batch.records || [])].sort((a, b) => new Date(a.date) - new Date(b.date));
         const recordsDescending = [...sortedRecords].reverse();
@@ -4752,10 +4796,11 @@ const App = {
                 <div class="action-panel">
                     <div class="btn-group">
                         ${batch.status === 'active' ? `
-                            <button type="button" class="btn btn-primary" id="addDailyRecordBtn"
-                                data-batch-id="${escapedRouteId}" onclick="app.navigate('dailyRecord', {batchId: '${jsSafeRouteId}'})">
+                            <a class="btn btn-primary" id="addDailyRecordBtn"
+                                data-batch-id="${escapedRouteId}"
+                                href="./?page=dailyRecord&batchId=${hrefBatchId}">
                                 ➕ Add Daily Record
-                            </button>
+                            </a>
                         ` : `
                             <button type="button" class="btn btn-secondary" onclick="app.navigate('output', {batchId: '${escapedRouteId}'})">
                                 📤 View Output
