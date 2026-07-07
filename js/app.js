@@ -117,12 +117,6 @@ const App = {
 
             const addBtn = target.closest('#addDailyRecordBtn');
             if (addBtn) {
-                const isAnchor = String(addBtn.tagName || '').toLowerCase() === 'a';
-                if (isAnchor) {
-                    const href = addBtn.getAttribute('href');
-                    if (href) window.location.assign(href);
-                    return;
-                }
                 const batchId = addBtn.getAttribute('data-batch-id') || (this.data.currentBatch ? this.data.currentBatch.id : null);
                 if (batchId) this.navigate('dailyRecord', { batchId });
                 return;
@@ -313,6 +307,15 @@ const App = {
             .replace(/&/g, '&amp;')
             .replace(/</g, '&lt;')
             .replace(/"/g, '&quot;');
+    },
+
+    escapeHtml(value) {
+        return String(value == null ? '' : value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
     },
 
     normalizeCollaboratorEmails(emails = []) {
@@ -993,10 +996,11 @@ const App = {
         };
 
         const mapLeachateFromObservation = () => {
-            if (monitoring.leachateObserved) return monitoring.leachateObserved;
+            const stored = String(monitoring.leachateObserved ?? '').trim();
+            if (stored) return stored;
             if (observation.leachate === 'Yes') return 'yes';
             if (observation.leachate === 'No') return 'no';
-            return 'not_assessed';
+            return '';
         };
 
         const quantitativeMoisture = monitoring.moistureValue != null
@@ -1018,6 +1022,9 @@ const App = {
         const measurementDate = String(advancedMonitoring?.measurementDate || samplingDate).trim();
         const odourState = getOdourState();
 
+        const moistureAssessmentType = String(monitoring.moistureAssessmentType || '').trim()
+            || (quantitativeMoisture != null ? 'quantitative' : ((monitoring.moistureQualitative || '') ? 'qualitative' : ''));
+
         return {
             recordDate,
             ambientTemperature: monitoring.ambientTemperature != null ? monitoring.ambientTemperature : (process.ambient != null ? process.ambient : null),
@@ -1025,7 +1032,7 @@ const App = {
             coreTemperature: monitoring.coreTemperature != null ? monitoring.coreTemperature : (process.core != null ? process.core : null),
             transitionTemperature: monitoring.transitionTemperature != null ? monitoring.transitionTemperature : (process.transition != null ? process.transition : null),
             outerTemperature: monitoring.outerTemperature != null ? monitoring.outerTemperature : (process.outer != null ? process.outer : null),
-            moistureAssessmentType: monitoring.moistureAssessmentType || (quantitativeMoisture != null ? 'quantitative' : 'qualitative'),
+            moistureAssessmentType,
             moistureValue: quantitativeMoisture,
             moistureQualitative: monitoring.moistureQualitative || '',
             odourDetected: odourState.odourDetected,
@@ -1185,15 +1192,17 @@ const App = {
     },
 
     renderICTAMonitoringModule(monitoring) {
-        const moistureType = monitoring.moistureAssessmentType || 'quantitative';
-        const isQuantitative = moistureType === 'quantitative';
+        const moistureType = String(monitoring.moistureAssessmentType || '').trim()
+            || (monitoring.moistureValue != null ? 'quantitative' : ((monitoring.moistureQualitative || '') ? 'qualitative' : ''));
+        const showQuantitative = moistureType === 'quantitative';
+        const showQualitative = moistureType === 'qualitative';
         const odourDetectedChoice = monitoring.odourDetected === true
             ? 'detected'
             : (monitoring.odourDetected === false ? 'no' : '');
         const showOdourDetails = monitoring.odourDetected === true;
         const odourType = String(monitoring.odourType || '').trim();
         const odourDistance = String(monitoring.odourDistance || '').trim();
-        const leachateObserved = monitoring.leachateObserved || 'not_assessed';
+        const leachateObserved = String(monitoring.leachateObserved || '').trim();
         const isCompleted = this.hasMonitoringStateContent(monitoring);
         const showAdvanced = this.getBatchMonitoringProtocol(this.data.currentBatch) === 'advanced';
 
@@ -1210,11 +1219,11 @@ const App = {
                         <div style="display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px;">
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label class="form-label">Ambient Temperature (℃)</label>
-                                <input type="number" class="form-input" id="ambientTemperature" step="any" value="${monitoring.ambientTemperature != null ? monitoring.ambientTemperature : ''}" placeholder="27">
+                                <input type="number" class="form-input" id="ambientTemperature" step="any" value="${monitoring.ambientTemperature != null ? monitoring.ambientTemperature : ''}">
                             </div>
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label class="form-label">Ambient Humidity (%)</label>
-                                <input type="number" class="form-input" id="ambientHumidity" step="any" value="${monitoring.ambientHumidity != null ? monitoring.ambientHumidity : ''}" placeholder="68">
+                                <input type="number" class="form-input" id="ambientHumidity" step="any" value="${monitoring.ambientHumidity != null ? monitoring.ambientHumidity : ''}">
                             </div>
                         </div>
                     </div>
@@ -1244,23 +1253,23 @@ const App = {
                         <h3 class="module-title" style="color: #F57C00;">Moisture Assessment</h3>
                         <div class="radio-group" style="margin-bottom: 15px;">
                             <label class="radio-item">
-                                <input type="radio" name="moistureAssessmentType" value="quantitative" ${isQuantitative ? 'checked' : ''} onchange="app.updateICTAMoistureAssessmentVisibility()">
+                                <input type="radio" name="moistureAssessmentType" value="quantitative" ${showQuantitative ? 'checked' : ''} onchange="app.updateICTAMoistureAssessmentVisibility()">
                                 Quantitative
                             </label>
                             <label class="radio-item">
-                                <input type="radio" name="moistureAssessmentType" value="qualitative" ${!isQuantitative ? 'checked' : ''} onchange="app.updateICTAMoistureAssessmentVisibility()">
+                                <input type="radio" name="moistureAssessmentType" value="qualitative" ${showQualitative ? 'checked' : ''} onchange="app.updateICTAMoistureAssessmentVisibility()">
                                 Qualitative
                             </label>
                         </div>
 
-                        <div id="moistureQuantitativeSection" style="${isQuantitative ? '' : 'display:none;'}">
+                        <div id="moistureQuantitativeSection" style="${showQuantitative ? '' : 'display:none;'}">
                             <div class="form-group">
                                 <label class="form-label">Moisture (%)</label>
                                 <input type="number" class="form-input" id="moistureValue" step="any" value="${monitoring.moistureValue != null ? monitoring.moistureValue : ''}">
                             </div>
                         </div>
 
-                        <div id="moistureQualitativeSection" style="${!isQuantitative ? '' : 'display:none;'}">
+                        <div id="moistureQualitativeSection" style="${showQualitative ? '' : 'display:none;'}">
                             <div style="margin-bottom: 12px; color: var(--gray);">Take a handful of compost and squeeze firmly.</div>
                             <div class="moisture-card-grid">
                                 <label class="moisture-card">
@@ -1395,15 +1404,17 @@ const App = {
     },
 
     renderNonICTAMonitoringModule(monitoring) {
-        const moistureType = monitoring.moistureAssessmentType || 'quantitative';
-        const isQuantitative = moistureType === 'quantitative';
+        const moistureType = String(monitoring.moistureAssessmentType || '').trim()
+            || (monitoring.moistureValue != null ? 'quantitative' : ((monitoring.moistureQualitative || '') ? 'qualitative' : ''));
+        const showQuantitative = moistureType === 'quantitative';
+        const showQualitative = moistureType === 'qualitative';
         const odourDetectedChoice = monitoring.odourDetected === true
             ? 'detected'
             : (monitoring.odourDetected === false ? 'no' : '');
         const showOdourDetails = monitoring.odourDetected === true;
         const odourType = String(monitoring.odourType || '').trim();
         const odourDistance = String(monitoring.odourDistance || '').trim();
-        const leachateObserved = monitoring.leachateObserved || 'not_assessed';
+        const leachateObserved = String(monitoring.leachateObserved || '').trim();
         const isCompleted = this.hasMonitoringStateContent(monitoring);
         const showAdvanced = this.getBatchMonitoringProtocol(this.data.currentBatch) === 'advanced';
 
@@ -1420,11 +1431,11 @@ const App = {
                         <div style="display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px;">
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label class="form-label">Ambient Temperature (℃)</label>
-                                <input type="number" class="form-input" id="ambientTemperature" step="any" value="${monitoring.ambientTemperature != null ? monitoring.ambientTemperature : ''}" placeholder="27">
+                                <input type="number" class="form-input" id="ambientTemperature" step="any" value="${monitoring.ambientTemperature != null ? monitoring.ambientTemperature : ''}">
                             </div>
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label class="form-label">Ambient Humidity (%)</label>
-                                <input type="number" class="form-input" id="ambientHumidity" step="any" value="${monitoring.ambientHumidity != null ? monitoring.ambientHumidity : ''}" placeholder="68">
+                                <input type="number" class="form-input" id="ambientHumidity" step="any" value="${monitoring.ambientHumidity != null ? monitoring.ambientHumidity : ''}">
                             </div>
                         </div>
                     </div>
@@ -1444,23 +1455,23 @@ const App = {
                         <h3 class="module-title" style="color: #F57C00;">Moisture Assessment</h3>
                         <div class="radio-group" style="margin-bottom: 15px;">
                             <label class="radio-item">
-                                <input type="radio" name="moistureAssessmentType" value="quantitative" ${isQuantitative ? 'checked' : ''} onchange="app.updateICTAMoistureAssessmentVisibility()">
+                                <input type="radio" name="moistureAssessmentType" value="quantitative" ${showQuantitative ? 'checked' : ''} onchange="app.updateICTAMoistureAssessmentVisibility()">
                                 Quantitative
                             </label>
                             <label class="radio-item">
-                                <input type="radio" name="moistureAssessmentType" value="qualitative" ${!isQuantitative ? 'checked' : ''} onchange="app.updateICTAMoistureAssessmentVisibility()">
+                                <input type="radio" name="moistureAssessmentType" value="qualitative" ${showQualitative ? 'checked' : ''} onchange="app.updateICTAMoistureAssessmentVisibility()">
                                 Qualitative
                             </label>
                         </div>
 
-                        <div id="moistureQuantitativeSection" style="${isQuantitative ? '' : 'display:none;'}">
+                        <div id="moistureQuantitativeSection" style="${showQuantitative ? '' : 'display:none;'}">
                             <div class="form-group">
                                 <label class="form-label">Moisture (%)</label>
                                 <input type="number" class="form-input" id="moistureValue" step="any" value="${monitoring.moistureValue != null ? monitoring.moistureValue : ''}">
                             </div>
                         </div>
 
-                        <div id="moistureQualitativeSection" style="${!isQuantitative ? '' : 'display:none;'}">
+                        <div id="moistureQualitativeSection" style="${showQualitative ? '' : 'display:none;'}">
                             <div style="margin-bottom: 12px; color: var(--gray);">Take a handful of compost and squeeze firmly.</div>
                             <div class="moisture-card-grid">
                                 <label class="moisture-card">
@@ -3487,7 +3498,7 @@ const App = {
             </div>
             <div class="container">
                 <div class="card" style="max-width: 520px; margin: 40px auto;">
-                    <form id="loginForm">
+                    <form id="loginForm" novalidate onsubmit="event.preventDefault(); app.handleLoginSubmit()">
                         <div class="form-group">
                             <label class="form-label required">Email</label>
                             <input type="email" class="form-input" id="loginEmail" placeholder="Enter your email" required>
@@ -3511,7 +3522,7 @@ const App = {
                             </button>
                         </div>
                         <div class="btn-group" style="margin-top: 10px;">
-                            <button type="submit" class="btn btn-primary">Login</button>
+                            <button type="button" class="btn btn-primary" onclick="app.handleLoginSubmit()">Login</button>
                             <button type="button" class="btn btn-secondary" onclick="app.navigate('register')">Register</button>
                         </div>
                     </form>
@@ -4619,7 +4630,6 @@ const App = {
         const routeId = this.getBatchRouteId(batch);
         const escapedRouteId = this.escapeAttr(routeId);
         const jsSafeRouteId = String(routeId).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-        const hrefBatchId = encodeURIComponent(String(routeId || ''));
 
         const sortedRecords = [...(batch.records || [])].sort((a, b) => new Date(a.date) - new Date(b.date));
         const recordsDescending = [...sortedRecords].reverse();
@@ -4821,11 +4831,10 @@ const App = {
                 <div class="action-panel">
                     <div class="btn-group">
                         ${batch.status === 'active' ? `
-                            <a class="btn btn-primary" id="addDailyRecordBtn"
-                                data-batch-id="${escapedRouteId}"
-                                href="./?page=dailyRecord&batchId=${hrefBatchId}">
+                            <button type="button" class="btn btn-primary" id="addDailyRecordBtn"
+                                data-batch-id="${escapedRouteId}">
                                 ➕ Add Daily Record
-                            </a>
+                            </button>
                         ` : `
                             <button type="button" class="btn btn-secondary" onclick="app.navigate('output', {batchId: '${escapedRouteId}'})">
                                 📤 View Output
@@ -5752,6 +5761,7 @@ const App = {
             this.updateOdourAssessmentVisibility();
             this.updateAdvancedMonitoringFieldVisibility();
             this.initializeSystemRecommendationRealtime();
+            this.initializeToggleableMonitoringRadios();
             this.updateSystemRecommendationDom();
             this.updateMaintenanceTotals();
             this.updateICTAActionTakenVisibility();
@@ -6111,7 +6121,7 @@ const App = {
     },
 
     updateICTAMoistureAssessmentVisibility() {
-        const type = document.querySelector('input[name="moistureAssessmentType"]:checked')?.value || 'quantitative';
+        const type = document.querySelector('input[name="moistureAssessmentType"]:checked')?.value || '';
         const quantitativeSection = document.getElementById('moistureQuantitativeSection');
         const qualitativeSection = document.getElementById('moistureQualitativeSection');
         if (quantitativeSection) quantitativeSection.style.display = type === 'quantitative' ? 'block' : 'none';
@@ -6119,10 +6129,21 @@ const App = {
         if (type === 'quantitative') {
             const qualitative = document.querySelectorAll('input[name="moistureQualitative"]');
             qualitative.forEach(radio => { radio.checked = false; });
-        } else {
+            this.updateSystemRecommendationDom();
+            return;
+        }
+
+        if (type === 'qualitative') {
             const moistureValue = document.getElementById('moistureValue');
             if (moistureValue) moistureValue.value = '';
+            this.updateSystemRecommendationDom();
+            return;
         }
+
+        const moistureValue = document.getElementById('moistureValue');
+        if (moistureValue) moistureValue.value = '';
+        const qualitative = document.querySelectorAll('input[name="moistureQualitative"]');
+        qualitative.forEach(radio => { radio.checked = false; });
         this.updateSystemRecommendationDom();
     },
 
@@ -6153,6 +6174,40 @@ const App = {
         content.addEventListener('change', handler);
     },
 
+    initializeToggleableMonitoringRadios() {
+        const content = document.getElementById('monitoringModuleContent');
+        if (!content) return;
+        if (content.dataset.toggleableRadiosBound === 'true') return;
+        content.dataset.toggleableRadiosBound = 'true';
+
+        const getRadioTarget = (event) => {
+            const raw = event.target;
+            const target = raw && raw.nodeType === 3 ? raw.parentElement : raw;
+            if (!target || !target.closest) return null;
+            const direct = target.closest('input[type="radio"]');
+            if (direct) return direct;
+            const label = target.closest('label');
+            if (!label) return null;
+            return label.querySelector('input[type="radio"]');
+        };
+
+        content.addEventListener('pointerdown', (event) => {
+            const radio = getRadioTarget(event);
+            if (!radio) return;
+            radio.dataset.wasChecked = radio.checked ? 'true' : 'false';
+        }, true);
+
+        content.addEventListener('click', (event) => {
+            const radio = getRadioTarget(event);
+            if (!radio) return;
+            if (radio.dataset.wasChecked === 'true') {
+                radio.checked = false;
+                radio.dispatchEvent(new Event('change', { bubbles: true }));
+                radio.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+        }, true);
+    },
+
     getMonitoringDraftStateFromDom() {
         const getNumericValue = (id) => {
             const el = document.getElementById(id);
@@ -6160,7 +6215,7 @@ const App = {
             const n = parseFloat(el.value);
             return isNaN(n) ? null : n;
         };
-        const moistureAssessmentType = document.querySelector('input[name="moistureAssessmentType"]:checked')?.value || 'quantitative';
+        const moistureAssessmentType = document.querySelector('input[name="moistureAssessmentType"]:checked')?.value || '';
         const moistureValue = moistureAssessmentType === 'quantitative' ? getNumericValue('moistureValue') : null;
         const moistureQualitative = moistureAssessmentType === 'qualitative'
             ? (document.querySelector('input[name="moistureQualitative"]:checked')?.value || '')
@@ -6177,7 +6232,7 @@ const App = {
             ? (document.querySelector('input[name="odourDistance"]:checked')?.value || null)
             : null;
 
-        const leachateObserved = document.querySelector('input[name="leachateObserved"]:checked')?.value || 'not_assessed';
+        const leachateObserved = document.querySelector('input[name="leachateObserved"]:checked')?.value || '';
 
         const getAdvancedDraftField = (baseId) => {
             const enabled = !!document.getElementById(`${baseId}Enabled`)?.checked;
@@ -7716,7 +7771,7 @@ const App = {
             otherActionDescription
         };
 
-        const moistureAssessmentType = document.querySelector('input[name="moistureAssessmentType"]:checked')?.value || 'quantitative';
+        const moistureAssessmentType = document.querySelector('input[name="moistureAssessmentType"]:checked')?.value || '';
         const moistureValue = moistureAssessmentType === 'quantitative' ? getNumericValue('moistureValue') : null;
         const moistureQualitative = moistureAssessmentType === 'qualitative'
             ? (document.querySelector('input[name="moistureQualitative"]:checked')?.value || '')
@@ -7731,7 +7786,7 @@ const App = {
         const odourDistance = odourDetected === true
             ? (document.querySelector('input[name="odourDistance"]:checked')?.value || null)
             : null;
-        const leachateObserved = document.querySelector('input[name="leachateObserved"]:checked')?.value || 'not_assessed';
+        const leachateObserved = document.querySelector('input[name="leachateObserved"]:checked')?.value || '';
         const monitoringProtocol = this.getBatchMonitoringProtocol(batch);
         const getAdvancedField = (baseId) => {
             const enabled = !!document.getElementById(`${baseId}Enabled`)?.checked;
