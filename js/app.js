@@ -98,7 +98,11 @@ const App = {
             const addBtn = target.closest('#addDailyRecordBtn');
             if (addBtn) {
                 const isAnchor = String(addBtn.tagName || '').toLowerCase() === 'a';
-                if (isAnchor) return;
+                if (isAnchor) {
+                    const href = addBtn.getAttribute('href');
+                    if (href) window.location.assign(href);
+                    return;
+                }
                 const batchId = addBtn.getAttribute('data-batch-id') || (this.data.currentBatch ? this.data.currentBatch.id : null);
                 if (batchId) this.navigate('dailyRecord', { batchId });
                 return;
@@ -148,7 +152,6 @@ const App = {
                 const pending = this.data.pendingRoute || this.parseRouteFromUrl();
                 this.data.pendingRoute = null;
                 if (pending && pending.page) {
-                    this.clearUrlRouteParams();
                     this.navigate(pending.page, {
                         ...(pending.batchId ? { batchId: pending.batchId } : {}),
                         ...(pending.recordId != null ? { recordId: pending.recordId } : {})
