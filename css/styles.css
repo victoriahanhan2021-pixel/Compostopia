@@ -389,6 +389,30 @@ body {
     margin-bottom: 20px;
 }
 
+.system-recommendation-module {
+    background: #FFFDE7;
+    border-color: #FFECB3;
+}
+
+.system-recommendation-title {
+    color: #F57C00;
+}
+
+.system-recommendation-heading {
+    font-weight: 700;
+    margin-bottom: 10px;
+}
+
+.system-recommendation-list {
+    display: grid;
+    gap: 8px;
+    color: #4E4E4E;
+}
+
+.system-recommendation-item {
+    line-height: 1.6;
+}
+
 .module-title {
     font-size: 1.1rem;
     font-weight: 600;
@@ -410,17 +434,8 @@ body {
     color: var(--info);
 }
 
-.module-title.diagnosis {
-    color: var(--danger);
-}
-
 .module-title.maintenance {
     color: var(--primary);
-}
-
-.monitoring-temperature-ambient {
-    max-width: 320px;
-    margin-bottom: 18px;
 }
 
 .monitoring-temperature-grid {
@@ -686,6 +701,239 @@ body {
     background: rgba(255,255,255,0.52);
     color: var(--gray);
     text-align: center;
+}
+
+.initial-stock-intro {
+    color: var(--gray);
+    line-height: 1.65;
+    margin-bottom: 16px;
+}
+
+.initial-stock-add-btn {
+    margin-top: 8px;
+}
+
+.initial-stock-material-card {
+    border: 1px solid rgba(0,0,0,0.08);
+    border-radius: 16px;
+    background: rgba(255,255,255,0.72);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+    margin-bottom: 14px;
+    overflow: hidden;
+}
+
+.initial-stock-material-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 16px 18px;
+    cursor: pointer;
+    background: rgba(255,255,255,0.88);
+}
+
+.initial-stock-material-title {
+    font-weight: 800;
+    color: var(--dark);
+}
+
+.initial-stock-material-subtitle {
+    margin-top: 4px;
+    color: var(--gray);
+    font-size: 0.9rem;
+}
+
+.initial-stock-material-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.initial-stock-header-btn,
+.initial-stock-remove-btn {
+    padding: 7px 10px;
+    font-size: 0.82rem;
+}
+
+.initial-stock-material-body {
+    padding: 0 18px 18px;
+}
+
+.initial-stock-summary-card {
+    margin-top: 18px;
+    border-radius: 16px;
+    padding: 18px 20px;
+    background: linear-gradient(180deg, #FFF9F1, #FFF4E6);
+    border: 1px solid rgba(239, 108, 0, 0.16);
+}
+
+.initial-stock-summary-title {
+    font-weight: 800;
+    color: #C25C00;
+    margin-bottom: 12px;
+}
+
+.initial-stock-summary-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+}
+
+.initial-stock-summary-item {
+    border-radius: 14px;
+    padding: 14px;
+    background: rgba(255,255,255,0.78);
+    border: 1px solid rgba(0,0,0,0.05);
+}
+
+.initial-stock-summary-label {
+    font-size: 0.82rem;
+    color: var(--gray);
+    margin-bottom: 6px;
+}
+
+.initial-stock-summary-value {
+    font-size: 1rem;
+    font-weight: 800;
+    color: var(--dark);
+}
+
+.monitoring-protocol-group {
+    margin-top: 18px;
+}
+
+.monitoring-protocol-help {
+    color: var(--gray);
+    line-height: 1.55;
+    margin-bottom: 12px;
+}
+
+.monitoring-protocol-list {
+    display: grid;
+    gap: 12px;
+}
+
+.monitoring-protocol-option {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 14px 16px;
+    border-radius: 14px;
+    border: 1px solid rgba(0,0,0,0.08);
+    background: rgba(255,255,255,0.78);
+}
+
+.monitoring-protocol-option-main {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 700;
+    color: var(--dark);
+}
+
+.monitoring-protocol-info-btn {
+    padding: 6px 10px;
+    font-size: 0.82rem;
+}
+
+.advanced-monitoring-module {
+    margin-top: 8px;
+}
+
+.advanced-monitoring-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    cursor: pointer;
+}
+
+.advanced-monitoring-content {
+    margin-top: 16px;
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 240ms ease;
+}
+
+.advanced-monitoring-content.is-open {
+    max-height: 2600px;
+}
+
+.advanced-monitoring-subtitle {
+    margin-top: 6px;
+    color: var(--gray);
+    line-height: 1.5;
+}
+
+.advanced-monitoring-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+}
+
+.advanced-monitoring-field-card {
+    padding: 14px;
+    border-radius: 14px;
+    background: rgba(255,255,255,0.82);
+    border: 1px solid rgba(106, 27, 154, 0.12);
+}
+
+.advanced-monitoring-field-desc {
+    margin-top: 8px;
+    color: var(--gray);
+    font-size: 0.86rem;
+    line-height: 1.45;
+}
+
+.advanced-monitoring-checkbox {
+    font-weight: 700;
+    color: var(--dark);
+}
+
+.advanced-monitoring-date-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+    margin-bottom: 14px;
+}
+
+.advanced-monitoring-date-readonly {
+    height: 46px;
+    display: flex;
+    align-items: center;
+    padding: 0 14px;
+    border-radius: 12px;
+    background: #F5F3FF;
+    border: 1px solid rgba(106, 27, 154, 0.12);
+    color: #6A1B9A;
+    font-weight: 700;
+}
+
+.advanced-monitoring-field-inputs {
+    margin-top: 12px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px;
+    align-items: center;
+}
+
+.advanced-monitoring-unit,
+.advanced-monitoring-unit-fixed {
+    min-width: 88px;
+}
+
+.advanced-monitoring-unit-fixed {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 46px;
+    padding: 0 12px;
+    border-radius: 12px;
+    background: #F5F3FF;
+    border: 1px solid rgba(106, 27, 154, 0.12);
+    color: #6A1B9A;
+    font-weight: 700;
 }
 
 .maintenance-amount {
@@ -1700,10 +1948,6 @@ body {
         grid-template-columns: 1fr;
     }
 
-    .monitoring-temperature-ambient {
-        max-width: none;
-    }
-
     .maintenance-additional-grid {
         grid-template-columns: 1fr;
     }
@@ -1719,6 +1963,12 @@ body {
     .nonicta-library-actions {
         justify-content: flex-start;
     }
+
+    .initial-stock-summary-grid,
+    .advanced-monitoring-grid {
+        grid-template-columns: 1fr;
+    }
+
 
     .action-conditional-grid {
         grid-template-columns: 1fr;
@@ -1768,29 +2018,6 @@ body {
     font-weight: 700;
     color: #2F5D31;
     line-height: 1.4;
-}
-
-.diagnosis-item {
-    padding: 12px 16px;
-    background: var(--light-gray);
-    border-radius: 8px;
-    margin-bottom: 10px;
-    display: flex;
-    align-items: center;
-    gap: 12px;
-}
-
-.diagnosis-icon {
-    font-size: 1.5rem;
-}
-
-.diagnosis-text {
-    flex: 1;
-}
-
-.diagnosis-action {
-    font-weight: 600;
-    color: var(--primary);
 }
 
 .page-header {

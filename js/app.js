@@ -800,7 +800,57 @@ const App = {
             : 0.36;
         return {
             useCustomConversionRate: useCustom,
-            compostConversionRate
+            compostConversionRate,
+            monitoringProtocol: raw.monitoringProtocol === 'advanced' ? 'advanced' : 'basic'
+        };
+    },
+
+    getBatchMonitoringProtocol(batch) {
+        return this.getBatchCalculationSettings(batch).monitoringProtocol;
+    },
+
+    getInitialStockState(batch) {
+        const initial = batch?.initialStock || null;
+        if (!initial) {
+            return { exists: false, materials: [] };
+        }
+
+        const legacyExists = initial.exists === true || initial.exists === 'yes';
+        const hasMaterials = Array.isArray(initial.materials) && initial.materials.length > 0;
+        const materials = hasMaterials
+            ? initial.materials.map((item, index) => {
+                const materialType = String(item?.materialType || item?.type || '').trim();
+                return {
+                    id: String(item?.id || `initial-stock-${index + 1}`),
+                    materialType,
+                    materialDescription: String(item?.materialDescription || item?.otherType || '').trim(),
+                    materialWeight: item?.materialWeight != null
+                        ? (parseFloat(item.materialWeight) || 0)
+                        : (item?.amount != null ? (parseFloat(item.amount) || 0) : 0),
+                    approximateHeightCm: item?.approximateHeightCm != null
+                        ? (parseFloat(item.approximateHeightCm) || 0)
+                        : (item?.height != null ? (parseFloat(item.height) || 0) : 0),
+                    composterId: String(item?.composterId || item?.location || '').trim(),
+                    notes: String(item?.notes || '').trim(),
+                    purpose: materialType === 'Structural Material'
+                        ? String(item?.purpose || '').trim()
+                        : ''
+                };
+            })
+            : (legacyExists ? [{
+                id: 'initial-stock-1',
+                materialType: String(initial.type || '').trim(),
+                materialDescription: String(initial.otherType || '').trim(),
+                materialWeight: initial.amount != null ? (parseFloat(initial.amount) || 0) : 0,
+                approximateHeightCm: initial.height != null ? (parseFloat(initial.height) || 0) : 0,
+                composterId: String(initial.composterId || initial.location || '').trim(),
+                notes: '',
+                purpose: String(initial.purpose || '').trim()
+            }] : []);
+
+        return {
+            exists: hasMaterials || legacyExists,
+            materials: materials.filter((item) => item.materialType || item.materialWeight || item.approximateHeightCm || item.composterId || item.notes)
         };
     },
 
@@ -817,11 +867,60 @@ const App = {
         const process = record?.process || {};
         const observation = record?.observation || {};
         const monitoring = record?.monitoring || {};
+        const advancedMonitoring = monitoring.advancedMonitoring || {};
 
-        const mapOdourFromObservation = () => {
-            if (monitoring.odourLevel) return monitoring.odourLevel;
-            if (observation.odour === 'Strong') return 'greater_than_5m';
-            if (observation.odour === 'Slight') return 'between_1_and_5m';
+        const normalizeBool = (value) => {
+            if (value === true || value === 'true' || value === 1 || value === '1') return true;
+            if (value === false || value === 'false' || value === 0 || value === '0') return false;
+            return null;
+        };
+
+        const mapLegacyOdourDistanceFromLevel = (level) => {
+            if (level === 'less_than_1m') return 'lt_1m';
+            if (level === 'between_1_and_5m') return '1_5m';
+            if (level === 'greater_than_5m') return 'gt_5m';
+            return null;
+        };
+
+        const getOdourState = () => {
+            const explicitDetected = normalizeBool(monitoring.odourDetected);
+            const explicitType = String(monitoring.odourType || '').trim() || null;
+            const explicitDistance = String(monitoring.odourDistance || '').trim() || null;
+            if (explicitDetected !== null || explicitType || explicitDistance) {
+                return {
+                    odourDetected: explicitDetected,
+                    odourType: explicitType,
+                    odourDistance: explicitDistance
+                };
+            }
+
+            const legacyLevel = String(monitoring.odourLevel || '').trim();
+            if (legacyLevel && legacyLevel !== 'no_odour') {
+                return {
+                    odourDetected: true,
+                    odourType: null,
+                    odourDistance: mapLegacyOdourDistanceFromLevel(legacyLevel)
+                };
+            }
+
+            if (observation.odour === 'Strong') {
+                return { odourDetected: true, odourType: null, odourDistance: 'gt_5m' };
+            }
+            if (observation.odour === 'Slight') {
+                return { odourDetected: true, odourType: null, odourDistance: '1_5m' };
+            }
+
+            return { odourDetected: null, odourType: null, odourDistance: null };
+        };
+
+        const deriveLegacyOdourLevel = (odourDetected, odourDistance) => {
+            if (odourDetected === false) return 'no_odour';
+            if (odourDetected === true) {
+                if (odourDistance === 'lt_1m') return 'less_than_1m';
+                if (odourDistance === '1_5m') return 'between_1_and_5m';
+                if (odourDistance === 'gt_5m') return 'greater_than_5m';
+                return 'between_1_and_5m';
+            }
             return 'no_odour';
         };
 
@@ -836,16 +935,51 @@ const App = {
             ? monitoring.moistureValue
             : (process.moisture != null ? process.moisture : null);
 
+        const getOptionalAdvancedField = (key, unit = '') => {
+            const rawEnabled = advancedMonitoring?.[`${key}Enabled`];
+            const value = advancedMonitoring?.[key];
+            const numericValue = value != null && value !== '' && !isNaN(value) ? (parseFloat(value) || 0) : null;
+            return {
+                enabled: rawEnabled === true || rawEnabled === 'true' || numericValue != null,
+                value: numericValue,
+                unit
+            };
+        };
+        const recordDate = String(record?.date || '').trim();
+        const samplingDate = String(advancedMonitoring?.samplingDate || recordDate).trim();
+        const measurementDate = String(advancedMonitoring?.measurementDate || samplingDate).trim();
+        const odourState = getOdourState();
+
         return {
+            recordDate,
             ambientTemperature: monitoring.ambientTemperature != null ? monitoring.ambientTemperature : (process.ambient != null ? process.ambient : null),
+            ambientHumidity: monitoring.ambientHumidity != null ? monitoring.ambientHumidity : null,
             coreTemperature: monitoring.coreTemperature != null ? monitoring.coreTemperature : (process.core != null ? process.core : null),
             transitionTemperature: monitoring.transitionTemperature != null ? monitoring.transitionTemperature : (process.transition != null ? process.transition : null),
             outerTemperature: monitoring.outerTemperature != null ? monitoring.outerTemperature : (process.outer != null ? process.outer : null),
             moistureAssessmentType: monitoring.moistureAssessmentType || (quantitativeMoisture != null ? 'quantitative' : 'qualitative'),
             moistureValue: quantitativeMoisture,
             moistureQualitative: monitoring.moistureQualitative || '',
-            odourLevel: mapOdourFromObservation(),
-            leachateObserved: mapLeachateFromObservation()
+            odourDetected: odourState.odourDetected,
+            odourType: odourState.odourType,
+            odourDistance: odourState.odourDistance,
+            odourLevel: monitoring.odourLevel || deriveLegacyOdourLevel(odourState.odourDetected, odourState.odourDistance),
+            leachateObserved: mapLeachateFromObservation(),
+            advancedMonitoring: {
+                samplingDate,
+                measurementDate,
+                laboratoryMoisture: getOptionalAdvancedField('laboratoryMoisture', '%'),
+                oxygen: getOptionalAdvancedField('oxygen', '%'),
+                ammonia: getOptionalAdvancedField('ammonia', 'ppm'),
+                carbonDioxide: getOptionalAdvancedField('carbonDioxide', 'ppm'),
+                methane: getOptionalAdvancedField('methane', 'ppm'),
+                hydrogenSulfide: getOptionalAdvancedField('hydrogenSulfide', 'ppm'),
+                voc: getOptionalAdvancedField('voc', 'ppm'),
+                nitrousOxide: getOptionalAdvancedField('nitrousOxide', 'ppm'),
+                organicMatter: getOptionalAdvancedField('organicMatter', '%'),
+                electricalConductivity: getOptionalAdvancedField('electricalConductivity', 'mS/cm'),
+                notes: String(advancedMonitoring?.notes || advancedMonitoring?.additionalNotes || '').trim()
+            }
         };
     },
 
@@ -861,16 +995,25 @@ const App = {
 
     hasMonitoringStateContent(monitoring) {
         if (!monitoring) return false;
+        const advanced = monitoring.advancedMonitoring || {};
         return [
             monitoring.ambientTemperature,
+            monitoring.ambientHumidity,
             monitoring.coreTemperature,
             monitoring.transitionTemperature,
             monitoring.outerTemperature,
             monitoring.moistureValue
         ].some(value => value != null && value !== '' && !isNaN(value))
             || !!monitoring.moistureQualitative
+            || monitoring.odourDetected === true
+            || monitoring.odourDetected === false
+            || !!monitoring.odourType
+            || !!monitoring.odourDistance
             || (monitoring.odourLevel && monitoring.odourLevel !== 'no_odour')
-            || (monitoring.leachateObserved && monitoring.leachateObserved !== 'not_assessed');
+            || (monitoring.leachateObserved && monitoring.leachateObserved !== 'not_assessed')
+            || ['laboratoryMoisture', 'oxygen', 'ammonia', 'carbonDioxide', 'methane', 'hydrogenSulfide', 'voc', 'nitrousOxide', 'organicMatter', 'electricalConductivity']
+                .some((key) => advanced?.[key]?.value != null && advanced[key].value !== '' && !isNaN(advanced[key].value))
+            || !!advanced.notes;
     },
 
     hasMaintenanceStateContent(maintenance) {
@@ -976,9 +1119,15 @@ const App = {
     renderICTAMonitoringModule(monitoring) {
         const moistureType = monitoring.moistureAssessmentType || 'quantitative';
         const isQuantitative = moistureType === 'quantitative';
-        const odourLevel = monitoring.odourLevel || 'no_odour';
+        const odourDetectedChoice = monitoring.odourDetected === true
+            ? 'detected'
+            : (monitoring.odourDetected === false ? 'no' : '');
+        const showOdourDetails = monitoring.odourDetected === true;
+        const odourType = String(monitoring.odourType || '').trim();
+        const odourDistance = String(monitoring.odourDistance || '').trim();
         const leachateObserved = monitoring.leachateObserved || 'not_assessed';
         const isCompleted = this.hasMonitoringStateContent(monitoring);
+        const showAdvanced = this.getBatchMonitoringProtocol(this.data.currentBatch) === 'advanced';
 
         return `
             <div class="card">
@@ -988,14 +1137,22 @@ const App = {
                 </div>
 
                 <div id="monitoringModuleContent" style="display: none; margin-top: 20px;">
-                    <div class="module" style="background: #F4FBF4; border-color: #C8E6C9;">
-                        <h3 class="module-title process">Temperature Monitoring</h3>
-                        <div class="monitoring-temperature-ambient">
+                    <div class="module" style="background: #F3F8FF; border-color: #BBDEFB;">
+                        <h3 class="module-title" style="color: #1976D2;">🌤 Environmental Conditions</h3>
+                        <div style="display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px;">
                             <div class="form-group" style="margin-bottom: 0;">
-                                <label class="form-label required">Ambient Temperature (°C)</label>
-                                <input type="number" class="form-input" id="ambientTemperature" step="any" value="${monitoring.ambientTemperature != null ? monitoring.ambientTemperature : ''}">
+                                <label class="form-label">Ambient Temperature (℃)</label>
+                                <input type="number" class="form-input" id="ambientTemperature" step="any" value="${monitoring.ambientTemperature != null ? monitoring.ambientTemperature : ''}" placeholder="27">
+                            </div>
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label class="form-label">Ambient Humidity (%)</label>
+                                <input type="number" class="form-input" id="ambientHumidity" step="any" value="${monitoring.ambientHumidity != null ? monitoring.ambientHumidity : ''}" placeholder="68">
                             </div>
                         </div>
+                    </div>
+
+                    <div class="module" style="background: #F4FBF4; border-color: #C8E6C9;">
+                        <h3 class="module-title process">Temperature Monitoring</h3>
                         <div class="monitoring-temperature-grid">
                             <div class="monitoring-temperature-card">
                                 <label class="form-label" style="margin-bottom: 6px;">Core Temperature (°C)</label>
@@ -1068,23 +1225,76 @@ const App = {
 
                     <div class="module" style="background: #F3F8FF; border-color: #BBDEFB;">
                         <h3 class="module-title" style="color: #1976D2;">Odour Assessment <button type="button" class="btn btn-secondary" style="padding: 4px 10px; font-size: 0.8rem;" onclick="event.stopPropagation(); app.showOdourGuide()">ⓘ Odour Guide</button></h3>
-                        <div class="radio-group" style="flex-direction: column; align-items: flex-start;">
-                            <label class="radio-item">
-                                <input type="radio" name="odourLevel" value="no_odour" ${odourLevel === 'no_odour' ? 'checked' : ''}>
-                                No odour
-                            </label>
-                            <label class="radio-item">
-                                <input type="radio" name="odourLevel" value="less_than_1m" ${odourLevel === 'less_than_1m' ? 'checked' : ''}>
-                                Detected &lt;1 m
-                            </label>
-                            <label class="radio-item">
-                                <input type="radio" name="odourLevel" value="between_1_and_5m" ${odourLevel === 'between_1_and_5m' ? 'checked' : ''}>
-                                Detected 1–5 m
-                            </label>
-                            <label class="radio-item">
-                                <input type="radio" name="odourLevel" value="greater_than_5m" ${odourLevel === 'greater_than_5m' ? 'checked' : ''}>
-                                Detected &gt;5 m
-                            </label>
+
+                        <div class="form-group" style="margin-bottom: 0;">
+                            <label class="form-label">Is any noticeable odour detected?</label>
+                            <div class="radio-group" style="flex-direction: column; align-items: flex-start;">
+                                <label class="radio-item">
+                                    <input type="radio" name="odourDetected" value="no" ${odourDetectedChoice === 'no' ? 'checked' : ''} onchange="app.updateOdourAssessmentVisibility()">
+                                    No Noticeable Odour
+                                </label>
+                                <label class="radio-item">
+                                    <input type="radio" name="odourDetected" value="detected" ${odourDetectedChoice === 'detected' ? 'checked' : ''} onchange="app.updateOdourAssessmentVisibility()">
+                                    Odour Detected
+                                </label>
+                            </div>
+                        </div>
+
+                        <div id="odourDetectedDetails" style="${showOdourDetails ? '' : 'display:none;'}">
+                            <div style="margin-top: 14px; padding-top: 14px; border-top: 1px solid #E3F2FD;">
+                                <div style="font-weight: 700; margin-bottom: 10px;">A. Odour Type</div>
+                                <div class="radio-group" style="flex-direction: column; align-items: flex-start;">
+                                    <label class="radio-item" style="align-items: flex-start;">
+                                        <input type="radio" name="odourType" value="earth" ${odourType === 'earth' ? 'checked' : ''}>
+                                        <div>
+                                            <div>Earth / Forest Odour</div>
+                                            <div style="color: var(--gray); font-size: 0.9rem;">Natural soil smell. Indicates compost is operating normally.</div>
+                                        </div>
+                                    </label>
+                                    <label class="radio-item" style="align-items: flex-start;">
+                                        <input type="radio" name="odourType" value="vinegar" ${odourType === 'vinegar' ? 'checked' : ''}>
+                                        <div>
+                                            <div>Vinegar Odour</div>
+                                            <div style="color: var(--gray); font-size: 0.9rem;">Sour smell. Often indicates too much fruit/vegetable content.</div>
+                                        </div>
+                                    </label>
+                                    <label class="radio-item" style="align-items: flex-start;">
+                                        <input type="radio" name="odourType" value="rotten" ${odourType === 'rotten' ? 'checked' : ''}>
+                                        <div>
+                                            <div>Rotten Odour</div>
+                                            <div style="color: var(--gray); font-size: 0.9rem;">Strong rotten smell. Usually indicates insufficient oxygen (anaerobic conditions).</div>
+                                        </div>
+                                    </label>
+                                    <label class="radio-item" style="align-items: flex-start;">
+                                        <input type="radio" name="odourType" value="ammonia" ${odourType === 'ammonia' ? 'checked' : ''}>
+                                        <div>
+                                            <div>Ammonia / Fermented Odour</div>
+                                            <div style="color: var(--gray); font-size: 0.9rem;">Strong ammonia or fermented smell. Often indicates too much nitrogen-rich material.</div>
+                                        </div>
+                                    </label>
+                                </div>
+                            </div>
+
+                            <div style="margin-top: 14px; padding-top: 14px; border-top: 1px solid #E3F2FD;">
+                                <div style="font-weight: 700; margin-bottom: 10px;">B. Odour Detection Distance</div>
+                                <div style="color: var(--gray); font-size: 0.9rem; margin-bottom: 12px;">
+                                    Estimated detection distance under normal outdoor conditions (without strong wind).
+                                </div>
+                                <div class="radio-group" style="flex-direction: column; align-items: flex-start;">
+                                    <label class="radio-item">
+                                        <input type="radio" name="odourDistance" value="lt_1m" ${odourDistance === 'lt_1m' ? 'checked' : ''}>
+                                        Detected &lt;1 m
+                                    </label>
+                                    <label class="radio-item">
+                                        <input type="radio" name="odourDistance" value="1_5m" ${odourDistance === '1_5m' ? 'checked' : ''}>
+                                        Detected 1–5 m
+                                    </label>
+                                    <label class="radio-item">
+                                        <input type="radio" name="odourDistance" value="gt_5m" ${odourDistance === 'gt_5m' ? 'checked' : ''}>
+                                        Detected &gt;5 m
+                                    </label>
+                                </div>
+                            </div>
                         </div>
                     </div>
 
@@ -1108,6 +1318,9 @@ const App = {
                             </div>
                         </div>
                     </div>
+
+                    ${showAdvanced ? this.renderAdvancedMonitoringSection(monitoring) : ''}
+                    ${this.renderSystemRecommendationModule()}
                 </div>
             </div>
         `;
@@ -1116,9 +1329,15 @@ const App = {
     renderNonICTAMonitoringModule(monitoring) {
         const moistureType = monitoring.moistureAssessmentType || 'quantitative';
         const isQuantitative = moistureType === 'quantitative';
-        const odourLevel = monitoring.odourLevel || 'no_odour';
+        const odourDetectedChoice = monitoring.odourDetected === true
+            ? 'detected'
+            : (monitoring.odourDetected === false ? 'no' : '');
+        const showOdourDetails = monitoring.odourDetected === true;
+        const odourType = String(monitoring.odourType || '').trim();
+        const odourDistance = String(monitoring.odourDistance || '').trim();
         const leachateObserved = monitoring.leachateObserved || 'not_assessed';
         const isCompleted = this.hasMonitoringStateContent(monitoring);
+        const showAdvanced = this.getBatchMonitoringProtocol(this.data.currentBatch) === 'advanced';
 
         return `
             <div class="card">
@@ -1128,6 +1347,20 @@ const App = {
                 </div>
 
                 <div id="monitoringModuleContent" style="display: none; margin-top: 20px;">
+                    <div class="module" style="background: #F3F8FF; border-color: #BBDEFB;">
+                        <h3 class="module-title" style="color: #1976D2;">🌤 Environmental Conditions</h3>
+                        <div style="display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px;">
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label class="form-label">Ambient Temperature (℃)</label>
+                                <input type="number" class="form-input" id="ambientTemperature" step="any" value="${monitoring.ambientTemperature != null ? monitoring.ambientTemperature : ''}" placeholder="27">
+                            </div>
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label class="form-label">Ambient Humidity (%)</label>
+                                <input type="number" class="form-input" id="ambientHumidity" step="any" value="${monitoring.ambientHumidity != null ? monitoring.ambientHumidity : ''}" placeholder="68">
+                            </div>
+                        </div>
+                    </div>
+
                     <div class="module" style="background: #F4FBF4; border-color: #C8E6C9;">
                         <h3 class="module-title process">Temperature Monitoring</h3>
                         <div class="monitoring-temperature-grid" style="grid-template-columns: minmax(0, 1fr);">
@@ -1192,23 +1425,76 @@ const App = {
 
                     <div class="module" style="background: #F3F8FF; border-color: #BBDEFB;">
                         <h3 class="module-title" style="color: #1976D2;">Odour Assessment <button type="button" class="btn btn-secondary" style="padding: 4px 10px; font-size: 0.8rem;" onclick="event.stopPropagation(); app.showOdourGuide()">ⓘ Odour Guide</button></h3>
-                        <div class="radio-group" style="flex-direction: column; align-items: flex-start;">
-                            <label class="radio-item">
-                                <input type="radio" name="odourLevel" value="no_odour" ${odourLevel === 'no_odour' ? 'checked' : ''}>
-                                No odour
-                            </label>
-                            <label class="radio-item">
-                                <input type="radio" name="odourLevel" value="less_than_1m" ${odourLevel === 'less_than_1m' ? 'checked' : ''}>
-                                Detected &lt;1 m
-                            </label>
-                            <label class="radio-item">
-                                <input type="radio" name="odourLevel" value="between_1_and_5m" ${odourLevel === 'between_1_and_5m' ? 'checked' : ''}>
-                                Detected 1–5 m
-                            </label>
-                            <label class="radio-item">
-                                <input type="radio" name="odourLevel" value="greater_than_5m" ${odourLevel === 'greater_than_5m' ? 'checked' : ''}>
-                                Detected &gt;5 m
-                            </label>
+
+                        <div class="form-group" style="margin-bottom: 0;">
+                            <label class="form-label">Is any noticeable odour detected?</label>
+                            <div class="radio-group" style="flex-direction: column; align-items: flex-start;">
+                                <label class="radio-item">
+                                    <input type="radio" name="odourDetected" value="no" ${odourDetectedChoice === 'no' ? 'checked' : ''} onchange="app.updateOdourAssessmentVisibility()">
+                                    No Noticeable Odour
+                                </label>
+                                <label class="radio-item">
+                                    <input type="radio" name="odourDetected" value="detected" ${odourDetectedChoice === 'detected' ? 'checked' : ''} onchange="app.updateOdourAssessmentVisibility()">
+                                    Odour Detected
+                                </label>
+                            </div>
+                        </div>
+
+                        <div id="odourDetectedDetails" style="${showOdourDetails ? '' : 'display:none;'}">
+                            <div style="margin-top: 14px; padding-top: 14px; border-top: 1px solid #E3F2FD;">
+                                <div style="font-weight: 700; margin-bottom: 10px;">A. Odour Type</div>
+                                <div class="radio-group" style="flex-direction: column; align-items: flex-start;">
+                                    <label class="radio-item" style="align-items: flex-start;">
+                                        <input type="radio" name="odourType" value="earth" ${odourType === 'earth' ? 'checked' : ''}>
+                                        <div>
+                                            <div>Earth / Forest Odour</div>
+                                            <div style="color: var(--gray); font-size: 0.9rem;">Natural soil smell. Indicates compost is operating normally.</div>
+                                        </div>
+                                    </label>
+                                    <label class="radio-item" style="align-items: flex-start;">
+                                        <input type="radio" name="odourType" value="vinegar" ${odourType === 'vinegar' ? 'checked' : ''}>
+                                        <div>
+                                            <div>Vinegar Odour</div>
+                                            <div style="color: var(--gray); font-size: 0.9rem;">Sour smell. Often indicates too much fruit/vegetable content.</div>
+                                        </div>
+                                    </label>
+                                    <label class="radio-item" style="align-items: flex-start;">
+                                        <input type="radio" name="odourType" value="rotten" ${odourType === 'rotten' ? 'checked' : ''}>
+                                        <div>
+                                            <div>Rotten Odour</div>
+                                            <div style="color: var(--gray); font-size: 0.9rem;">Strong rotten smell. Usually indicates insufficient oxygen (anaerobic conditions).</div>
+                                        </div>
+                                    </label>
+                                    <label class="radio-item" style="align-items: flex-start;">
+                                        <input type="radio" name="odourType" value="ammonia" ${odourType === 'ammonia' ? 'checked' : ''}>
+                                        <div>
+                                            <div>Ammonia / Fermented Odour</div>
+                                            <div style="color: var(--gray); font-size: 0.9rem;">Strong ammonia or fermented smell. Often indicates too much nitrogen-rich material.</div>
+                                        </div>
+                                    </label>
+                                </div>
+                            </div>
+
+                            <div style="margin-top: 14px; padding-top: 14px; border-top: 1px solid #E3F2FD;">
+                                <div style="font-weight: 700; margin-bottom: 10px;">B. Odour Detection Distance</div>
+                                <div style="color: var(--gray); font-size: 0.9rem; margin-bottom: 12px;">
+                                    Estimated detection distance under normal outdoor conditions (without strong wind).
+                                </div>
+                                <div class="radio-group" style="flex-direction: column; align-items: flex-start;">
+                                    <label class="radio-item">
+                                        <input type="radio" name="odourDistance" value="lt_1m" ${odourDistance === 'lt_1m' ? 'checked' : ''}>
+                                        Detected &lt;1 m
+                                    </label>
+                                    <label class="radio-item">
+                                        <input type="radio" name="odourDistance" value="1_5m" ${odourDistance === '1_5m' ? 'checked' : ''}>
+                                        Detected 1–5 m
+                                    </label>
+                                    <label class="radio-item">
+                                        <input type="radio" name="odourDistance" value="gt_5m" ${odourDistance === 'gt_5m' ? 'checked' : ''}>
+                                        Detected &gt;5 m
+                                    </label>
+                                </div>
+                            </div>
                         </div>
                     </div>
 
@@ -1232,9 +1518,188 @@ const App = {
                             </div>
                         </div>
                     </div>
+
+                    ${showAdvanced ? this.renderAdvancedMonitoringSection(monitoring) : ''}
+                    ${this.renderSystemRecommendationModule()}
                 </div>
             </div>
         `;
+    },
+
+    renderSystemRecommendationModule() {
+        return `
+            <div class="module system-recommendation-module" id="systemRecommendationModule" style="display:none;">
+                <h3 class="module-title system-recommendation-title">💡 System Recommendation</h3>
+                <div class="system-recommendation-section">
+                    <div class="system-recommendation-heading">🩺 Current Compost Condition</div>
+                    <div id="systemRecommendationInterpretations" class="system-recommendation-list"></div>
+                </div>
+                <div class="system-recommendation-section" style="margin-top: 14px;">
+                    <div class="system-recommendation-heading">🔧 Recommended Actions</div>
+                    <div id="systemRecommendationActions" class="system-recommendation-list"></div>
+                </div>
+            </div>
+        `;
+    },
+
+    renderAdvancedMonitoringField(config, state) {
+        const enabled = !!state?.enabled;
+        const value = state?.value != null && !isNaN(state.value) ? this.formatNumber(state.value, 6) : '';
+        const unitControl = `<span class="advanced-monitoring-unit-fixed">${this.escapeAttr(config.unit || '')}</span>`;
+        return `
+            <div class="advanced-monitoring-field-card">
+                <label class="checkbox-item advanced-monitoring-checkbox">
+                    <input type="checkbox" id="${config.id}Enabled" ${enabled ? 'checked' : ''} onchange="app.updateAdvancedMonitoringFieldVisibility()">
+                    ${config.label}
+                </label>
+                ${config.description ? `<div class="advanced-monitoring-field-desc">${this.escapeHtml(config.description)}</div>` : ''}
+                <div class="advanced-monitoring-field-inputs" id="${config.id}Row" style="${enabled ? '' : 'display:none;'}">
+                    <input type="number" class="form-input advanced-monitoring-value" id="${config.id}Value" step="any" value="${value}" placeholder="${config.placeholder || 'Enter value'}" ${enabled ? '' : 'disabled'}>
+                    ${unitControl}
+                </div>
+            </div>
+        `;
+    },
+
+    renderAdvancedMonitoringSection(monitoring) {
+        const advanced = monitoring.advancedMonitoring || {};
+        const fields = [
+            {
+                id: 'advancedLaboratoryMoisture',
+                label: 'Laboratory Moisture',
+                unit: '%',
+                description: 'Relative moisture determined using laboratory oven-drying methods.',
+                state: advanced.laboratoryMoisture
+            },
+            {
+                id: 'advancedOxygen',
+                label: 'Oxygen (O2)',
+                unit: '%',
+                description: 'Oxygen concentration inside the compost.',
+                state: advanced.oxygen
+            },
+            {
+                id: 'advancedAmmonia',
+                label: 'Ammonia (NH3)',
+                unit: 'ppm',
+                description: 'Measured ammonia concentration.',
+                state: advanced.ammonia
+            },
+            {
+                id: 'advancedCarbonDioxide',
+                label: 'Carbon Dioxide (CO2)',
+                unit: 'ppm',
+                description: 'Measured carbon dioxide concentration.',
+                state: advanced.carbonDioxide
+            },
+            {
+                id: 'advancedMethane',
+                label: 'Methane (CH4)',
+                unit: 'ppm',
+                description: 'Measured methane concentration.',
+                state: advanced.methane
+            },
+            {
+                id: 'advancedHydrogenSulfide',
+                label: 'Hydrogen Sulfide (H2S)',
+                unit: 'ppm',
+                description: 'Measured hydrogen sulfide concentration.',
+                state: advanced.hydrogenSulfide
+            },
+            {
+                id: 'advancedVoc',
+                label: 'Volatile Organic Compounds (VOC)',
+                unit: 'ppm',
+                description: 'Measured volatile organic compound concentration.',
+                state: advanced.voc
+            },
+            {
+                id: 'advancedNitrousOxide',
+                label: 'Nitrous Oxide (N2O)',
+                unit: 'ppm',
+                description: 'Measured nitrous oxide concentration.',
+                state: advanced.nitrousOxide
+            },
+            {
+                id: 'advancedOrganicMatter',
+                label: 'Organic Matter',
+                unit: '%',
+                description: 'Organic matter content determined through laboratory analysis.',
+                state: advanced.organicMatter
+            },
+            {
+                id: 'advancedElectricalConductivity',
+                label: 'Electrical Conductivity (EC)',
+                unit: 'mS/cm',
+                description: 'Electrical conductivity of the compost sample.',
+                state: advanced.electricalConductivity
+            }
+        ];
+        return `
+            <div class="module advanced-monitoring-module" style="background: #F8F5FF; border-color: #D1C4E9;">
+                <div class="advanced-monitoring-header" onclick="app.toggleAdvancedMonitoringSection()">
+                    <div>
+                        <h3 class="module-title" style="color: #6A1B9A; margin: 0;">🔬 Advanced Monitoring</h3>
+                        <div class="advanced-monitoring-subtitle">Optional laboratory and research measurements. Record only the parameters that are available.</div>
+                    </div>
+                    <span id="advancedMonitoringToggleIcon" style="color: var(--gray); font-weight: 700;">▸</span>
+                </div>
+                <div id="advancedMonitoringContent" class="advanced-monitoring-content">
+                    <div class="advanced-monitoring-date-grid">
+                        <div class="form-group" style="margin-bottom: 0;">
+                            <label class="form-label">Sampling Date</label>
+                            <div class="advanced-monitoring-date-readonly">${this.escapeHtml(advanced.samplingDate || monitoring.recordDate || '') || '—'}</div>
+                        </div>
+                        <div class="form-group" style="margin-bottom: 0;">
+                            <label class="form-label">Measurement Date</label>
+                            <input type="date" class="form-input" id="advancedMeasurementDate" value="${this.escapeAttr(advanced.measurementDate || advanced.samplingDate || monitoring.recordDate || '')}">
+                        </div>
+                    </div>
+                    <div class="advanced-monitoring-grid">
+                        ${fields.map((field) => this.renderAdvancedMonitoringField(field, field.state)).join('')}
+                    </div>
+                    <div class="form-group" style="margin-top: 16px;">
+                        <label class="form-label">Additional Notes</label>
+                        <textarea class="form-input" id="advancedMonitoringNotes" rows="3" placeholder="Optional.">${this.escapeAttr(advanced.notes || advanced.additionalNotes || '')}</textarea>
+                    </div>
+                </div>
+            </div>
+        `;
+    },
+
+    toggleAdvancedMonitoringSection() {
+        const content = document.getElementById('advancedMonitoringContent');
+        const icon = document.getElementById('advancedMonitoringToggleIcon');
+        if (!content || !icon) return;
+        const isOpen = content.classList.toggle('is-open');
+        icon.textContent = isOpen ? '▾' : '▸';
+    },
+
+    updateAdvancedMonitoringFieldVisibility() {
+        [
+            'advancedLaboratoryMoisture',
+            'advancedOxygen',
+            'advancedCarbonDioxide',
+            'advancedMethane',
+            'advancedAmmonia',
+            'advancedHydrogenSulfide',
+            'advancedVoc',
+            'advancedNitrousOxide',
+            'advancedElectricalConductivity',
+            'advancedOrganicMatter'
+        ].forEach((baseId) => {
+            const enabledEl = document.getElementById(`${baseId}Enabled`);
+            const rowEl = document.getElementById(`${baseId}Row`);
+            const valueEl = document.getElementById(`${baseId}Value`);
+            const unitEl = document.getElementById(`${baseId}Unit`);
+            const enabled = !!enabledEl?.checked;
+            if (rowEl) rowEl.style.display = enabled ? 'grid' : 'none';
+            if (valueEl) {
+                valueEl.disabled = !enabled;
+                if (!enabled) valueEl.value = '';
+            }
+            if (unitEl) unitEl.disabled = !enabled;
+        });
     },
 
     getICTAMaintenanceState(record, batch) {
@@ -2187,12 +2652,7 @@ const App = {
                         transition: 48,
                         outer: 42,
                         moisture: 55,
-                        oxygen: 18,
-                        turning: true,
-                        mixing: false,
-                        waterAdded: true,
-                        waterAddedAmount: 5,
-                        none: false
+                        waterAddedAmount: 5
                     },
                     observation: {
                         odour: 'None',
@@ -2223,12 +2683,7 @@ const App = {
                         transition: 52,
                         outer: 45,
                         moisture: 58,
-                        oxygen: 12,
-                        turning: true,
-                        mixing: true,
-                        waterAdded: false,
-                        waterAddedAmount: 0,
-                        none: false
+                        waterAddedAmount: 0
                     },
                     observation: {
                         odour: 'Slight',
@@ -2259,12 +2714,7 @@ const App = {
                         transition: 38,
                         outer: 35,
                         moisture: null,
-                        oxygen: null,
-                        turning: false,
-                        mixing: false,
-                        waterAdded: false,
-                        waterAddedAmount: null,
-                        none: true
+                        waterAddedAmount: null
                     },
                     observation: {
                         odour: 'Slight',
@@ -2410,12 +2860,12 @@ const App = {
     },
 
     calculateInitialStockAmount(batch) {
-        const initial = batch?.initialStock || null;
-        if (!initial) return 0;
-        const exists = initial.exists === true || initial.exists === 'yes';
-        if (!exists) return 0;
-        const value = initial.amount != null ? parseFloat(initial.amount) : 0;
-        return isNaN(value) ? 0 : value;
+        const initial = this.getInitialStockState(batch);
+        if (!initial.exists || !Array.isArray(initial.materials)) return 0;
+        return initial.materials.reduce((sum, item) => {
+            const value = item?.materialWeight != null ? parseFloat(item.materialWeight) : 0;
+            return sum + (isNaN(value) ? 0 : value);
+        }, 0);
     },
 
     normalizeAdditionalMaterialType(type) {
@@ -2665,7 +3115,7 @@ const App = {
     },
 
     hasMonitoringData(record) {
-        const monitoring = record?.monitoring || {};
+        const monitoring = this.getICTAMonitoringState(record);
         const process = record?.process || {};
         const temperatureFields = [
             monitoring.ambientTemperature,
@@ -2678,11 +3128,20 @@ const App = {
             process.outer
         ];
         const hasTemperature = temperatureFields.some((value) => value != null && !isNaN(value));
+        const hasEnvironmental = monitoring.ambientHumidity != null && !isNaN(monitoring.ambientHumidity);
         const hasMoisture = (monitoring.moistureValue != null && !isNaN(monitoring.moistureValue))
             || !!monitoring.moistureQualitative;
-        const hasOdour = !!monitoring.odourLevel && monitoring.odourLevel !== 'no_odour';
+        const hasOdour = monitoring.odourDetected === true
+            || monitoring.odourDetected === false
+            || !!monitoring.odourType
+            || !!monitoring.odourDistance
+            || (!!monitoring.odourLevel && monitoring.odourLevel !== 'no_odour');
         const hasLeachate = !!monitoring.leachateObserved && monitoring.leachateObserved !== 'not_assessed';
-        return hasTemperature || hasMoisture || hasOdour || hasLeachate;
+        const advanced = monitoring.advancedMonitoring || {};
+        const hasAdvanced = ['laboratoryMoisture', 'oxygen', 'ammonia', 'carbonDioxide', 'methane', 'hydrogenSulfide', 'voc', 'nitrousOxide', 'organicMatter', 'electricalConductivity']
+            .some((key) => advanced?.[key]?.value != null && advanced[key].value !== '' && !isNaN(advanced[key].value))
+            || !!advanced.notes;
+        return hasTemperature || hasEnvironmental || hasMoisture || hasOdour || hasLeachate || hasAdvanced;
     },
 
     hasMaintenanceData(record) {
@@ -2912,97 +3371,6 @@ const App = {
                 </div>
             </div>
         `;
-    },
-
-    getDiagnosis(process, observation) {
-        const diagnosis = { phase: '', alerts: [] };
-
-        if (!process) return diagnosis;
-
-        const avgTemp = this.calculateAvgTemperature({ process });
-
-        // Temperature Logic - Only if core/transition/outer are not null
-        if (avgTemp !== null && avgTemp >= 70) {
-            diagnosis.alerts.push({
-                type: 'danger',
-                icon: '🔴',
-                text: `Temperature too high (${avgTemp}°C)`,
-                action: 'Turn compost and add water to prevent overheating.'
-            });
-        }
-
-        // Oxygen Logic - ONLY if oxygen is NOT null
-        if (process.oxygen !== null && !isNaN(process.oxygen)) {
-            if (process.oxygen < 10) {
-                diagnosis.alerts.push({
-                    type: 'danger',
-                    icon: '🔴',
-                    text: `Low oxygen level detected (${process.oxygen}%)`,
-                    action: 'Check aeration conditions and turn compost. <br>→ Consider adding structuring material. <br>→ If bad odour is also observed, strong intervention is recommended.'
-                });
-            } else if (process.oxygen < 15) {
-                diagnosis.alerts.push({
-                    type: 'warning',
-                    icon: '⚠️',
-                    text: `Oxygen borderline low (${process.oxygen}%)`,
-                    action: 'Consider turning to improve aeration.'
-                });
-            }
-        }
-
-        // Moisture Logic - ONLY if moisture is NOT null
-        if (process.moisture !== null && !isNaN(process.moisture)) {
-            if (process.moisture < 50 || process.moisture > 60) {
-                let action = '';
-                if (process.moisture < 50) {
-                    action = 'Material is too dry → consider adding water.';
-                } else {
-                    action = 'Material is too wet → consider adding dry/structuring material.';
-                }
-                diagnosis.alerts.push({
-                    type: 'warning',
-                    icon: '⚠️',
-                    text: `Moisture is outside the optimal range (50–60%) - Current: ${process.moisture}%`,
-                    action: action
-                });
-            } else {
-                diagnosis.alerts.push({
-                    type: 'success',
-                    icon: '✅',
-                    text: `Moisture optimal (${process.moisture}%)`,
-                    action: 'Moisture within ideal range (50-60%).'
-                });
-            }
-        }
-
-        if (observation && observation.leachate === 'Yes') {
-            diagnosis.alerts.push({
-                type: 'warning',
-                icon: '⚠️',
-                text: 'Leachate detected',
-                action: 'Check drainage and consider adding dry material'
-            });
-        }
-
-        if (observation && observation.odour === 'Strong') {
-            diagnosis.alerts.push({
-                type: 'warning',
-                icon: '⚠️',
-                text: 'Strong odour detected',
-                action: 'Potential anaerobic conditions - turn immediately'
-            });
-        }
-
-        if (diagnosis.alerts.length === 0) {
-            diagnosis.alerts.push({
-                type: 'success',
-                icon: '✅',
-                text: 'All parameters within normal range',
-                action: 'Continue regular monitoring'
-            });
-        }
-
-        return diagnosis;
     },
 
     render() {
@@ -3413,7 +3781,7 @@ const App = {
                 return { src, photoIndex };
             });
             sections.push({
-                title: `Daily Record • ${this.formatDate(record.date)}${record?.composterId ? ` • Composter ${record.composterId}` : ''}`,
+                title: `Daily Record • ${this.formatDate(record.date)}${record?.composterId ? ` • ${record.composterId}` : ''}`,
                 subtitle: `${photos.length} photo${photos.length === 1 ? '' : 's'}`,
                 items
             });
@@ -3535,7 +3903,7 @@ const App = {
             ? `${this.formatNumber(measurement.bucketSizeL, 3)} L`
             : '—';
         const customUnitLabel = measurement.inputMethod === 'other' ? (measurement.customUnitName || measurement.unitName || '—') : '—';
-        const initialStock = batch.initialStock || {};
+        const initialStock = this.getInitialStockState(batch);
         const calculationSettings = this.getBatchCalculationSettings(batch);
 
         const compInfo = batch.compostingSystemInformation || {};
@@ -3568,13 +3936,41 @@ const App = {
         const statusLabel = batch.status === 'finished' ? 'Finished' : 'Active';
         const statusClass = batch.status === 'finished' ? 'finished' : 'active';
         const stockAmountLabel = initialStock.exists
-            ? `${this.formatNumber(initialStock.amount || 0, 3)} ${measurement.unitName}`
-            : '—';
-        const stockHeightLabel = initialStock.height != null && initialStock.height !== ''
-            ? `${this.formatNumber(initialStock.height, 2)} cm`
+            ? `${this.formatNumber(this.calculateInitialStockAmount(batch), 3)} ${measurement.unitName}`
             : '—';
         const conversionRateLabel = `${this.formatNumber(calculationSettings.compostConversionRate * 100, 2)}%`;
         const composterCountLabel = compInfo.numberOfCompostersUsed != null ? String(compInfo.numberOfCompostersUsed) : '—';
+        const stockMaterialsTable = initialStock.exists && initialStock.materials.length > 0
+            ? `
+                <div class="batch-info-table-wrap">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Material Type</th>
+                                <th>Weight</th>
+                                <th>Height</th>
+                                <th>Composter</th>
+                                <th>Purpose</th>
+                                <th>Notes</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${initialStock.materials.map((item) => `
+                                <tr>
+                                    <td>${esc(item.materialType === 'Other' ? (item.materialDescription || 'Other') : item.materialType || '—')}</td>
+                                    <td>${esc(`${this.formatNumber(item.materialWeight || 0, 3)} ${measurement.unitName}`)}</td>
+                                    <td>${esc(item.approximateHeightCm != null ? `${this.formatNumber(item.approximateHeightCm, 2)} cm` : '—')}</td>
+                                    <td>${esc(item.composterId || '—')}</td>
+                                    <td>${esc(item.purpose || '—')}</td>
+                                    <td>${esc(item.notes || '—')}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            `
+            : `<div style="margin-top: 8px; color: var(--gray);">No initial materials recorded.</div>`;
+        const selectedComposters = Array.from(new Set(initialStock.materials.map((item) => String(item.composterId || '').trim()).filter(Boolean)));
 
         const body = `
             <div class="batch-info-modal">
@@ -3643,12 +4039,11 @@ const App = {
                         <div class="batch-info-section-title"><span class="batch-info-section-icon">📦</span><span>Initial Composting Stock</span></div>
                         <div class="batch-info-kv-grid">
                             <div class="batch-info-kv-item"><span class="batch-info-kv-label">Exists</span><span class="batch-info-kv-value">${esc(initialStock.exists ? 'Yes' : 'No')}</span></div>
-                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Stock Type</span><span class="batch-info-kv-value">${esc(initialStock.type || '—')}</span></div>
-                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Other Type</span><span class="batch-info-kv-value">${esc(initialStock.otherType || '—')}</span></div>
-                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Initial Stock Amount</span><span class="batch-info-kv-value">${esc(stockAmountLabel)}</span></div>
-                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Composter ID</span><span class="batch-info-kv-value">${esc(initialStock.composterId || initialStock.location || '—')}</span></div>
-                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Approximate Initial Stock Height</span><span class="batch-info-kv-value">${esc(stockHeightLabel)}</span></div>
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Total Existing Materials</span><span class="batch-info-kv-value">${esc(String(initialStock.materials.length))}</span></div>
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Total Initial Stock Weight</span><span class="batch-info-kv-value">${esc(stockAmountLabel)}</span></div>
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Selected Composter</span><span class="batch-info-kv-value">${esc(selectedComposters.length > 0 ? selectedComposters.join(', ') : '—')}</span></div>
                         </div>
+                        ${stockMaterialsTable}
                     </section>
 
                     <section class="batch-info-section-card batch-info-section-calculation">
@@ -3656,6 +4051,7 @@ const App = {
                         <div class="batch-info-kv-grid">
                             <div class="batch-info-kv-item"><span class="batch-info-kv-label">Overall Compost Conversion Rate</span><span class="batch-info-kv-value">${esc(conversionRateLabel)}</span></div>
                             <div class="batch-info-kv-item"><span class="batch-info-kv-label">Mode</span><span class="batch-info-kv-value">${esc(calculationSettings.useCustomConversionRate ? 'Custom' : 'Default (ICTA-UAB Case)')}</span></div>
+                            <div class="batch-info-kv-item"><span class="batch-info-kv-label">Monitoring Protocol</span><span class="batch-info-kv-value">${esc(calculationSettings.monitoringProtocol === 'advanced' ? 'Advanced Monitoring' : 'Basic Monitoring')}</span></div>
                         </div>
                     </section>
 
@@ -3673,6 +4069,303 @@ const App = {
         `;
 
         this.showInfoModal(`Batch Info — ${esc(batch.id)}`, body);
+    },
+
+    showMonitoringProtocolInfo(protocol) {
+        const isAdvanced = String(protocol || '').toLowerCase() === 'advanced';
+        const title = isAdvanced ? 'ⓘ Advanced Monitoring' : 'ⓘ Basic Monitoring';
+        const body = isAdvanced
+            ? `
+                <div style="line-height: 1.65;">
+                    <p><strong>Advanced Monitoring</strong></p>
+                    <p>Designed for universities, research projects and professional composting systems.</p>
+                    <p>Includes all Basic Monitoring parameters together with optional laboratory and research measurements.</p>
+                    <p>Not all measurements are required for every monitoring session. Users should record only the parameters that are available.</p>
+                </div>
+            `
+            : `
+                <div style="line-height: 1.65;">
+                    <p><strong>Basic Monitoring</strong></p>
+                    <p>Designed for routine community composting operations.</p>
+                    <p>Includes only the essential monitoring parameters required for daily compost management.</p>
+                    <p>Suitable for community composting sites, schools, households and organisations without laboratory equipment.</p>
+                </div>
+            `;
+        this.showInfoModal(title, body);
+    },
+
+    getCreateBatchInitialStockUnitLabel() {
+        const method = document.querySelector('input[name="inputMethod"]:checked')?.value || 'weight';
+        if (method === 'volume') return 'L';
+        if (method === 'other') {
+            const custom = document.getElementById('customUnitName')?.value || '';
+            return String(custom).trim() || 'Unit';
+        }
+        return 'kg';
+    },
+
+    getCreateBatchComposterOptions() {
+        const numEl = document.getElementById('numComposters');
+        let count = numEl ? parseInt(numEl.value, 10) : 0;
+        if (isNaN(count) || count < 1) count = 1;
+        const options = [];
+        for (let i = 1; i <= count; i++) {
+            const rawId = document.getElementById(`composterId_${i}`)?.value || '';
+            const composterId = String(rawId).trim() || String(i);
+            if (composterId) options.push(composterId);
+        }
+        return Array.from(new Set(options));
+    },
+
+    renderCreateBatchMonitoringProtocolOption(value, label) {
+        const checked = value === 'basic' ? 'checked' : '';
+        return `
+            <label class="monitoring-protocol-option">
+                <div class="monitoring-protocol-option-main">
+                    <input type="radio" name="monitoringProtocol" value="${value}" ${checked}>
+                    <span>${label}</span>
+                </div>
+                <button type="button" class="btn btn-secondary monitoring-protocol-info-btn" onclick="event.preventDefault(); event.stopPropagation(); app.showMonitoringProtocolInfo('${value}')">ⓘ</button>
+            </label>
+        `;
+    },
+
+    renderCreateBatchCalculationSettingsSection() {
+        return `
+            <div class="module" style="background: #F4FAFF; border-color: #B3E5FC;">
+                <h3 class="module-title" style="color: #0277BD; margin-bottom: 8px;">⚙️ Calculation Settings</h3>
+                <div class="form-group">
+                    <label class="form-label">Overall Compost Conversion Rate</label>
+                    <div style="font-weight: 600; color: var(--gray); margin-bottom: 10px;">36% (ICTA-UAB Case)</div>
+                    <div class="radio-group">
+                        <label class="radio-item">
+                            <input type="radio" name="conversionRateMode" value="default" checked onchange="app.updateCreateBatchCalculationSettingsVisibility()">
+                            Default
+                        </label>
+                        <label class="radio-item">
+                            <input type="radio" name="conversionRateMode" value="custom" onchange="app.updateCreateBatchCalculationSettingsVisibility()">
+                            Custom
+                        </label>
+                    </div>
+                </div>
+                <div id="customConversionRateSection" style="display:none;">
+                    <div class="form-group">
+                        <label class="form-label required">Conversion Rate (%)</label>
+                        <input type="number" class="form-input" id="customConversionRate" step="any" min="0" placeholder="e.g., 36">
+                    </div>
+                </div>
+
+                <div class="form-group monitoring-protocol-group">
+                    <label class="form-label">🔬 Monitoring Protocol</label>
+                    <div class="monitoring-protocol-help">
+                        Select the monitoring protocol for this composting batch.<br>
+                        Basic Monitoring is recommended for routine community composting.<br>
+                        Advanced Monitoring is intended for research projects and users with access to specialised monitoring equipment or laboratory analyses.
+                    </div>
+                    <div class="monitoring-protocol-list">
+                        ${this.renderCreateBatchMonitoringProtocolOption('basic', 'Basic Monitoring')}
+                        ${this.renderCreateBatchMonitoringProtocolOption('advanced', 'Advanced Monitoring')}
+                    </div>
+                </div>
+            </div>
+        `;
+    },
+
+    renderCreateBatchInitialStockMaterialCard(index, data = {}) {
+        const materialId = this.escapeAttr(data.id || `initial-stock-${Date.now()}-${Math.floor(Math.random() * 1000)}`);
+        const unit = this.getCreateBatchInitialStockUnitLabel();
+        const composterOptions = this.getCreateBatchComposterOptions();
+        const materialType = String(data.materialType || 'Mature Compost');
+        const materialDescription = String(data.materialDescription || '');
+        const purpose = String(data.purpose || '');
+        const notes = String(data.notes || '');
+        const materialWeight = data.materialWeight != null && !isNaN(data.materialWeight) ? this.formatNumber(data.materialWeight, 6) : '';
+        const approximateHeightCm = data.approximateHeightCm != null && !isNaN(data.approximateHeightCm) ? this.formatNumber(data.approximateHeightCm, 6) : '';
+        const defaultComposter = String(data.composterId || composterOptions[0] || '');
+        const singleComposter = composterOptions.length <= 1;
+        return `
+            <div class="initial-stock-material-card" data-material-id="${materialId}">
+                <div class="initial-stock-material-header" onclick="app.toggleCreateBatchInitialStockMaterialCard(this)">
+                    <div>
+                        <div class="initial-stock-material-title">Material ${index}</div>
+                        <div class="initial-stock-material-subtitle">${this.escapeAttr(materialType === 'Other' ? (materialDescription || 'Other') : materialType)}</div>
+                    </div>
+                    <div class="initial-stock-material-actions">
+                        <button type="button" class="btn btn-secondary initial-stock-header-btn">▾</button>
+                        <button type="button" class="btn btn-danger initial-stock-remove-btn" onclick="event.stopPropagation(); app.removeCreateBatchInitialStockMaterial(this)">Remove</button>
+                    </div>
+                </div>
+                <div class="initial-stock-material-body">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label class="form-label required">Material Type</label>
+                            <select class="form-input initial-stock-material-type" onchange="app.updateCreateBatchInitialStockMaterialFields(this)">
+                                <option value="Mature Compost" ${materialType === 'Mature Compost' ? 'selected' : ''}>Mature Compost</option>
+                                <option value="Active Compost" ${materialType === 'Active Compost' ? 'selected' : ''}>Active Compost</option>
+                                <option value="Previous Batch Residues" ${materialType === 'Previous Batch Residues' ? 'selected' : ''}>Previous Batch Residues</option>
+                                <option value="Structural Material" ${materialType === 'Structural Material' ? 'selected' : ''}>Structural Material</option>
+                                <option value="Other" ${materialType === 'Other' ? 'selected' : ''}>Other</option>
+                            </select>
+                        </div>
+                        <div class="form-group initial-stock-purpose-group" style="${materialType === 'Structural Material' ? '' : 'display:none;'}">
+                            <label class="form-label">Purpose</label>
+                            <select class="form-input initial-stock-purpose" onchange="app.updateCreateBatchInitialStockSummary()">
+                                <option value="">Select purpose</option>
+                                <option value="Base Layer" ${purpose === 'Base Layer' ? 'selected' : ''}>Base Layer</option>
+                                <option value="Initial Mixing" ${purpose === 'Initial Mixing' ? 'selected' : ''}>Initial Mixing</option>
+                                <option value="Other" ${purpose === 'Other' ? 'selected' : ''}>Other</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="form-group initial-stock-material-description-group" style="${materialType === 'Other' ? '' : 'display:none;'}">
+                        <label class="form-label required">Material Description</label>
+                        <input type="text" class="form-input initial-stock-material-description" value="${this.escapeAttr(materialDescription)}" placeholder="Describe the material" oninput="app.updateCreateBatchInitialStockSummary()">
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label class="form-label required">Material Weight (${this.escapeAttr(unit)})</label>
+                            <input type="number" class="form-input initial-stock-material-weight" step="any" value="${materialWeight}" placeholder="Enter amount" oninput="app.updateCreateBatchInitialStockSummary()">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label required">Approximate Material Height (cm)</label>
+                            <input type="number" class="form-input initial-stock-material-height" step="any" min="0" value="${approximateHeightCm}" placeholder="Enter height" oninput="app.updateCreateBatchInitialStockSummary()">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label required">Composter</label>
+                            <select class="form-input initial-stock-composter" ${singleComposter ? 'disabled' : ''} onchange="app.updateCreateBatchInitialStockSummary()">
+                                ${composterOptions.map((id) => `<option value="${this.escapeAttr(id)}" ${defaultComposter === id ? 'selected' : ''}>${this.escapeAttr(id)}</option>`).join('')}
+                            </select>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Notes (Optional)</label>
+                        <textarea class="form-input initial-stock-material-notes" rows="2" placeholder="Purchased mature compost from previous season." oninput="app.updateCreateBatchInitialStockSummary()">${this.escapeAttr(notes)}</textarea>
+                    </div>
+                </div>
+            </div>
+        `;
+    },
+
+    renderCreateBatchInitialStockSection() {
+        return `
+            <div class="module" style="background: #FFF7F0; border-color: #FFE0B2;">
+                <h3 class="module-title" style="color: #E65100; margin-bottom: 8px;">📦 Initial Composting Stock (Optional)</h3>
+                <div class="initial-stock-intro">
+                    Record any composting materials already present inside the selected composter before this batch begins.<br><br>
+                    These materials help establish the initial composting environment and improve batch tracking, material balance and carbon accounting.
+                </div>
+                <div class="form-group">
+                    <div class="radio-group">
+                        <label class="radio-item">
+                            <input type="radio" name="initialStockExists" value="no" checked onchange="app.updateCreateBatchInitialStockVisibility()">
+                            No
+                        </label>
+                        <label class="radio-item">
+                            <input type="radio" name="initialStockExists" value="yes" onchange="app.updateCreateBatchInitialStockVisibility()">
+                            Yes
+                        </label>
+                    </div>
+                </div>
+
+                <div id="initialStockDetails" style="display:none;">
+                    <div id="initialStockMaterialsList"></div>
+                    <button type="button" class="btn btn-secondary initial-stock-add-btn" onclick="app.addCreateBatchInitialStockMaterial()">➕ Add Existing Material</button>
+                    <div class="initial-stock-summary-card">
+                        <div class="initial-stock-summary-title">Initial Composting Stock Summary</div>
+                        <div class="initial-stock-summary-grid">
+                            <div class="initial-stock-summary-item">
+                                <div class="initial-stock-summary-label">Total Existing Materials</div>
+                                <div class="initial-stock-summary-value" id="initialStockSummaryCount">0</div>
+                            </div>
+                            <div class="initial-stock-summary-item">
+                                <div class="initial-stock-summary-label">Total Initial Stock Weight</div>
+                                <div class="initial-stock-summary-value" id="initialStockSummaryWeight">0 ${this.escapeAttr(this.getCreateBatchInitialStockUnitLabel())}</div>
+                            </div>
+                            <div class="initial-stock-summary-item">
+                                <div class="initial-stock-summary-label">Selected Composter</div>
+                                <div class="initial-stock-summary-value" id="initialStockSummaryComposter">—</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+    },
+
+    addCreateBatchInitialStockMaterial(data = {}) {
+        const list = document.getElementById('initialStockMaterialsList');
+        if (!list) return;
+        const nextIndex = list.querySelectorAll('.initial-stock-material-card').length + 1;
+        list.insertAdjacentHTML('beforeend', this.renderCreateBatchInitialStockMaterialCard(nextIndex, data));
+        this.updateCreateBatchInitialStockComposterOptions();
+        this.updateCreateBatchInitialStockSummary();
+    },
+
+    removeCreateBatchInitialStockMaterial(buttonEl) {
+        const list = document.getElementById('initialStockMaterialsList');
+        const card = buttonEl?.closest?.('.initial-stock-material-card');
+        if (!list || !card) return;
+        card.remove();
+        const cards = Array.from(list.querySelectorAll('.initial-stock-material-card'));
+        cards.forEach((item, idx) => {
+            const title = item.querySelector('.initial-stock-material-title');
+            if (title) title.textContent = `Material ${idx + 1}`;
+        });
+        if (cards.length === 0 && document.querySelector('input[name="initialStockExists"]:checked')?.value === 'yes') {
+            this.addCreateBatchInitialStockMaterial();
+            return;
+        }
+        this.updateCreateBatchInitialStockSummary();
+    },
+
+    toggleCreateBatchInitialStockMaterialCard(triggerEl) {
+        const card = triggerEl?.closest?.('.initial-stock-material-card');
+        const body = card?.querySelector('.initial-stock-material-body');
+        const btn = card?.querySelector('.initial-stock-header-btn');
+        if (!card || !body || !btn) return;
+        const collapsed = body.style.display === 'none';
+        body.style.display = collapsed ? 'block' : 'none';
+        btn.textContent = collapsed ? '▾' : '▸';
+    },
+
+    updateCreateBatchInitialStockMaterialFields(selectEl) {
+        const card = selectEl?.closest?.('.initial-stock-material-card');
+        if (!card) return;
+        const type = selectEl.value || '';
+        const otherGroup = card.querySelector('.initial-stock-material-description-group');
+        const otherInput = card.querySelector('.initial-stock-material-description');
+        const purposeGroup = card.querySelector('.initial-stock-purpose-group');
+        const purposeSelect = card.querySelector('.initial-stock-purpose');
+        const subtitle = card.querySelector('.initial-stock-material-subtitle');
+
+        if (otherGroup) otherGroup.style.display = type === 'Other' ? 'block' : 'none';
+        if (otherInput && type !== 'Other') otherInput.value = '';
+        if (purposeGroup) purposeGroup.style.display = type === 'Structural Material' ? 'block' : 'none';
+        if (purposeSelect && type !== 'Structural Material') purposeSelect.value = '';
+        if (subtitle) subtitle.textContent = type || 'Material';
+        this.updateCreateBatchInitialStockSummary();
+    },
+
+    updateCreateBatchInitialStockSummary() {
+        const countEl = document.getElementById('initialStockSummaryCount');
+        const weightEl = document.getElementById('initialStockSummaryWeight');
+        const composterEl = document.getElementById('initialStockSummaryComposter');
+        const list = document.getElementById('initialStockMaterialsList');
+        const unit = this.getCreateBatchInitialStockUnitLabel();
+        if (!countEl || !weightEl || !composterEl || !list) return;
+
+        const cards = Array.from(list.querySelectorAll('.initial-stock-material-card'));
+        const totalWeight = cards.reduce((sum, card) => {
+            const value = parseFloat(card.querySelector('.initial-stock-material-weight')?.value || '');
+            return sum + (isNaN(value) ? 0 : value);
+        }, 0);
+        const composters = Array.from(new Set(cards
+            .map((card) => String(card.querySelector('.initial-stock-composter')?.value || '').trim())
+            .filter(Boolean)));
+
+        countEl.textContent = String(cards.length);
+        weightEl.textContent = `${this.formatNumber(totalWeight, 3)} ${unit}`;
+        composterEl.textContent = composters.length > 0 ? composters.join(', ') : '—';
     },
 
     renderCreateBatch() {
@@ -3805,94 +4498,9 @@ const App = {
                             </div>
                         </div>
 
-                        <div class="module" style="background: #FFF7F0; border-color: #FFE0B2;">
-                            <h3 class="module-title" style="color: #E65100; margin-bottom: 8px;">📦 Initial Composting Stock (Optional)</h3>
-                            <div class="form-group">
-                                <label class="form-label">Was there already composting material inside the composter when this batch started?</label>
-                                <div class="radio-group">
-                                    <label class="radio-item">
-                                        <input type="radio" name="initialStockExists" value="no" checked onchange="app.updateCreateBatchInitialStockVisibility()">
-                                        No
-                                    </label>
-                                    <label class="radio-item">
-                                        <input type="radio" name="initialStockExists" value="yes" onchange="app.updateCreateBatchInitialStockVisibility()">
-                                        Yes
-                                    </label>
-                                </div>
-                            </div>
+                        ${this.renderCreateBatchInitialStockSection()}
 
-                            <div id="initialStockDetails" style="display:none;">
-                                <div class="form-row">
-                                    <div class="form-group">
-                                        <label class="form-label" id="initialStockAmountLabel">Initial Stock Amount</label>
-                                        <input type="number" class="form-input" id="initialStockAmount" step="any" placeholder="Enter amount">
-                                    </div>
-                                    <div class="form-group">
-                                        <label class="form-label" id="initialStockComposterLabel">Composter ID</label>
-                                        <select class="form-input" id="initialStockComposterId">
-                                            <option value="">Select composter</option>
-                                            <option value="1">1</option>
-                                            <option value="2">2</option>
-                                        </select>
-                                    </div>
-                                    <div class="form-group">
-                                        <label class="form-label" id="initialStockHeightLabel">Approximate Initial Stock Height (cm)</label>
-                                        <input type="number" class="form-input" id="initialStockHeight" step="any" min="0" placeholder="Enter approximate height">
-                                    </div>
-                                </div>
-
-                                <div class="form-group" style="margin-top: 6px;">
-                                    <label class="form-label" id="initialStockTypeLabel">Initial Stock Type</label>
-                                    <div class="radio-group" style="gap: 16px;">
-                                        <label class="radio-item">
-                                            <input type="radio" name="initialStockType" value="Mature Compost" onchange="app.updateCreateBatchInitialStockTypeVisibility()">
-                                            Mature Compost
-                                        </label>
-                                        <label class="radio-item">
-                                            <input type="radio" name="initialStockType" value="Active Compost" onchange="app.updateCreateBatchInitialStockTypeVisibility()">
-                                            Active Compost
-                                        </label>
-                                        <label class="radio-item">
-                                            <input type="radio" name="initialStockType" value="Previous Batch Residues" onchange="app.updateCreateBatchInitialStockTypeVisibility()">
-                                            Previous Batch Residues
-                                        </label>
-                                        <label class="radio-item">
-                                            <input type="radio" name="initialStockType" value="Other" onchange="app.updateCreateBatchInitialStockTypeVisibility()">
-                                            Other
-                                        </label>
-                                    </div>
-                                </div>
-
-                                <div class="form-group" id="initialStockOtherTypeGroup" style="display:none;">
-                                    <label class="form-label" id="initialStockOtherTypeLabel">Please specify</label>
-                                    <input type="text" class="form-input" id="initialStockOtherType" placeholder="Please specify">
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="module" style="background: #F4FAFF; border-color: #B3E5FC;">
-                            <h3 class="module-title" style="color: #0277BD; margin-bottom: 8px;">⚙️ Calculation Settings</h3>
-                            <div class="form-group">
-                                <label class="form-label">Overall Compost Conversion Rate</label>
-                                <div style="font-weight: 600; color: var(--gray); margin-bottom: 10px;">36% (ICTA-UAB Case)</div>
-                                <div class="radio-group">
-                                    <label class="radio-item">
-                                        <input type="radio" name="conversionRateMode" value="default" checked onchange="app.updateCreateBatchCalculationSettingsVisibility()">
-                                        Default
-                                    </label>
-                                    <label class="radio-item">
-                                        <input type="radio" name="conversionRateMode" value="custom" onchange="app.updateCreateBatchCalculationSettingsVisibility()">
-                                        Custom
-                                    </label>
-                                </div>
-                            </div>
-                            <div id="customConversionRateSection" style="display:none;">
-                                <div class="form-group">
-                                    <label class="form-label required">Conversion Rate (%)</label>
-                                    <input type="number" class="form-input" id="customConversionRate" step="any" min="0" placeholder="e.g., 36">
-                                </div>
-                            </div>
-                        </div>
+                        ${this.renderCreateBatchCalculationSettingsSection()}
 
                         <div class="module" style="background: #FFF3E0; border-color: #FFE0B2;">
                             <h3 class="module-title" style="color: #E65100; margin-bottom: 8px;">Collaboration Settings</h3>
@@ -4823,9 +5431,8 @@ const App = {
                                         ${this.renderExportFieldOption('dailyRecords', 'exportQuality', 'Input Quality', 'Exports the quality rating or condition of the input materials.')}
                                         ${this.renderExportFieldOption('dailyRecords', 'exportTemperature', 'Temperature', 'Exports ambient, core, transition, outer, and average temperature values.')}
                                         ${this.renderExportFieldOption('dailyRecords', 'exportMoisture', 'Moisture', 'Exports moisture type, moisture percentage, or qualitative moisture assessment.')}
-                                        ${this.renderExportFieldOption('dailyRecords', 'exportOxygen', 'Oxygen', 'Exports oxygen measurement values when available.')}
                                         ${this.renderExportFieldOption('dailyRecords', 'exportPhase', 'Phase', 'Exports the composting phase tracked for each record.')}
-                                        ${this.renderExportFieldOption('dailyRecords', 'exportOperations', 'Actions and Operations', 'Exports turning, mixing, water added, water added amount, and no-action status.')}
+                                        ${this.renderExportFieldOption('dailyRecords', 'exportOperations', 'Actions and Operations', 'Exports turning, mixing, water added, and water added amount.')}
                                         ${this.renderExportFieldOption('dailyRecords', 'exportOdour', 'Odour', 'Exports odour observation and any odour notes recorded on that date.')}
                                         ${this.renderExportFieldOption('dailyRecords', 'exportLeachate', 'Leachate', 'Exports leachate observation and any related notes recorded on that date.')}
                                     </div>
@@ -5070,6 +5677,10 @@ const App = {
 
         if (this.data.currentPage === 'dailyRecord') {
             this.updateICTAMoistureAssessmentVisibility();
+            this.updateOdourAssessmentVisibility();
+            this.updateAdvancedMonitoringFieldVisibility();
+            this.initializeSystemRecommendationRealtime();
+            this.updateSystemRecommendationDom();
             this.updateMaintenanceTotals();
             this.updateICTAActionTakenVisibility();
             this.updateICTAPhotoGridDom();
@@ -5161,89 +5772,42 @@ const App = {
 
     updateCreateBatchInitialStockVisibility() {
         const details = document.getElementById('initialStockDetails');
-        const amountEl = document.getElementById('initialStockAmount');
-        const composterEl = document.getElementById('initialStockComposterId');
-        const heightEl = document.getElementById('initialStockHeight');
-        const otherTypeEl = document.getElementById('initialStockOtherType');
-        const labelEl = document.getElementById('initialStockAmountLabel');
-        const composterLabel = document.getElementById('initialStockComposterLabel');
-        const heightLabel = document.getElementById('initialStockHeightLabel');
-        const typeLabel = document.getElementById('initialStockTypeLabel');
-        const otherTypeLabel = document.getElementById('initialStockOtherTypeLabel');
-        if (!details || !amountEl || !labelEl) return;
+        const list = document.getElementById('initialStockMaterialsList');
+        if (!details || !list) return;
 
         const selected = document.querySelector('input[name="initialStockExists"]:checked')?.value || 'no';
         const show = selected === 'yes';
         details.style.display = show ? 'block' : 'none';
-        amountEl.required = show;
-        if (composterEl) composterEl.required = show;
-        if (heightEl) heightEl.required = show;
         if (!show) {
-            amountEl.value = '';
-            if (composterEl) composterEl.value = '';
-            if (heightEl) heightEl.value = '';
-            if (otherTypeEl) otherTypeEl.value = '';
-            const checkedType = document.querySelector('input[name="initialStockType"]:checked');
-            if (checkedType) checkedType.checked = false;
+            list.innerHTML = '';
+            this.updateCreateBatchInitialStockSummary();
+            return;
         }
-
-        const method = document.querySelector('input[name="inputMethod"]:checked')?.value || 'weight';
-        let unit = 'kg';
-        if (method === 'volume') unit = 'L';
-        if (method === 'other') {
-            const custom = document.getElementById('customUnitName')?.value || '';
-            unit = String(custom).trim() || 'Unit';
+        if (list.querySelectorAll('.initial-stock-material-card').length === 0) {
+            this.addCreateBatchInitialStockMaterial();
+        } else {
+            this.updateCreateBatchInitialStockComposterOptions();
+            this.updateCreateBatchInitialStockSummary();
         }
-        labelEl.textContent = `Initial Stock Amount (${unit})`;
-        labelEl.classList.toggle('required', show);
-        if (composterLabel) composterLabel.classList.toggle('required', show);
-        if (heightLabel) heightLabel.classList.toggle('required', show);
-        if (typeLabel) typeLabel.classList.toggle('required', show);
-        if (otherTypeLabel) otherTypeLabel.classList.toggle('required', show && (document.querySelector('input[name="initialStockType"]:checked')?.value === 'Other'));
-        if (amountEl) amountEl.disabled = !show;
-        if (composterEl) composterEl.disabled = !show;
-        if (heightEl) heightEl.disabled = !show;
-        this.updateCreateBatchInitialStockComposterOptions();
-        this.updateCreateBatchInitialStockTypeVisibility();
     },
 
     updateCreateBatchInitialStockComposterOptions() {
-        const selectEl = document.getElementById('initialStockComposterId');
-        if (!selectEl) return;
-        const previousValue = selectEl.value;
-        const numEl = document.getElementById('numComposters');
-        let count = numEl ? parseInt(numEl.value, 10) : 0;
-        if (isNaN(count) || count < 1) count = 0;
-        const options = [];
-        for (let i = 1; i <= count; i++) {
-            const rawId = document.getElementById(`composterId_${i}`)?.value || '';
-            const composterId = String(rawId).trim() || String(i);
-            options.push(composterId);
-        }
-        const uniqueOptions = [...new Set(options)];
-        selectEl.innerHTML = `
-            <option value="">Select composter</option>
-            ${uniqueOptions.map((id) => `<option value="${String(id).replace(/"/g, '&quot;')}">${String(id).replace(/</g, '&lt;')}</option>`).join('')}
-        `;
-        if (uniqueOptions.includes(previousValue)) {
-            selectEl.value = previousValue;
-        }
-    },
-
-    updateCreateBatchInitialStockTypeVisibility() {
-        const selectedType = document.querySelector('input[name="initialStockType"]:checked')?.value || '';
-        const exists = document.querySelector('input[name="initialStockExists"]:checked')?.value === 'yes';
-        const otherGroup = document.getElementById('initialStockOtherTypeGroup');
-        const otherInput = document.getElementById('initialStockOtherType');
-        const otherLabel = document.getElementById('initialStockOtherTypeLabel');
-        const showOther = exists && selectedType === 'Other';
-        if (otherGroup) otherGroup.style.display = showOther ? 'block' : 'none';
-        if (otherInput) {
-            otherInput.required = showOther;
-            otherInput.disabled = !exists;
-            if (!showOther) otherInput.value = '';
-        }
-        if (otherLabel) otherLabel.classList.toggle('required', showOther);
+        const selects = Array.from(document.querySelectorAll('.initial-stock-composter'));
+        if (selects.length === 0) return;
+        const options = this.getCreateBatchComposterOptions();
+        const singleComposter = options.length <= 1;
+        selects.forEach((selectEl) => {
+            const previousValue = selectEl.value;
+            selectEl.innerHTML = options.map((id) => `<option value="${this.escapeAttr(id)}">${this.escapeAttr(id)}</option>`).join('');
+            selectEl.disabled = singleComposter;
+            if (options.includes(previousValue)) selectEl.value = previousValue;
+            else if (options[0]) selectEl.value = options[0];
+        });
+        document.querySelectorAll('.initial-stock-material-card').forEach((card) => {
+            const typeSelect = card.querySelector('.initial-stock-material-type');
+            if (typeSelect) this.updateCreateBatchInitialStockMaterialFields(typeSelect);
+        });
+        this.updateCreateBatchInitialStockSummary();
     },
 
     updateCreateBatchCalculationSettingsVisibility() {
@@ -5487,6 +6051,255 @@ const App = {
             const moistureValue = document.getElementById('moistureValue');
             if (moistureValue) moistureValue.value = '';
         }
+        this.updateSystemRecommendationDom();
+    },
+
+    updateOdourAssessmentVisibility() {
+        const choice = document.querySelector('input[name="odourDetected"]:checked')?.value || '';
+        const details = document.getElementById('odourDetectedDetails');
+        if (!details) return;
+        const show = choice === 'detected';
+        details.style.display = show ? 'block' : 'none';
+        if (!show) {
+            document.querySelectorAll('input[name="odourType"]').forEach((radio) => {
+                radio.checked = false;
+            });
+            document.querySelectorAll('input[name="odourDistance"]').forEach((radio) => {
+                radio.checked = false;
+            });
+        }
+        this.updateSystemRecommendationDom();
+    },
+
+    initializeSystemRecommendationRealtime() {
+        const content = document.getElementById('monitoringModuleContent');
+        if (!content) return;
+        if (content.dataset.systemRecommendationBound === 'true') return;
+        content.dataset.systemRecommendationBound = 'true';
+        const handler = () => this.updateSystemRecommendationDom();
+        content.addEventListener('input', handler);
+        content.addEventListener('change', handler);
+    },
+
+    getMonitoringDraftStateFromDom() {
+        const getNumericValue = (id) => {
+            const el = document.getElementById(id);
+            if (!el || el.value === '') return null;
+            const n = parseFloat(el.value);
+            return isNaN(n) ? null : n;
+        };
+        const moistureAssessmentType = document.querySelector('input[name="moistureAssessmentType"]:checked')?.value || 'quantitative';
+        const moistureValue = moistureAssessmentType === 'quantitative' ? getNumericValue('moistureValue') : null;
+        const moistureQualitative = moistureAssessmentType === 'qualitative'
+            ? (document.querySelector('input[name="moistureQualitative"]:checked')?.value || '')
+            : '';
+
+        const odourDetectedChoice = document.querySelector('input[name="odourDetected"]:checked')?.value || '';
+        const odourDetected = odourDetectedChoice === 'detected'
+            ? true
+            : (odourDetectedChoice === 'no' ? false : null);
+        const odourType = odourDetected === true
+            ? (document.querySelector('input[name="odourType"]:checked')?.value || null)
+            : null;
+        const odourDistance = odourDetected === true
+            ? (document.querySelector('input[name="odourDistance"]:checked')?.value || null)
+            : null;
+
+        const leachateObserved = document.querySelector('input[name="leachateObserved"]:checked')?.value || 'not_assessed';
+
+        const getAdvancedDraftField = (baseId) => {
+            const enabled = !!document.getElementById(`${baseId}Enabled`)?.checked;
+            const value = enabled ? getNumericValue(`${baseId}Value`) : null;
+            return { value };
+        };
+        const advancedMonitoringNotes = document.getElementById('advancedMonitoringNotes')?.value?.trim?.() || '';
+        const advancedMonitoring = {
+            laboratoryMoisture: getAdvancedDraftField('advancedLaboratoryMoisture'),
+            oxygen: getAdvancedDraftField('advancedOxygen'),
+            ammonia: getAdvancedDraftField('advancedAmmonia'),
+            carbonDioxide: getAdvancedDraftField('advancedCarbonDioxide'),
+            methane: getAdvancedDraftField('advancedMethane'),
+            hydrogenSulfide: getAdvancedDraftField('advancedHydrogenSulfide'),
+            voc: getAdvancedDraftField('advancedVoc'),
+            nitrousOxide: getAdvancedDraftField('advancedNitrousOxide'),
+            organicMatter: getAdvancedDraftField('advancedOrganicMatter'),
+            electricalConductivity: getAdvancedDraftField('advancedElectricalConductivity'),
+            notes: advancedMonitoringNotes
+        };
+
+        return {
+            ambientTemperature: getNumericValue('ambientTemperature'),
+            ambientHumidity: getNumericValue('ambientHumidity'),
+            coreTemperature: getNumericValue('coreTemperature'),
+            transitionTemperature: getNumericValue('transitionTemperature'),
+            outerTemperature: getNumericValue('outerTemperature'),
+            moistureAssessmentType,
+            moistureValue,
+            moistureQualitative,
+            odourDetected,
+            odourType,
+            odourDistance,
+            leachateObserved,
+            advancedMonitoring
+        };
+    },
+
+    getSystemRecommendationResult(batch, monitoringDraft, recordDate) {
+        const interpretations = [];
+        const actions = [];
+
+        const pushInterpretation = (text) => {
+            const t = String(text || '').trim();
+            if (t) interpretations.push(t);
+        };
+        const pushAction = (text) => {
+            const t = String(text || '').trim();
+            if (t) actions.push(t);
+        };
+
+        const coreTemp = monitoringDraft?.coreTemperature;
+        if (coreTemp != null && !isNaN(coreTemp)) {
+            if (coreTemp > 60) {
+                pushInterpretation('The compost temperature is too high.');
+                pushInterpretation('Excessive temperatures may inhibit microbial activity.');
+                pushAction('Turn the compost.');
+                pushAction('Add water while turning.');
+                pushAction('Avoid reducing the temperature below 40°C.');
+                pushAction('Avoid excessive watering.');
+                pushAction('Add structural material if necessary.');
+            } else if (coreTemp >= 40 && coreTemp <= 60) {
+                pushInterpretation('The compost is in the normal thermophilic phase.');
+                pushAction('No maintenance required.');
+                pushAction('Continue monitoring.');
+            } else if (coreTemp < 40) {
+                const hasReachedThermophilic = this.hasBatchReachedThermophilicPeak(batch, recordDate, coreTemp);
+                if (!hasReachedThermophilic) {
+                    pushInterpretation('The compost is still in the mesophilic phase.');
+                    pushAction('Increase nitrogen-rich organic materials.');
+                    pushAction('Do not turn the compost.');
+                    pushAction('Do not add water.');
+                } else {
+                    pushInterpretation('The compost is currently in the cooling or maturation phase.');
+                    pushAction('No maintenance required.');
+                    pushAction('Continue monitoring.');
+                }
+            }
+        }
+
+        const moisture = String(monitoringDraft?.moistureQualitative || '').trim();
+        if (moisture === 'wet') {
+            pushInterpretation('The compost contains excessive moisture.');
+            pushInterpretation('Poor aeration may occur.');
+            pushAction('Add structural material.');
+            pushAction('Turn the compost.');
+        } else if (moisture === 'optimal') {
+            pushInterpretation('Moisture conditions are appropriate.');
+            pushAction('No maintenance required.');
+        } else if (moisture === 'dry') {
+            pushInterpretation('The compost is too dry.');
+            pushInterpretation('Microbial activity may decrease.');
+            pushAction('Turn the compost.');
+            pushAction('Add water gradually.');
+            pushAction('Adjust water according to ambient conditions and the next maintenance schedule.');
+        }
+
+        const odourDetected = monitoringDraft?.odourDetected;
+        const odourType = String(monitoringDraft?.odourType || '').trim();
+        if (odourDetected === true) {
+            if (odourType === 'earth') {
+                pushInterpretation('The composting process is progressing normally.');
+                pushAction('No maintenance required.');
+            } else if (odourType === 'vinegar') {
+                pushInterpretation('Excess acidic compounds are present.');
+                pushAction('Reduce fruit and vegetable inputs.');
+            } else if (odourType === 'rotten') {
+                pushInterpretation('Insufficient oxygen.');
+                pushInterpretation('Possible anaerobic conditions.');
+                pushAction('Turn the compost immediately.');
+                pushAction('Improve aeration.');
+            } else if (odourType === 'ammonia') {
+                pushInterpretation('Excess nitrogen.');
+                pushAction('Reduce nitrogen-rich organic waste.');
+                pushAction('Add structural material.');
+                pushAction('Restore approximately a 1:1 Organic Waste : Structural Material ratio.');
+            }
+        }
+
+        const uniqueInterpretations = [];
+        const seenInterpretations = new Set();
+        interpretations.forEach((item) => {
+            if (seenInterpretations.has(item)) return;
+            seenInterpretations.add(item);
+            uniqueInterpretations.push(item);
+        });
+
+        const uniqueActions = [];
+        const seenActions = new Set();
+        actions.forEach((item) => {
+            if (seenActions.has(item)) return;
+            seenActions.add(item);
+            uniqueActions.push(item);
+        });
+
+        return { interpretations: uniqueInterpretations, actions: uniqueActions };
+    },
+
+    hasBatchReachedThermophilicPeak(batch, recordDate, draftCoreTemperature) {
+        const records = Array.isArray(batch?.records) ? batch.records : [];
+        const dateStr = String(recordDate || '').trim();
+        const draftCore = draftCoreTemperature != null && !isNaN(draftCoreTemperature) ? draftCoreTemperature : null;
+        const merged = records.map((r) => {
+            if (dateStr && String(r?.date || '') === dateStr) {
+                const next = { ...(r || {}) };
+                next.monitoring = { ...(r?.monitoring || {}), coreTemperature: draftCore };
+                next.process = { ...(r?.process || {}), core: draftCore };
+                return next;
+            }
+            return r;
+        });
+        if (dateStr && !records.some((r) => String(r?.date || '') === dateStr)) {
+            merged.push({
+                id: 'draft',
+                date: dateStr,
+                monitoring: { coreTemperature: draftCore },
+                process: { core: draftCore }
+            });
+        }
+        return merged.some((r) => {
+            const core = r?.monitoring?.coreTemperature != null ? r.monitoring.coreTemperature : r?.process?.core;
+            return core != null && !isNaN(core) && Number(core) >= 40;
+        });
+    },
+
+    updateSystemRecommendationDom() {
+        const module = document.getElementById('systemRecommendationModule');
+        if (!module) return;
+        const batch = this.data.currentBatch;
+        if (!batch) {
+            module.style.display = 'none';
+            return;
+        }
+        const recordDate = document.getElementById('recordDate')?.value || '';
+        const monitoringDraft = this.getMonitoringDraftStateFromDom();
+        const shouldShow = this.hasMonitoringStateContent(monitoringDraft);
+        if (!shouldShow) {
+            module.style.display = 'none';
+            return;
+        }
+        const result = this.getSystemRecommendationResult(batch, monitoringDraft, recordDate);
+        const interpretationsEl = document.getElementById('systemRecommendationInterpretations');
+        const actionsEl = document.getElementById('systemRecommendationActions');
+        if (interpretationsEl) {
+            interpretationsEl.innerHTML = result.interpretations.map((text) => (
+                `<div class="system-recommendation-item">• ${this.escapeHtml(text)}</div>`
+            )).join('');
+        }
+        if (actionsEl) {
+            actionsEl.innerHTML = result.actions.map((text) => (
+                `<div class="system-recommendation-item">✔ ${this.escapeHtml(text)}</div>`
+            )).join('');
+        }
+        module.style.display = 'block';
     },
 
     toggleICTAMaintenanceModule() {
@@ -6096,7 +6909,9 @@ const App = {
     showOdourGuide() {
         const body = `
             <div style="line-height: 1.8;">
-                <div style="margin-bottom: 10px;">• <strong>No odour:</strong><br>No noticeable smell.</div>
+                <div style="margin-bottom: 12px; color: var(--gray);">
+                    Estimated detection distance under normal outdoor conditions (without strong wind).
+                </div>
                 <div style="margin-bottom: 10px;">• <strong>Detected &lt;1 m:</strong><br>Odour only noticeable close to the composter.</div>
                 <div style="margin-bottom: 10px;">• <strong>Detected 1–5 m:</strong><br>Odour detectable around the composting area.</div>
                 <div>• <strong>Detected &gt;5 m:</strong><br>Strong odour detectable at a considerable distance.</div>
@@ -6443,49 +7258,56 @@ const App = {
 
         const initialStockSelected = document.querySelector('input[name="initialStockExists"]:checked')?.value || 'no';
         const hasInitialStock = initialStockSelected === 'yes';
-        const initialStockAmountRaw = document.getElementById('initialStockAmount')?.value;
-        const initialStockComposterId = document.getElementById('initialStockComposterId')?.value || '';
-        const initialStockHeightRaw = document.getElementById('initialStockHeight')?.value;
-        const initialStockType = document.querySelector('input[name="initialStockType"]:checked')?.value || '';
-        const initialStockOtherType = document.getElementById('initialStockOtherType')?.value.trim() || '';
-        let initialStockAmount = 0;
-        let initialStockHeight = null;
+        const initialStockCards = Array.from(document.querySelectorAll('#initialStockMaterialsList .initial-stock-material-card'));
+        let initialStockMaterials = [];
         if (hasInitialStock) {
-            const parsed = initialStockAmountRaw != null && String(initialStockAmountRaw).trim() !== '' ? parseFloat(initialStockAmountRaw) : NaN;
-            if (isNaN(parsed) || parsed < 0) {
-                alert(`Please enter a valid Initial Stock Amount (${measurementSettings.unitName})`);
+            if (initialStockCards.length === 0) {
+                alert('Please add at least one existing material to the Initial Composting Stock section.');
                 return;
             }
-            initialStockAmount = parsed;
-            if (!initialStockComposterId) {
-                alert('Please select the Composter ID for the Initial Composting Stock');
+            try {
+                initialStockMaterials = initialStockCards.map((card, index) => {
+                    const materialType = card.querySelector('.initial-stock-material-type')?.value || '';
+                    const materialDescription = (card.querySelector('.initial-stock-material-description')?.value || '').trim();
+                    const materialWeightRaw = card.querySelector('.initial-stock-material-weight')?.value;
+                    const approximateHeightRaw = card.querySelector('.initial-stock-material-height')?.value;
+                    const composterId = (card.querySelector('.initial-stock-composter')?.value || '').trim();
+                    const notes = (card.querySelector('.initial-stock-material-notes')?.value || '').trim();
+                    const purpose = materialType === 'Structural Material'
+                        ? (card.querySelector('.initial-stock-purpose')?.value || '')
+                        : '';
+                    const materialWeight = materialWeightRaw != null && String(materialWeightRaw).trim() !== '' ? parseFloat(materialWeightRaw) : NaN;
+                    const approximateHeightCm = approximateHeightRaw != null && String(approximateHeightRaw).trim() !== '' ? parseFloat(approximateHeightRaw) : NaN;
+
+                    if (!materialType) throw new Error(`Please select Material Type for Material ${index + 1}.`);
+                    if (materialType === 'Other' && !materialDescription) throw new Error(`Please enter Material Description for Material ${index + 1}.`);
+                    if (isNaN(materialWeight) || materialWeight < 0) throw new Error(`Please enter a valid Material Weight (${measurementSettings.unitName}) for Material ${index + 1}.`);
+                    if (isNaN(approximateHeightCm) || approximateHeightCm < 0) throw new Error(`Please enter a valid Approximate Material Height (cm) for Material ${index + 1}.`);
+                    if (!composterId) throw new Error(`Please select the Composter for Material ${index + 1}.`);
+
+                    return {
+                        id: card.getAttribute('data-material-id') || `initial-stock-${Date.now()}-${index + 1}`,
+                        materialType,
+                        materialDescription: materialType === 'Other' ? materialDescription : '',
+                        materialWeight,
+                        approximateHeightCm,
+                        composterId,
+                        notes,
+                        purpose
+                    };
+                });
+            } catch (error) {
+                alert(error?.message || 'Please review the Initial Composting Stock section.');
                 return;
             }
-            if (!initialStockType) {
-                alert('Please select the Initial Stock Type');
-                return;
-            }
-            if (initialStockType === 'Other' && !initialStockOtherType) {
-                alert('Please specify the Initial Stock Type');
-                return;
-            }
-            const heightValue = initialStockHeightRaw != null && String(initialStockHeightRaw).trim() !== '' ? parseFloat(initialStockHeightRaw) : NaN;
-            if (isNaN(heightValue) || heightValue < 0) {
-                alert('Please enter a valid Approximate Initial Stock Height (cm)');
-                return;
-            }
-            initialStockHeight = heightValue;
         }
         const initialStock = {
             exists: hasInitialStock,
-            amount: initialStockAmount,
-            type: hasInitialStock ? initialStockType : '',
-            otherType: hasInitialStock && initialStockType === 'Other' ? initialStockOtherType : '',
-            composterId: hasInitialStock ? initialStockComposterId : '',
-            height: hasInitialStock ? initialStockHeight : null
+            materials: initialStockMaterials
         };
 
         const conversionRateMode = document.querySelector('input[name="conversionRateMode"]:checked')?.value || 'default';
+        const monitoringProtocol = document.querySelector('input[name="monitoringProtocol"]:checked')?.value || 'basic';
         const customConversionRateRaw = document.getElementById('customConversionRate')?.value;
         let compostConversionRate = 0.36;
         if (conversionRateMode === 'custom') {
@@ -6498,7 +7320,8 @@ const App = {
         }
         const settings = {
             useCustomConversionRate: conversionRateMode === 'custom',
-            compostConversionRate
+            compostConversionRate,
+            monitoringProtocol: monitoringProtocol === 'advanced' ? 'advanced' : 'basic'
         };
 
         const existingIndex = this.data.batches.findIndex((b) => (
@@ -6826,24 +7649,75 @@ const App = {
         const moistureQualitative = moistureAssessmentType === 'qualitative'
             ? (document.querySelector('input[name="moistureQualitative"]:checked')?.value || '')
             : '';
-        const odourLevel = document.querySelector('input[name="odourLevel"]:checked')?.value || 'no_odour';
+        const odourDetectedChoice = document.querySelector('input[name="odourDetected"]:checked')?.value || '';
+        const odourDetected = odourDetectedChoice === 'detected'
+            ? true
+            : (odourDetectedChoice === 'no' ? false : null);
+        const odourType = odourDetected === true
+            ? (document.querySelector('input[name="odourType"]:checked')?.value || null)
+            : null;
+        const odourDistance = odourDetected === true
+            ? (document.querySelector('input[name="odourDistance"]:checked')?.value || null)
+            : null;
         const leachateObserved = document.querySelector('input[name="leachateObserved"]:checked')?.value || 'not_assessed';
+        const monitoringProtocol = this.getBatchMonitoringProtocol(batch);
+        const getAdvancedField = (baseId) => {
+            const enabled = !!document.getElementById(`${baseId}Enabled`)?.checked;
+            const value = enabled ? getNumericValue(`${baseId}Value`) : null;
+            return { enabled, value };
+        };
+        const advancedMonitoring = monitoringProtocol === 'advanced'
+            ? {
+                samplingDate: recordDate,
+                measurementDate: document.getElementById('advancedMeasurementDate')?.value || recordDate,
+                laboratoryMoistureEnabled: !!document.getElementById('advancedLaboratoryMoistureEnabled')?.checked,
+                laboratoryMoisture: getAdvancedField('advancedLaboratoryMoisture').value,
+                oxygenEnabled: !!document.getElementById('advancedOxygenEnabled')?.checked,
+                oxygen: getAdvancedField('advancedOxygen').value,
+                ammoniaEnabled: !!document.getElementById('advancedAmmoniaEnabled')?.checked,
+                ammonia: getAdvancedField('advancedAmmonia').value,
+                carbonDioxideEnabled: !!document.getElementById('advancedCarbonDioxideEnabled')?.checked,
+                carbonDioxide: getAdvancedField('advancedCarbonDioxide').value,
+                methaneEnabled: !!document.getElementById('advancedMethaneEnabled')?.checked,
+                methane: getAdvancedField('advancedMethane').value,
+                hydrogenSulfideEnabled: !!document.getElementById('advancedHydrogenSulfideEnabled')?.checked,
+                hydrogenSulfide: getAdvancedField('advancedHydrogenSulfide').value,
+                vocEnabled: !!document.getElementById('advancedVocEnabled')?.checked,
+                voc: getAdvancedField('advancedVoc').value,
+                nitrousOxideEnabled: !!document.getElementById('advancedNitrousOxideEnabled')?.checked,
+                nitrousOxide: getAdvancedField('advancedNitrousOxide').value,
+                organicMatterEnabled: !!document.getElementById('advancedOrganicMatterEnabled')?.checked,
+                organicMatter: getAdvancedField('advancedOrganicMatter').value,
+                electricalConductivityEnabled: !!document.getElementById('advancedElectricalConductivityEnabled')?.checked,
+                electricalConductivity: getAdvancedField('advancedElectricalConductivity').value,
+                notes: document.getElementById('advancedMonitoringNotes')?.value?.trim?.() || ''
+            }
+            : null;
 
         monitoring = {
             ambientTemperature: getNumericValue('ambientTemperature'),
+            ambientHumidity: getNumericValue('ambientHumidity'),
             coreTemperature: getNumericValue('coreTemperature'),
             transitionTemperature: getNumericValue('transitionTemperature'),
             outerTemperature: getNumericValue('outerTemperature'),
             moistureAssessmentType,
             moistureValue,
             moistureQualitative,
-            odourLevel,
-            leachateObserved
+            odourDetected,
+            odourType,
+            odourDistance,
+            leachateObserved,
+            advancedMonitoring
         };
 
-        let odour = 'None';
-        if (odourLevel === 'greater_than_5m') odour = 'Strong';
-        else if (odourLevel === 'less_than_1m' || odourLevel === 'between_1_and_5m') odour = 'Slight';
+        let odour = previousRecord?.observation?.odour != null ? previousRecord.observation.odour : '';
+        if (odourDetected === true) {
+            if (odourDistance === 'gt_5m') odour = 'Strong';
+            else if (odourDistance === 'lt_1m' || odourDistance === '1_5m') odour = 'Slight';
+            else odour = 'Slight';
+        } else if (odourDetected === false) {
+            odour = 'None';
+        }
 
         let leachate = 'None';
         if (leachateObserved === 'yes') leachate = 'Yes';
@@ -6855,19 +7729,14 @@ const App = {
             transition: monitoring.transitionTemperature,
             outer: monitoring.outerTemperature,
             moisture: moistureValue,
-            oxygen: null,
-            turning: false,
-            mixing: false,
-            waterAdded: false,
-            waterAddedAmount: 0,
-            none: false
+            waterAddedAmount: waterAddedAmount
         };
 
         observation = {
             odour,
-            odourNote: '',
+            odourNote: previousRecord?.observation?.odourNote != null ? String(previousRecord.observation.odourNote) : '',
             leachate,
-            leachateNote: '',
+            leachateNote: previousRecord?.observation?.leachateNote != null ? String(previousRecord.observation.leachateNote) : '',
             notes
         };
 
@@ -6937,7 +7806,7 @@ const App = {
             this.appendBatchActivity(
                 batch,
                 'record_added',
-                `Added daily record for ${this.formatDate(record.date)}${record.composterId ? ` (Composter ${record.composterId})` : ''}`,
+                `Added daily record for ${this.formatDate(record.date)}${record.composterId ? ` (Composter ID: ${record.composterId})` : ''}`,
                 { recordId: record.id, date: record.date, composterId: record.composterId || '' }
             );
         }
@@ -7197,241 +8066,6 @@ const App = {
             amountInput.disabled = true;
             amountInput.value = 0;
         }
-    },
-
-    updateTempAverage() {
-        const getVal = (id) => {
-            const el = document.getElementById(id);
-            return (el && el.value !== '') ? parseFloat(el.value) : null;
-        };
-
-        const core = getVal('core');
-        const transition = getVal('transition');
-        const outer = getVal('outer');
-
-        const tempValues = [core, transition, outer].filter(v => v !== null && !isNaN(v));
-        const avg = tempValues.length > 0 ? (tempValues.reduce((s, v) => s + v, 0) / tempValues.length) : null;
-        
-        const avgTempEl = document.getElementById('avgTemp');
-
-        if (avgTempEl) {
-            avgTempEl.textContent = avg !== null ? Math.round(avg * 10) / 10 : '-';
-        }
-
-        this.updateSystemDiagnosis();
-    },
-
-    updateSystemDiagnosis() {
-        const getVal = (id) => {
-            const el = document.getElementById(id);
-            return (el && el.value !== '') ? parseFloat(el.value) : null;
-        };
-
-        const isICTA = this.isICTAUser();
-        const moisture = getVal('moisture');
-        const oxygen = getVal('oxygen');
-        const core = getVal('core');
-        const transition = getVal('transition');
-        const outer = getVal('outer');
-        const odour = document.querySelector('input[name="odour"]:checked')?.value;
-        const leachate = document.querySelector('input[name="leachate"]:checked')?.value;
-
-        const tempValues = [core, transition, outer].filter(v => v !== null && !isNaN(v));
-        const avgTemp = tempValues.length > 0 ? (tempValues.reduce((s, v) => s + v, 0) / tempValues.length) : null;
-
-        const alertsEl = document.getElementById('diagnosisAlerts');
-        if (!alertsEl) return;
-
-        // Check if there are any valid inputs
-        const hasValidInputs = (moisture !== null) || (oxygen !== null) || (avgTemp !== null) || (leachate === 'Yes') || (odour === 'Strong');
-
-        // If no valid inputs, hide the entire diagnosis section
-        if (!hasValidInputs) {
-            alertsEl.innerHTML = '';
-            return;
-        }
-
-        if (!isICTA) {
-            const checklist = [];
-            const recommendations = [];
-            let severity = 'success';
-
-            if (avgTemp === null) {
-                checklist.push({ icon: '⚪', text: 'Temperature: no data' });
-            } else if (avgTemp >= 70) {
-                checklist.push({ icon: '🔴', text: `Temperature high (${Math.round(avgTemp * 10) / 10}°C)` });
-                recommendations.push('Turn compost and add water to prevent overheating.');
-                severity = 'danger';
-            } else {
-                checklist.push({ icon: '✅', text: `Temperature OK (${Math.round(avgTemp * 10) / 10}°C)` });
-            }
-
-            if (moisture === null) {
-                checklist.push({ icon: '⚪', text: 'Moisture: not provided' });
-            } else if (moisture < 50) {
-                checklist.push({ icon: '⚠️', text: `Moisture low (${moisture}%)` });
-                recommendations.push('Material is too dry → consider adding water.');
-                if (severity !== 'danger') severity = 'warning';
-            } else if (moisture > 60) {
-                checklist.push({ icon: '⚠️', text: `Moisture high (${moisture}%)` });
-                recommendations.push('Material is too wet → consider adding structural material.');
-                if (severity !== 'danger') severity = 'warning';
-            } else {
-                checklist.push({ icon: '✅', text: `Moisture OK (${moisture}%)` });
-            }
-
-            if (oxygen === null) {
-                checklist.push({ icon: '⚪', text: 'Oxygen: not provided' });
-            } else if (oxygen < 10) {
-                checklist.push({ icon: '🔴', text: `Oxygen very low (${oxygen}%)` });
-                recommendations.push('Turn compost to improve aeration; consider adding structural material.');
-                severity = 'danger';
-            } else if (oxygen < 15) {
-                checklist.push({ icon: '⚠️', text: `Oxygen slightly low (${oxygen}%)` });
-                recommendations.push('Consider turning to improve aeration.');
-                if (severity !== 'danger') severity = 'warning';
-            } else {
-                checklist.push({ icon: '✅', text: `Oxygen OK (${oxygen}%)` });
-            }
-
-            if (leachate === 'Yes') {
-                checklist.push({ icon: '⚠️', text: 'Leachate detected' });
-                recommendations.push('Check drainage and consider adding dry structural material.');
-                if (severity !== 'danger') severity = 'warning';
-            }
-
-            if (odour === 'Strong') {
-                checklist.push({ icon: '⚠️', text: 'Strong odour detected' });
-                recommendations.push('Potential anaerobic conditions → turn immediately.');
-                if (severity !== 'danger') severity = 'warning';
-            }
-
-            const totalWasteInputEl = document.getElementById('totalWasteInput');
-            if (totalWasteInputEl) {
-                const totalWaste = totalWasteInputEl.value === '' ? 0 : parseFloat(totalWasteInputEl.value);
-                const totalStructuring = Array.from(document.querySelectorAll('#structuringMaterialsList .struct-kg')).reduce((s, el) => {
-                    if (!el || el.value === '') return s;
-                    const n = parseFloat(el.value);
-                    return s + (isNaN(n) ? 0 : n);
-                }, 0);
-                if (!isNaN(totalWaste) && totalWaste > 0) {
-                    const ratio = totalStructuring / totalWaste;
-                    if (ratio < 0.6) {
-                        recommendations.push('Low structural ratio → consider adding more structural material.');
-                        if (severity !== 'danger') severity = 'warning';
-                    }
-                }
-            }
-
-            const checklistHtml = checklist.map(i => `<div style="margin: 6px 0;">${i.icon} ${i.text}</div>`).join('');
-            const recHtml = recommendations.length > 0
-                ? `<div style="margin-top: 12px;"><strong>Recommendation:</strong><br><small>${recommendations.join('<br>')}</small></div>`
-                : '';
-
-            alertsEl.innerHTML = `
-                <div class="alert alert-${severity}">
-                    <div><strong>System Feedback</strong></div>
-                    ${checklistHtml}
-                    ${recHtml}
-                </div>
-            `;
-            return;
-        }
-
-        let alerts = [];
-
-        // Temperature Logic - Only if avgTemp is not null
-        if (avgTemp !== null && avgTemp >= 70) {
-            alerts.push({
-                type: 'danger',
-                icon: '🔴',
-                text: `Temperature too high (${Math.round(avgTemp * 10) / 10}°C)`,
-                action: 'Turn compost and add water to prevent overheating.'
-            });
-        }
-
-        // Oxygen Logic - ONLY if oxygen is NOT null
-        if (oxygen !== null && !isNaN(oxygen)) {
-            if (oxygen < 10) {
-                alerts.push({
-                    type: 'danger',
-                    icon: '🔴',
-                    text: `Low oxygen level detected (${oxygen}%)`,
-                    action: 'Check aeration conditions and turn compost. <br>→ Consider adding structuring material. <br>→ If bad odour is also observed, strong intervention is recommended.'
-                });
-            } else if (oxygen < 15) {
-                alerts.push({
-                    type: 'warning',
-                    icon: '⚠️',
-                    text: `Oxygen borderline low (${oxygen}%)`,
-                    action: 'Consider turning to improve aeration.'
-                });
-            }
-        }
-
-        // Moisture Logic - ONLY if moisture is NOT null
-        if (moisture !== null && !isNaN(moisture)) {
-            if (moisture < 50 || moisture > 60) {
-                let action = '';
-                if (moisture < 50) {
-                    action = 'Material is too dry → consider adding water.';
-                } else {
-                    action = 'Material is too wet → consider adding dry/structuring material.';
-                }
-                alerts.push({
-                    type: 'warning',
-                    icon: '⚠️',
-                    text: `Moisture is outside the optimal range (50–60%) - Current: ${moisture}%`,
-                    action: action
-                });
-            } else {
-                alerts.push({
-                    type: 'success',
-                    icon: '✅',
-                    text: `Moisture optimal (${moisture}%)`,
-                    action: 'Moisture within ideal range (50-60%).'
-                });
-            }
-        }
-
-        // Leachate Logic
-        if (leachate === 'Yes') {
-            alerts.push({
-                type: 'warning',
-                icon: '⚠️',
-                text: 'Leachate detected',
-                action: 'Check drainage and consider adding dry material'
-            });
-        }
-
-        // Odour Logic
-        if (odour === 'Strong') {
-            alerts.push({
-                type: 'warning',
-                icon: '⚠️',
-                text: 'Strong odour detected',
-                action: 'Potential anaerobic conditions - turn immediately'
-            });
-        }
-
-        if (alerts.length === 0) {
-            alerts.push({
-                type: 'success',
-                icon: '✅',
-                text: 'All parameters within normal range',
-                action: 'Continue regular monitoring.'
-            });
-        }
-
-        alertsEl.innerHTML = alerts.map(alert => `
-            <div class="alert alert-${alert.type}">
-                <span style="font-size: 1.5rem; margin-right: 10px;">${alert.icon}</span>
-                <div>
-                    <strong>${alert.text}</strong><br>
-                    <small>${alert.action}</small>
-                </div>
-            </div>
-        `).join('');
     },
 
     updateLossCalculation() {
@@ -8060,19 +8694,24 @@ const App = {
         const communityType = this.data.currentCommunityType === 'Other'
             ? (this.data.currentCommunityTypeOther || 'Other')
             : (this.data.currentCommunityType || '');
-        const getRecordWaterAddedAmount = (record) => {
-            const raw = record?.actionTaken?.waterAddedAmount != null ? record.actionTaken.waterAddedAmount : record?.waterAddedAmount;
-            const legacy = record?.process?.waterAddedAmount;
-            const picked = raw != null ? raw : legacy;
-            if (picked == null || picked === '') return '';
-            const value = parseFloat(picked);
-            return isNaN(value) ? '' : value;
+        const getRecordActionExportValues = (record) => {
+            const action = this.getICTAActionTakenState(record);
+            const waterAddedAmount = action.waterAddedAmount != null && !isNaN(action.waterAddedAmount)
+                ? (parseFloat(action.waterAddedAmount) || 0)
+                : 0;
+            return {
+                turning: !!action.actionTurning,
+                mixing: !!action.actionMixing,
+                waterAdded: !!action.actionAddedWater || waterAddedAmount > 0,
+                waterAddedAmount
+            };
         };
         const getRecordMoistureExportValues = (record) => {
-            const type = record?.monitoring?.moistureAssessmentType || ((record?.monitoring?.moistureQualitative || '') ? 'qualitative' : 'quantitative');
-            const quantitativeRaw = record?.monitoring?.moistureValue != null ? record.monitoring.moistureValue : record?.process?.moisture;
+            const monitoring = this.getICTAMonitoringState(record);
+            const type = monitoring.moistureAssessmentType || (monitoring.moistureQualitative ? 'qualitative' : 'quantitative');
+            const quantitativeRaw = monitoring.moistureValue;
             const quantitative = quantitativeRaw != null && quantitativeRaw !== '' && !isNaN(quantitativeRaw) ? (parseFloat(quantitativeRaw) || 0) : '';
-            const qualitative = record?.monitoring?.moistureQualitative || '';
+            const qualitative = monitoring.moistureQualitative || '';
             return {
                 type,
                 value: type === 'quantitative' ? quantitative : '',
@@ -8097,10 +8736,9 @@ const App = {
                 headers.push('Ambient (°C)', 'Core (°C)', 'Transition (°C)', 'Outer (°C)', 'Avg Temp (°C)');
             }
             if (document.getElementById('exportMoisture')?.checked) headers.push('Moisture Type', 'Moisture (%)', 'Moisture Assessment');
-            if (document.getElementById('exportOxygen')?.checked) headers.push('Oxygen (%)');
             if (document.getElementById('exportPhase')?.checked) headers.push('Phase');
             if (document.getElementById('exportOperations')?.checked) {
-                headers.push('Turning', 'Mixing', 'Water Added', `Water Added Amount (${inputUnit})`, 'None');
+                headers.push('Turning', 'Mixing', 'Water Added', 'Water Added Amount (L)');
             }
 
             if (document.getElementById('exportOdour')?.checked) headers.push('Odour', 'Odour Note');
@@ -8167,7 +8805,7 @@ const App = {
                 batchSummaryEntries.push(
                     [`Initial Composting Stock (${inputUnit})`, initialStockAmount],
                     [`Total Organic Input (${inputUnit})`, totalOrganicInput],
-                    [`Total Water Added (${inputUnit})`, totalWaterAdded],
+                    ['Total Water Added (L)', totalWaterAdded],
                     [`Batch Total System Input (${inputUnit})`, totalSystemInput]
                 );
             }
@@ -8195,8 +8833,10 @@ const App = {
             }
 
             records.forEach(r => {
-                const row = [r.date, `Composter ${r.composterId}`];
+                    const row = [r.date, r.composterId || ''];
                 const materialBreakdown = this.calculateRecordMaterialBreakdown(r);
+                const monitoringState = this.getICTAMonitoringState(r);
+                const actionExport = getRecordActionExportValues(r);
 
                 if (document.getElementById('exportTotalInput')?.checked) {
                     row.push(materialBreakdown.totalOrganicWaste, materialBreakdown.totalStructuralMaterial, materialBreakdown.totalOrganicInput);
@@ -8240,9 +8880,15 @@ const App = {
                 }
 
                 if (document.getElementById('exportTemperature')?.checked) {
-                    if (r.process) {
+                    if (monitoringState) {
                         const avg = this.calculateAvgTemperature(r);
-                        row.push(r.process.ambient, r.process.core, r.process.transition, r.process.outer, avg);
+                        row.push(
+                            monitoringState.ambientTemperature ?? '',
+                            monitoringState.coreTemperature ?? '',
+                            monitoringState.transitionTemperature ?? '',
+                            monitoringState.outerTemperature ?? '',
+                            avg
+                        );
                     } else {
                         row.push('', '', '', '', '');
                     }
@@ -8251,24 +8897,14 @@ const App = {
                     const moistureExport = getRecordMoistureExportValues(r);
                     row.push(moistureExport.type, moistureExport.value, moistureExport.assessment);
                 }
-                if (document.getElementById('exportOxygen')?.checked) {
-                    const oxygen = r.process?.oxygen;
-                    row.push(oxygen != null && oxygen !== '' ? oxygen : '');
-                }
                 if (document.getElementById('exportPhase')?.checked) {
                     row.push(phaseByRecordId ? (phaseByRecordId.get(r.id) || '') : '');
                 }
                 if (document.getElementById('exportOperations')?.checked) {
-                    if (r.process) {
-                        const waterAddedAmount = getRecordWaterAddedAmount(r);
-                        row.push(r.process.turning ? 'Yes' : 'No');
-                        row.push(r.process.mixing ? 'Yes' : 'No');
-                        row.push(r.process.waterAdded ? 'Yes' : 'No');
-                        row.push(waterAddedAmount);
-                        row.push(r.process.none ? 'Yes' : 'No');
-                    } else {
-                        row.push('No', 'No', 'No', '', 'No');
-                    }
+                    row.push(actionExport.turning ? 'Yes' : 'No');
+                    row.push(actionExport.mixing ? 'Yes' : 'No');
+                    row.push(actionExport.waterAdded ? 'Yes' : 'No');
+                    row.push(actionExport.waterAddedAmount);
                 }
 
                 if (document.getElementById('exportOdour')?.checked) {
