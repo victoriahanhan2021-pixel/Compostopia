@@ -97,7 +97,8 @@ const App = {
 
             const addBtn = target.closest('#addDailyRecordBtn');
             if (addBtn) {
-                if (typeof event.preventDefault === 'function') event.preventDefault();
+                const isAnchor = String(addBtn.tagName || '').toLowerCase() === 'a';
+                if (isAnchor) return;
                 const batchId = addBtn.getAttribute('data-batch-id') || (this.data.currentBatch ? this.data.currentBatch.id : null);
                 if (batchId) this.navigate('dailyRecord', { batchId });
                 return;
