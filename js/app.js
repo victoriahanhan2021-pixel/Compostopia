@@ -1716,7 +1716,7 @@ const App = {
         const woodFusta = (maintenance.woodFusta != null ? maintenance.woodFusta : input.woodFusta) || 0;
         const woodChips = (maintenance.woodChips != null ? maintenance.woodChips : input.woodChips) || 0;
         const breakdown = this.calculateRecordMaterialBreakdown({
-            ...record,
+            ...(record || {}),
             input,
             maintenance: {
                 ...maintenance,
