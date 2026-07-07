@@ -61,8 +61,9 @@ const App = {
     bindGlobalClickDelegation() {
         if (this.data.globalClickDelegationBound) return;
         document.addEventListener('click', (event) => {
-            const target = event.target;
-            if (!target || !target.closest) return;
+            let target = event.target;
+            if (target && target.nodeType === 3) target = target.parentElement;
+            if (!target || typeof target.closest !== 'function') return;
 
             const addBtn = target.closest('#addDailyRecordBtn');
             if (addBtn) {
