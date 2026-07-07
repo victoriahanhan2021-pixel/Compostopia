@@ -4550,6 +4550,7 @@ const App = {
         }
         const routeId = this.getBatchRouteId(batch);
         const escapedRouteId = this.escapeAttr(routeId);
+        const jsSafeRouteId = String(routeId).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 
         const sortedRecords = [...(batch.records || [])].sort((a, b) => new Date(a.date) - new Date(b.date));
         const recordsDescending = [...sortedRecords].reverse();
@@ -4752,7 +4753,7 @@ const App = {
                     <div class="btn-group">
                         ${batch.status === 'active' ? `
                             <button type="button" class="btn btn-primary" id="addDailyRecordBtn"
-                                data-batch-id="${escapedRouteId}">
+                                data-batch-id="${escapedRouteId}" onclick="app.navigate('dailyRecord', {batchId: '${jsSafeRouteId}'})">
                                 ➕ Add Daily Record
                             </button>
                         ` : `
