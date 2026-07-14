@@ -46,6 +46,7 @@ const App = {
         globalClickDelegationBound: false,
         batchGalleryPhotos: [],
         batchInfoPanel: null,
+        batchTransferHistoryExpanded: false,
         carbonReductionExpanded: false,
         carbonCalculationDetailsExpanded: false,
         carbonReductionDraft: {}
@@ -1335,6 +1336,12 @@ const App = {
         textEl.textContent = this.getModuleToggleLabel(label, isCompleted);
     },
 
+    updateModuleCompletionState(textEl, label, isCompleted) {
+        if (!textEl) return;
+        textEl.dataset.completed = isCompleted ? 'true' : 'false';
+        this.syncModuleToggleText(textEl, label);
+    },
+
     hasMonitoringStateContent(monitoring) {
         if (!monitoring) return false;
         const advanced = monitoring.advancedMonitoring || {};
@@ -2047,6 +2054,7 @@ const App = {
             }
             if (unitEl) unitEl.disabled = !enabled;
         });
+        this.refreshDailyRecordModuleCompletionStates();
     },
 
     getICTAMaintenanceState(record, batch) {
@@ -3068,6 +3076,128 @@ const App = {
             unit: this.getBatchInputUnitName(batch),
             notes: document.getElementById('materialTransferNotes')?.value || ''
         }, batch);
+    },
+
+    getActionTakenDraftStateFromDom() {
+        return {
+            actionTurning: !!document.getElementById('actionTurning')?.checked,
+            actionMixing: !!document.getElementById('actionMixing')?.checked,
+            actionAddedWater: !!document.getElementById('actionAddedWater')?.checked,
+            waterAddedAmount: parseFloat(document.getElementById('waterAddedAmount')?.value || '') || 0,
+            actionRemovedImpurities: !!document.getElementById('actionRemovedImpurities')?.checked,
+            removedImpuritiesDescription: document.getElementById('removedImpuritiesDescription')?.value || '',
+            actionOther: !!document.getElementById('actionOther')?.checked,
+            otherActionDescription: document.getElementById('otherActionDescription')?.value || ''
+        };
+    },
+
+    getPhotosDraftStateFromDom() {
+        return Array.isArray(this.data.ictaPhotoDraft) ? this.data.ictaPhotoDraft : [];
+    },
+
+    getNotesDraftStateFromDom() {
+        return document.getElementById('ictaNotesTextarea')?.value || '';
+    },
+
+    getMaintenanceDraftStateFromDom() {
+        const batch = this.data.currentBatch;
+        if (!batch) return null;
+        if (this.isICTAUser()) {
+            const getNumber = (id) => {
+                const el = document.getElementById(id);
+                if (!el || el.value === '') return 0;
+                const parsed = parseFloat(el.value);
+                return isNaN(parsed) ? 0 : parsed;
+            };
+            const additionalRows = Array.from(document.querySelectorAll('#maintenanceAdditionalInputsList .maintenance-additional-row'));
+            const additionalInputs = additionalRows.map((row) => {
+                const source = row.querySelector('.maintenance-additional-source')?.value || '';
+                const type = row.querySelector('input[type="radio"]:checked')?.value || 'organic';
+                const description = row.querySelector('.maintenance-additional-desc')?.value || '';
+                const amountRaw = row.querySelector('.maintenance-additional-amount')?.value;
+                const amount = amountRaw != null && amountRaw !== '' ? parseFloat(amountRaw) : 0;
+                return { source, type, description, amount: isNaN(amount) ? 0 : amount };
+            });
+            const additionalTotals = this.calculateAdditionalInputTotals(additionalInputs);
+            const foodWasteCocina = getNumber('foodWasteCocina');
+            const foodWastePlanta0 = getNumber('foodWastePlanta0');
+            const foodWastePlanta1 = getNumber('foodWastePlanta1');
+            const foodWastePlanta3 = getNumber('foodWastePlanta3');
+            const woodFusta = getNumber('woodFusta');
+            const woodChips = getNumber('woodChips');
+            const totalFoodWaste = foodWasteCocina + foodWastePlanta0 + foodWastePlanta1 + foodWastePlanta3;
+            const regularStructuralMaterial = woodFusta + woodChips;
+            const totalOrganicWaste = totalFoodWaste + additionalTotals.additionalOrganicMaterial;
+            const totalStructuralMaterial = regularStructuralMaterial + additionalTotals.additionalStructuralMaterial;
+            const totalMaterialInput = totalOrganicWaste + totalStructuralMaterial;
+            return {
+                batchUnit: this.getBatchInputUnitName(batch),
+                foodWasteCocina,
+                foodWastePlanta0,
+                foodWastePlanta1,
+                foodWastePlanta3,
+                totalFoodWaste,
+                woodFusta,
+                woodChips,
+                regularStructuralMaterial,
+                additionalInputs,
+                additionalOrganicMaterial: additionalTotals.additionalOrganicMaterial,
+                additionalStructuralMaterial: additionalTotals.additionalStructuralMaterial,
+                totalAdditionalInput: additionalTotals.totalAdditionalInput,
+                totalOrganicWaste,
+                totalStructuralMaterial,
+                totalMaterialInput,
+                totalOrganicInput: totalMaterialInput
+            };
+        }
+        const record = this.data.editingRecord
+            ? batch.records.find((item) => String(item.id) === String(this.data.editingRecord)) || null
+            : null;
+        return this.getNonICTAMaintenanceState(record, batch, this.getNonICTAMaintenanceDraftFromDom());
+    },
+
+    refreshDailyRecordModuleCompletionStates() {
+        if (this.data.currentPage !== 'dailyRecord') return;
+        const batch = this.data.currentBatch;
+        if (!batch) return;
+
+        const monitoringState = this.getMonitoringDraftStateFromDom();
+        const maintenanceState = this.getMaintenanceDraftStateFromDom();
+        const materialTransferState = this.getMaterialTransferFormState(batch, document.getElementById('recordDate')?.value || '');
+        const actionState = this.getActionTakenDraftStateFromDom();
+        const photosState = this.getPhotosDraftStateFromDom();
+        const notesState = this.getNotesDraftStateFromDom();
+
+        this.updateModuleCompletionState(
+            document.getElementById('monitoringModuleToggleText'),
+            'Monitoring Module',
+            this.hasMonitoringStateContent(monitoringState)
+        );
+        this.updateModuleCompletionState(
+            document.getElementById('maintenanceModuleToggleText'),
+            'Maintenance Module',
+            this.hasMaintenanceStateContent(maintenanceState)
+        );
+        this.updateModuleCompletionState(
+            document.getElementById('materialTransferToggleText'),
+            'Material Transfer',
+            this.hasMaterialTransferContent(materialTransferState)
+        );
+        this.updateModuleCompletionState(
+            document.getElementById('actionTakenToggleText'),
+            'Action Taken',
+            this.hasActionTakenContent(actionState)
+        );
+        this.updateModuleCompletionState(
+            document.getElementById('photoUploadToggleText'),
+            'Photo Upload',
+            this.hasPhotosContent(photosState)
+        );
+        this.updateModuleCompletionState(
+            document.getElementById('ictaNotesToggleText'),
+            'Notes (Optional)',
+            this.hasNotesContent(notesState)
+        );
     },
 
     renderICTANotesModule(notes) {
@@ -5104,6 +5234,7 @@ const App = {
         const transferOverview = this.collectBatchTransferData(batch);
         const incomingTransferDisplay = this.formatTransferSummaryText(transferOverview.incomingCount, transferOverview.incomingAmount, inputUnit);
         const outgoingTransferDisplay = this.formatTransferSummaryText(transferOverview.outgoingCount, transferOverview.outgoingAmount, inputUnit);
+        const transferHistoryExpanded = !!this.data.batchTransferHistoryExpanded;
 
         return `
             <div class="header">
@@ -5210,39 +5341,42 @@ const App = {
                 </div>
 
                 <div class="card">
-                    <div class="card-header">
-                        <h2 class="card-title">🔄 Transfer History</h2>
+                    <div style="display: flex; align-items: center; justify-content: space-between; cursor: pointer;" onclick="app.toggleBatchTransferHistory()">
+                        <h2 class="card-title" style="margin: 0;">🔄 Transfer History</h2>
+                        <span id="batchTransferHistoryToggleIcon" style="color: var(--gray); font-weight: 700;">${transferHistoryExpanded ? '▾' : '▸'}</span>
                     </div>
-                    ${transferOverview.history.length === 0 ? `
-                        <div class="empty-state">
-                            <div class="empty-state-icon">🔄</div>
-                            <h3>No Material Transfers Yet</h3>
-                            <p>Transfers involving this batch will appear here.</p>
-                        </div>
-                    ` : `
-                        <table class="table">
-                            <thead>
-                                <tr>
-                                    <th>Date</th>
-                                    <th>Route</th>
-                                    <th>Material</th>
-                                    <th>Amount</th>
-                                    <th>Notes</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                ${transferOverview.history.map((entry) => `
+                    <div id="batchTransferHistoryContent" style="${transferHistoryExpanded ? 'display:block; margin-top: 20px;' : 'display:none; margin-top: 20px;'}">
+                        ${transferOverview.history.length === 0 ? `
+                            <div class="empty-state">
+                                <div class="empty-state-icon">🔄</div>
+                                <h3>No Material Transfers Yet</h3>
+                                <p>Transfers involving this batch will appear here.</p>
+                            </div>
+                        ` : `
+                            <table class="table">
+                                <thead>
                                     <tr>
-                                        <td>${this.formatDate(entry.effectiveDate || entry.recordDate)}</td>
-                                        <td>${this.escapeHtml(`${entry.sourceBatchLabel} / ${entry.sourceComposterLabel} → ${entry.destinationBatchLabel} / ${entry.destinationComposterLabel}`)}</td>
-                                        <td>${this.escapeHtml(entry.materialType || '—')}</td>
-                                        <td>${this.formatNumber(entry.amount || 0, 3)} ${this.escapeHtml(entry.unit || inputUnit)}</td>
-                                        <td>${this.escapeHtml(entry.notes || '—')}</td>
+                                        <th>Date</th>
+                                        <th>Route</th>
+                                        <th>Material</th>
+                                        <th>Amount</th>
+                                        <th>Notes</th>
                                     </tr>
-                                `).join('')}
-                            </tbody>
-                        </table>
-                    `}
+                                </thead>
+                                <tbody>
+                                    ${transferOverview.history.map((entry) => `
+                                        <tr>
+                                            <td>${this.formatDate(entry.effectiveDate || entry.recordDate)}</td>
+                                            <td>${this.escapeHtml(`${entry.sourceBatchLabel} / ${entry.sourceComposterLabel} → ${entry.destinationBatchLabel} / ${entry.destinationComposterLabel}`)}</td>
+                                            <td>${this.escapeHtml(entry.materialType || '—')}</td>
+                                            <td>${this.formatNumber(entry.amount || 0, 3)} ${this.escapeHtml(entry.unit || inputUnit)}</td>
+                                            <td>${this.escapeHtml(entry.notes || '—')}</td>
+                                        </tr>
+                                    `).join('')}
+                                </tbody>
+                            </table>
+                        `}
+                    </div>
                 </div>
 
                 ${this.renderBatchTrendSection(batch)}
@@ -5423,9 +5557,8 @@ const App = {
 
                     ${isICTA ? this.renderICTAMaintenanceModule(batch, maintenanceState) : this.renderNonICTAMaintenanceModule(batch, maintenanceState)}
 
-                    ${this.renderMaterialTransferModule(batch, materialTransferState)}
-
                     ${this.renderICTAActionTakenModule(actionTakenState)}
+                    ${this.renderMaterialTransferModule(batch, materialTransferState)}
                     ${this.renderICTAPhotoUploadModule(photosState)}
                     ${this.renderICTANotesModule(notesState)}
 
@@ -6292,6 +6425,13 @@ const App = {
         }
 
         if (this.data.currentPage === 'dailyRecord') {
+            const dailyRecordForm = document.getElementById('dailyRecordForm');
+            if (dailyRecordForm && dailyRecordForm.dataset.moduleCompletionBound !== 'true') {
+                dailyRecordForm.dataset.moduleCompletionBound = 'true';
+                const refreshModuleStates = () => this.refreshDailyRecordModuleCompletionStates();
+                dailyRecordForm.addEventListener('input', refreshModuleStates);
+                dailyRecordForm.addEventListener('change', refreshModuleStates);
+            }
             this.updateICTAMoistureAssessmentVisibility();
             this.updateOdourAssessmentVisibility();
             this.updateAdvancedMonitoringFieldVisibility();
@@ -6303,6 +6443,7 @@ const App = {
             this.updateMaintenanceTotals();
             this.updateICTAActionTakenVisibility();
             this.updateICTAPhotoGridDom();
+            this.refreshDailyRecordModuleCompletionStates();
             if (!this.isICTAUser()) {
                 this.updateNonICTAMaintenanceRowVisibility();
                 this.updateNonICTAMaintenanceTotals();
@@ -6706,7 +6847,10 @@ const App = {
         if (!content) return;
         if (content.dataset.systemRecommendationBound === 'true') return;
         content.dataset.systemRecommendationBound = 'true';
-        const handler = () => this.updateSystemRecommendationDom();
+        const handler = () => {
+            this.updateSystemRecommendationDom();
+            this.refreshDailyRecordModuleCompletionStates();
+        };
         content.addEventListener('input', handler);
         content.addEventListener('change', handler);
     },
@@ -7112,6 +7256,7 @@ const App = {
         if (ratioEl) {
             ratioEl.textContent = method === 'volume' ? this.simplifyRatio(totalOrganicWaste, totalStructuralMaterial) : '';
         }
+        this.refreshDailyRecordModuleCompletionStates();
     },
 
     updateNonICTAMaintenanceRowVisibility() {
@@ -7180,13 +7325,30 @@ const App = {
             confirmText: 'Add',
             fields: [
                 { id: 'foodWasteSourceName', label: 'Source Name', type: 'text', value: '', placeholder: 'e.g., Community kitchen', required: true },
-                { id: 'foodWasteSourceType', label: 'Food Waste Type', type: 'select', value: suggested, options: typeOptions, required: true }
+                { id: 'foodWasteSourceType', label: 'Food Waste Type', type: 'select', value: suggested, options: typeOptions, required: true },
+                { id: 'foodWasteSourceTypeOther', label: 'Please Specify', type: 'text', value: '', placeholder: 'e.g., Seaweed waste', required: false, hidden: true }
             ],
+            onAfterOpen: (modal) => {
+                const typeEl = modal.querySelector('#foodWasteSourceType');
+                const otherGroup = modal.querySelector('[data-field-id="foodWasteSourceTypeOther"]');
+                const otherInput = modal.querySelector('#foodWasteSourceTypeOther');
+                if (!typeEl || !otherGroup || !otherInput) return;
+                const apply = () => {
+                    const isOther = String(typeEl.value || '') === 'Other';
+                    otherGroup.style.display = isOther ? 'block' : 'none';
+                    if (!isOther) otherInput.value = '';
+                };
+                typeEl.addEventListener('change', apply);
+                apply();
+            },
             onConfirm: async (values) => {
                 const source = String(values.foodWasteSourceName || '').trim();
-                const type = String(values.foodWasteSourceType || '').trim();
+                const selectedType = String(values.foodWasteSourceType || '').trim();
+                const otherType = String(values.foodWasteSourceTypeOther || '').trim();
+                const type = selectedType === 'Other' ? otherType : selectedType;
                 if (!source) throw new Error('Source Name is required.');
-                if (!type) throw new Error('Food Waste Type is required.');
+                if (!selectedType) throw new Error('Food Waste Type is required.');
+                if (selectedType === 'Other' && !otherType) throw new Error('Please specify the Food Waste Type.');
 
                 const exists = batch.foodWasteLibrary.some((item) => item.active !== false
                     && String(item.source || '').trim().toLowerCase() === source.toLowerCase()
@@ -7232,15 +7394,35 @@ const App = {
         this.ensureNonICTAMaterialLibraries(batch);
         const item = batch.foodWasteLibrary.find((entry) => String(entry.id) === String(sourceId));
         if (!item) return;
+        const baseOptions = this.getNonICTAFoodTypeOptions();
+        const options = baseOptions.includes(item.type) ? baseOptions : [item.type, ...baseOptions];
         this.showFormModal({
             id: 'editFoodWasteTypeModal',
             title: 'Edit Food Waste Type',
             confirmText: 'Save',
             fields: [
-                { id: 'editFoodWasteTypeValue', label: 'Food Waste Type', type: 'select', value: item.type || '', options: this.getNonICTAFoodTypeOptions(), required: true }
+                { id: 'editFoodWasteTypeValue', label: 'Food Waste Type', type: 'select', value: item.type || '', options, required: true },
+                { id: 'editFoodWasteTypeOther', label: 'Please Specify', type: 'text', value: '', placeholder: 'e.g., Seaweed waste', required: false, hidden: true }
             ],
+            onAfterOpen: (modal) => {
+                const typeEl = modal.querySelector('#editFoodWasteTypeValue');
+                const otherGroup = modal.querySelector('[data-field-id="editFoodWasteTypeOther"]');
+                const otherInput = modal.querySelector('#editFoodWasteTypeOther');
+                if (!typeEl || !otherGroup || !otherInput) return;
+                const apply = () => {
+                    const isOther = String(typeEl.value || '') === 'Other';
+                    otherGroup.style.display = isOther ? 'block' : 'none';
+                    if (!isOther) otherInput.value = '';
+                };
+                typeEl.addEventListener('change', apply);
+                apply();
+            },
             onConfirm: async (values) => {
-                const nextType = String(values.editFoodWasteTypeValue || '').trim();
+                const selectedType = String(values.editFoodWasteTypeValue || '').trim();
+                const otherType = String(values.editFoodWasteTypeOther || '').trim();
+                if (!selectedType) return;
+                const nextType = selectedType === 'Other' ? otherType : selectedType;
+                if (selectedType === 'Other' && !otherType) throw new Error('Please specify the Food Waste Type.');
                 if (!nextType || nextType === item.type) return;
                 item.type = nextType;
                 await this.persistNonICTAMaterialLibraryChange('✅ Food waste type updated');
@@ -7368,6 +7550,7 @@ const App = {
         if (totalOrganicWasteEl) totalOrganicWasteEl.textContent = this.formatNumber(totalOrganicWaste, 3);
         if (totalStructuralOverallEl) totalStructuralOverallEl.textContent = this.formatNumber(totalStructuralMaterial, 3);
         if (totalMaterialInputEl) totalMaterialInputEl.textContent = this.formatNumber(totalMaterialInput, 3);
+        this.refreshDailyRecordModuleCompletionStates();
     },
 
     toggleICTAActionTakenModule() {
@@ -7413,6 +7596,7 @@ const App = {
             const desc = document.getElementById('otherActionDescription');
             if (desc) desc.value = '';
         }
+        this.refreshDailyRecordModuleCompletionStates();
     },
 
     toggleICTAMaterialTransferModule() {
@@ -7454,6 +7638,7 @@ const App = {
 
         updateComposterSelect(sourceBatchSelect, sourceComposterSelect);
         updateComposterSelect(destinationBatchSelect, destinationComposterSelect);
+        this.refreshDailyRecordModuleCompletionStates();
     },
 
     syncMaterialTransferDateWithRecordDate() {
@@ -7465,6 +7650,12 @@ const App = {
             transferDateInput.value = recordDate;
         }
         transferDateInput.dataset.recordDate = recordDate;
+        this.refreshDailyRecordModuleCompletionStates();
+    },
+
+    toggleBatchTransferHistory() {
+        this.data.batchTransferHistoryExpanded = !this.data.batchTransferHistoryExpanded;
+        this.render();
     },
 
     toggleICTAPhotoUploadModule() {
@@ -7593,6 +7784,7 @@ const App = {
         if (!grid) return;
         const photos = Array.isArray(this.data.ictaPhotoDraft) ? this.data.ictaPhotoDraft : [];
         grid.innerHTML = this.renderICTAPhotoGridHtml(photos);
+        this.refreshDailyRecordModuleCompletionStates();
     },
 
     viewICTAPhoto(index) {
@@ -7780,7 +7972,8 @@ const App = {
             confirmClass = 'btn btn-primary',
             cancelClass = 'btn btn-secondary',
             onConfirm = null,
-            onCancel = null
+            onCancel = null,
+            onAfterOpen = null
         } = options;
 
         try {
@@ -7799,6 +7992,7 @@ const App = {
             const placeholder = field?.placeholder != null ? String(field.placeholder) : '';
             const required = field?.required === true;
             const helpText = field?.helpText != null ? String(field.helpText) : '';
+            const hidden = field?.hidden === true;
             const optionsList = Array.isArray(field?.options) ? field.options : [];
             const optionsHtml = optionsList.map((opt) => {
                 const raw = String(opt);
@@ -7813,7 +8007,7 @@ const App = {
                 : `<input class="form-input" id="${this.escapeAttr(fieldId)}" type="${this.escapeAttr(type)}" value="${this.escapeAttr(value)}" placeholder="${this.escapeAttr(placeholder)}" ${required ? 'required' : ''}>`;
 
             return `
-                <div class="form-group">
+                <div class="form-group" data-field-id="${this.escapeAttr(fieldId)}" style="${hidden ? 'display:none;' : ''}">
                     <label class="form-label ${required ? 'required' : ''}" for="${this.escapeAttr(fieldId)}">${this.escapeHtml(label)}</label>
                     ${helpText ? `<div style="margin-bottom: 8px; color: var(--gray); font-size: 0.9rem;">${this.escapeHtml(helpText)}</div>` : ''}
                     ${control}
@@ -7892,6 +8086,12 @@ const App = {
         }
 
         document.body.appendChild(modal);
+        if (typeof onAfterOpen === 'function') {
+            try {
+                onAfterOpen(modal);
+            } catch (error) {
+            }
+        }
 
         const firstId = fields.find((f) => f?.id)?.id;
         if (firstId) {
