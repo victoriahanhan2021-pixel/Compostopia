@@ -6159,9 +6159,9 @@ const App = {
                                         ${this.renderExportFieldOption('dailyRecords', 'exportTemperature', 'Temperature', 'Exports ambient, core, transition, outer, and average temperature values.')}
                                         ${this.renderExportFieldOption('dailyRecords', 'exportMoisture', 'Moisture', 'Exports moisture type, moisture percentage, or qualitative moisture assessment.')}
                                         ${this.renderExportFieldOption('dailyRecords', 'exportPhase', 'Phase', 'Exports the composting phase tracked for each record.')}
-                                        ${this.renderExportFieldOption('dailyRecords', 'exportOperations', 'Actions and Operations', 'Exports turning, mixing, water added, and water added amount.')}
-                                        ${this.renderExportFieldOption('dailyRecords', 'exportOdour', 'Odour', 'Exports odour observation and any odour notes recorded on that date.')}
-                                        ${this.renderExportFieldOption('dailyRecords', 'exportLeachate', 'Leachate', 'Exports leachate observation and any related notes recorded on that date.')}
+                                        ${this.renderExportFieldOption('dailyRecords', 'exportOperations', 'Actions and Operations', 'Exports turning, mixing, water added (+ amount), removed impurities (+ description), and other action (+ description).')}
+                                        ${this.renderExportFieldOption('dailyRecords', 'exportOdour', 'Odour', 'Exports odour detected, odour type, detection distance, and any odour notes recorded on that date.')}
+                                        ${this.renderExportFieldOption('dailyRecords', 'exportLeachate', 'Leachate', 'Exports leachate observed status and any related notes recorded on that date.')}
                                         ${this.renderExportFieldOption('dailyRecords', 'exportRecordMetadata', 'Operator Traceability', 'Exports created by, created email, created time, last edited by, and last edited time for each daily record.')}
                                     </div>
                                 </div>
@@ -9835,7 +9835,11 @@ const App = {
                 turning: !!action.actionTurning,
                 mixing: !!action.actionMixing,
                 waterAdded: !!action.actionAddedWater || waterAddedAmount > 0,
-                waterAddedAmount
+                waterAddedAmount,
+                removedImpurities: !!action.actionRemovedImpurities,
+                removedImpuritiesDescription: String(action.removedImpuritiesDescription || '').trim(),
+                otherAction: !!action.actionOther,
+                otherActionDescription: String(action.otherActionDescription || '').trim()
             };
         };
         const getRecordMoistureExportValues = (record) => {
@@ -9850,6 +9854,37 @@ const App = {
                 assessment: type === 'qualitative' ? qualitative : ''
             };
         };
+        const formatOdourTypeLabel = (value) => {
+            const v = String(value || '').trim();
+            if (!v) return '';
+            const map = {
+                earth: 'Earthy',
+                vinegar: 'Vinegar-like',
+                rotten: 'Rotten',
+                ammonia: 'Ammonia'
+            };
+            return map[v] || v;
+        };
+        const formatOdourDistanceLabel = (value) => {
+            const v = String(value || '').trim();
+            if (!v) return '';
+            const map = {
+                lt_1m: '<1 m',
+                '1_5m': '1–5 m',
+                gt_5m: '>5 m'
+            };
+            return map[v] || v;
+        };
+        const formatLeachateLabel = (value) => {
+            const v = String(value || '').trim();
+            if (!v) return '';
+            const map = {
+                yes: 'Yes',
+                no: 'No',
+                not_assessed: 'Not assessed'
+            };
+            return map[v] || v;
+        };
         if (dailyRecordsEnabled) {
             if (document.getElementById('exportTotalInput')?.checked) headers.push(`Organic Waste (${inputUnit})`, `Structural Material (${inputUnit})`, `Total Material Input (${inputUnit})`);
             if (isICTA) {
@@ -9859,22 +9894,31 @@ const App = {
                 if (document.getElementById('exportStructural')?.checked) headers.push('Ratio', `Wood (Fusta) (${inputUnit})`, `Wood chips (${inputUnit})`);
             } else {
                 if (document.getElementById('exportTotalWasteInput')?.checked) headers.push(`Regular Organic Waste (${inputUnit})`);
-                if (document.getElementById('exportStructuralMaterials')?.checked) headers.push('Structural Materials (JSON)');
+                if (document.getElementById('exportStructuralMaterials')?.checked) headers.push('Structural Materials');
             }
             if (document.getElementById('exportAdditionalInput')?.checked) headers.push(`Additional Organic Material (${inputUnit})`, `Additional Structural Material (${inputUnit})`, `Total Additional Input (${inputUnit})`, 'Additional Source', 'Additional Type', `Additional Amount (${inputUnit})`);
             if (document.getElementById('exportQuality')?.checked) headers.push('Quality');
 
             if (document.getElementById('exportTemperature')?.checked) {
-                headers.push('Ambient (°C)', 'Core (°C)', 'Transition (°C)', 'Outer (°C)', 'Avg Temp (°C)');
+                headers.push('Ambient (°C)', 'Ambient Humidity (%)', 'Core (°C)', 'Transition (°C)', 'Outer (°C)', 'Avg Temp (°C)');
             }
             if (document.getElementById('exportMoisture')?.checked) headers.push('Moisture Type', 'Moisture (%)', 'Moisture Assessment');
             if (document.getElementById('exportPhase')?.checked) headers.push('Phase');
             if (document.getElementById('exportOperations')?.checked) {
-                headers.push('Turning', 'Mixing', 'Water Added', 'Water Added Amount (L)');
+                headers.push(
+                    'Turning',
+                    'Mixing',
+                    'Water Added',
+                    'Water Added Amount (L)',
+                    'Removed Impurities',
+                    'Removed Impurities Description',
+                    'Other Action',
+                    'Other Action Description'
+                );
             }
 
-            if (document.getElementById('exportOdour')?.checked) headers.push('Odour', 'Odour Note');
-            if (document.getElementById('exportLeachate')?.checked) headers.push('Leachate', 'Leachate Note');
+            if (document.getElementById('exportOdour')?.checked) headers.push('Odour Detected', 'Odour Type', 'Odour Distance', 'Odour Note');
+            if (document.getElementById('exportLeachate')?.checked) headers.push('Leachate Observed', 'Leachate Note');
             if (document.getElementById('exportRecordMetadata')?.checked) headers.push('Created By', 'Created Email', 'Created Time', 'Last Edited By', 'Last Edited Time');
         }
 
@@ -9991,21 +10035,55 @@ const App = {
                     }
                     if (document.getElementById('exportStructuralMaterials')?.checked) {
                         const materials = (r.input && Array.isArray(r.input.structuringMaterials)) ? r.input.structuringMaterials : [];
-                        row.push(JSON.stringify(materials));
+                        const formatted = materials
+                            .map((m) => {
+                                const name = String(m?.type || '').trim();
+                                const amt = (m?.kg != null && !isNaN(m.kg)) ? (parseFloat(m.kg) || 0) : null;
+                                if (!name && amt == null) return '';
+                                if (amt == null) return name;
+                                return `${name}: ${amt}`;
+                            })
+                            .filter(Boolean)
+                            .join('; ');
+                        row.push(formatted);
                     }
                 }
                 if (document.getElementById('exportAdditionalInput')?.checked) {
-                    const enabled = (r.input && r.input.additionalInput && r.input.additionalInput.enabled) || (r.input && Array.isArray(r.input.additionalInputs) && r.input.additionalInputs.length > 0);
-                    if (enabled && r.input) {
-                        const items = Array.isArray(r.input.additionalInputs)
-                            ? r.input.additionalInputs
-                            : [{ source: r.input.additionalInput?.source || '', type: r.input.additionalInput?.type || '', weight: r.input.additionalInput?.weight || 0 }];
-                        const sources = items.map(i => (i && i.source) ? i.source : '').filter(Boolean).join('; ');
-                        const types = items.map(i => (i && i.type) ? i.type : '').filter(Boolean).join('; ');
-                        const weights = items.reduce((s, i) => s + ((i && i.weight != null && !isNaN(i.weight)) ? (parseFloat(i.weight) || 0) : 0), 0);
-                        row.push(materialBreakdown.additionalOrganicMaterial, materialBreakdown.additionalStructuralMaterial, materialBreakdown.totalAdditionalInput, sources, types, weights);
+                    const items = Array.isArray(materialBreakdown.additionalInputs) ? materialBreakdown.additionalInputs : [];
+                    if (items.length > 0) {
+                        const sources = items
+                            .map((i) => {
+                                const source = String(i?.source || '').trim();
+                                const desc = String(i?.description || '').trim();
+                                if (!source && !desc) return '';
+                                if (source && desc) return `${source} - ${desc}`;
+                                return source || desc;
+                            })
+                            .filter(Boolean)
+                            .join('; ');
+                        const types = items
+                            .map((i) => {
+                                const t = String(i?.type || '').trim();
+                                if (t === 'structural') return 'Structural Material';
+                                if (t === 'organic') return 'Organic Material';
+                                return t;
+                            })
+                            .filter(Boolean)
+                            .join('; ');
+                        const amounts = items
+                            .map((i) => (i?.amount != null && !isNaN(i.amount)) ? String(parseFloat(i.amount) || 0) : '')
+                            .filter(Boolean)
+                            .join('; ');
+                        row.push(
+                            materialBreakdown.additionalOrganicMaterial,
+                            materialBreakdown.additionalStructuralMaterial,
+                            materialBreakdown.totalAdditionalInput,
+                            sources,
+                            types,
+                            amounts
+                        );
                     } else {
-                        row.push(0, 0, 0, '', '', 0);
+                        row.push(0, 0, 0, '', '', '');
                     }
                 }
                 if (document.getElementById('exportQuality')?.checked) {
@@ -10017,13 +10095,14 @@ const App = {
                         const avg = this.calculateAvgTemperature(r);
                         row.push(
                             monitoringState.ambientTemperature ?? '',
+                            monitoringState.ambientHumidity ?? '',
                             monitoringState.coreTemperature ?? '',
                             monitoringState.transitionTemperature ?? '',
                             monitoringState.outerTemperature ?? '',
                             avg
                         );
                     } else {
-                        row.push('', '', '', '', '');
+                        row.push('', '', '', '', '', '');
                     }
                 }
                 if (document.getElementById('exportMoisture')?.checked) {
@@ -10038,14 +10117,21 @@ const App = {
                     row.push(actionExport.mixing ? 'Yes' : 'No');
                     row.push(actionExport.waterAdded ? 'Yes' : 'No');
                     row.push(actionExport.waterAddedAmount);
+                    row.push(actionExport.removedImpurities ? 'Yes' : 'No');
+                    row.push(actionExport.removedImpuritiesDescription || '');
+                    row.push(actionExport.otherAction ? 'Yes' : 'No');
+                    row.push(actionExport.otherActionDescription || '');
                 }
 
                 if (document.getElementById('exportOdour')?.checked) {
-                    row.push(r.observation?.odour || '');
+                    const odourDetected = monitoringState?.odourDetected;
+                    row.push(odourDetected === true ? 'Yes' : (odourDetected === false ? 'No' : ''));
+                    row.push(formatOdourTypeLabel(monitoringState?.odourType));
+                    row.push(formatOdourDistanceLabel(monitoringState?.odourDistance));
                     row.push(r.observation?.odourNote || '');
                 }
                 if (document.getElementById('exportLeachate')?.checked) {
-                    row.push(r.observation?.leachate || '');
+                    row.push(formatLeachateLabel(monitoringState?.leachateObserved));
                     row.push(r.observation?.leachateNote || '');
                 }
                 if (document.getElementById('exportRecordMetadata')?.checked) {
@@ -10083,7 +10169,7 @@ const App = {
                         'Destination Batch',
                         'Destination Composter',
                         'Material Type',
-                        `Transferred Amount (${inputUnit})`,
+                        'Transferred Amount',
                         'Unit',
                         'Notes'
                     ], 'header');
@@ -10146,42 +10232,64 @@ const App = {
         let blob;
         let downloadName;
         if (format === 'excel') {
-            const maxCols = Math.max(2, ...exportRows.map((row) => row.values.length || 0));
-            const renderExcelRow = (row) => {
-                if (row.kind === 'blank') {
-                    return `<tr><td colspan="${maxCols}" style="height:12px; border:none; background:#FFFFFF;"></td></tr>`;
-                }
-                if (row.kind === 'section') {
-                    return `<tr><td colspan="${maxCols}" style="background:#DCEBFF; color:#1E3A5F; font-weight:700; font-size:15px; padding:10px 12px; border:1px solid #BFD2EC;">${escapeHtml(row.values[0] || '')}</td></tr>`;
-                }
-                const isHeader = row.kind === 'header';
-                const isNote = row.kind === 'note';
-                const tag = isHeader ? 'th' : 'td';
-                const baseStyle = isHeader
-                    ? 'background:#EEF4FB; color:#2F3A48; font-weight:700; padding:8px 10px; border:1px solid #D7E2EE; text-align:left;'
-                    : isNote
-                        ? 'background:#FFFBEA; color:#7A6222; padding:9px 10px; border:1px solid #F1E1A6;'
-                        : 'background:#FFFFFF; color:#2F3A48; padding:8px 10px; border:1px solid #E3EAF2; vertical-align:top;';
-                const cells = [];
-                for (let i = 0; i < maxCols; i += 1) {
-                    const value = row.values[i] || '';
-                    cells.push(`<${tag} style="${baseStyle}">${escapeHtml(value)}</${tag}>`);
-                }
-                return `<tr>${cells.join('')}</tr>`;
+            const renderTable = (rows) => {
+                const maxCols = Math.max(1, ...rows.map((r) => r.values.length || 0));
+                const renderRow = (row) => {
+                    const isHeader = row.kind === 'header';
+                    const isNote = row.kind === 'note';
+                    const tag = isHeader ? 'th' : 'td';
+                    const baseStyle = isHeader
+                        ? 'background:#EEF4FB; color:#2F3A48; font-weight:700; padding:8px 10px; border:1px solid #D7E2EE; text-align:left; white-space:nowrap;'
+                        : isNote
+                            ? 'background:#FFFBEA; color:#7A6222; padding:9px 10px; border:1px solid #F1E1A6;'
+                            : 'background:#FFFFFF; color:#2F3A48; padding:8px 10px; border:1px solid #E3EAF2; vertical-align:top; white-space:normal;';
+                    const cells = [];
+                    for (let i = 0; i < maxCols; i += 1) {
+                        const value = row.values[i] || '';
+                        cells.push(`<${tag} style="${baseStyle}">${escapeHtml(value)}</${tag}>`);
+                    }
+                    return `<tr>${cells.join('')}</tr>`;
+                };
+                return `
+                    <table style="border-collapse: collapse; width: 100%; margin-top: 8px; margin-bottom: 16px;">
+                        ${rows.map(renderRow).join('\n')}
+                    </table>
+                `;
             };
+
+            const parts = [];
+            let currentTableRows = [];
+            const flushTable = () => {
+                if (currentTableRows.length === 0) return;
+                parts.push(renderTable(currentTableRows));
+                currentTableRows = [];
+            };
+
+            exportRows.forEach((row) => {
+                if (row.kind === 'section') {
+                    flushTable();
+                    parts.push(`<div style="margin-top:18px; background:#DCEBFF; color:#1E3A5F; font-weight:700; font-size:15px; padding:10px 12px; border:1px solid #BFD2EC;">${escapeHtml(row.values[0] || '')}</div>`);
+                    return;
+                }
+                if (row.kind === 'blank') {
+                    flushTable();
+                    parts.push(`<div style="height: 10px;"></div>`);
+                    return;
+                }
+                currentTableRows.push(row);
+            });
+            flushTable();
+
             const workbookHtml = `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <style>
 body { font-family: Arial, sans-serif; }
-table { border-collapse: collapse; width: 100%; }
 </style>
 </head>
 <body>
-<table>
-${exportRows.map(renderExcelRow).join('\n')}
-</table>
+${parts.join('\n')}
 </body>
 </html>`;
             blob = new Blob([workbookHtml], { type: 'application/vnd.ms-excel;charset=utf-8;' });
