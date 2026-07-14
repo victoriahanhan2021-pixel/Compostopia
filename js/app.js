@@ -146,7 +146,11 @@ const App = {
 
     bindAuthState() {
         firebaseAuth.onAuthStateChanged(async (user) => {
-            this.data.currentUser = user ? { uid: user.uid, email: user.email } : null;
+            this.data.currentUser = user ? {
+                uid: user.uid,
+                email: user.email,
+                displayName: user.displayName || ''
+            } : null;
 
             if (this.data.currentUser) {
                 await this.loadData();
@@ -697,16 +701,17 @@ const App = {
     },
 
     buildCloudRecordPayload(record) {
+        const normalizedRecord = this.normalizeRecordForCompatibility(record);
         const cloudPhotosEnabled = this.isCloudPhotoStorageEnabled();
-        const photos = cloudPhotosEnabled && Array.isArray(record?.uploadedPhotos) ? record.uploadedPhotos : [];
+        const photos = cloudPhotosEnabled && Array.isArray(normalizedRecord?.uploadedPhotos) ? normalizedRecord.uploadedPhotos : [];
         const cloudPhotos = cloudPhotosEnabled
             ? this.normalizePhotoList(photos)
                 .map((photo) => this.serializePhotoItemForCloud(photo))
                 .filter(Boolean)
             : [];
         return this.removeUndefinedDeep({
-            ...record,
-            id: String(record?.id || ''),
+            ...normalizedRecord,
+            id: String(normalizedRecord?.id || ''),
             uploadedPhotos: cloudPhotos,
             uploadedPhotosCount: cloudPhotos.length,
             updatedAt: firebase.firestore.FieldValue.serverTimestamp()
@@ -741,11 +746,269 @@ const App = {
 
     normalizeCloudRecord(doc) {
         const data = doc.data() || {};
-        return {
+        return this.normalizeRecordForCompatibility({
             ...data,
             id: String(data.id || doc.id),
             uploadedPhotos: this.normalizePhotoList(data.uploadedPhotos)
+        });
+    },
+
+    normalizeBatchForCompatibility(batch) {
+        if (!batch) return batch;
+        const records = Array.isArray(batch.records) ? batch.records : [];
+        return {
+            ...batch,
+            records: records.map((record) => this.normalizeRecordForCompatibility(record, batch))
         };
+    },
+
+    getDefaultRecordMetadata() {
+        return {
+            createdByUID: '',
+            createdByEmail: '',
+            createdByName: '',
+            createdAt: '',
+            lastEditedByUID: '',
+            lastEditedByEmail: '',
+            lastEditedByName: '',
+            lastEditedAt: ''
+        };
+    },
+
+    normalizeRecordMetadata(raw) {
+        const base = this.getDefaultRecordMetadata();
+        const input = raw && typeof raw === 'object' ? raw : {};
+        return {
+            ...base,
+            createdByUID: String(input.createdByUID || ''),
+            createdByEmail: String(input.createdByEmail || ''),
+            createdByName: String(input.createdByName || ''),
+            createdAt: String(input.createdAt || ''),
+            lastEditedByUID: String(input.lastEditedByUID || ''),
+            lastEditedByEmail: String(input.lastEditedByEmail || ''),
+            lastEditedByName: String(input.lastEditedByName || ''),
+            lastEditedAt: String(input.lastEditedAt || '')
+        };
+    },
+
+    getDefaultMaterialTransfer() {
+        return {
+            performed: false,
+            transferDate: '',
+            sourceBatchId: '',
+            sourceComposterId: '',
+            destinationBatchId: '',
+            destinationComposterId: '',
+            materialType: '',
+            amount: 0,
+            unit: '',
+            notes: ''
+        };
+    },
+
+    normalizeMaterialTransfer(raw, batch = null) {
+        const base = this.getDefaultMaterialTransfer();
+        const input = raw && typeof raw === 'object' ? raw : {};
+        const hasContent = [
+            input.transferDate,
+            input.sourceBatchId,
+            input.sourceComposterId,
+            input.destinationBatchId,
+            input.destinationComposterId,
+            input.materialType,
+            input.notes
+        ].some((value) => String(value || '').trim() !== '') || (input.amount != null && !isNaN(input.amount) && (parseFloat(input.amount) || 0) > 0);
+        const performed = input.performed === true || input.performed === 'true' || hasContent;
+        const parsedAmount = input.amount != null && input.amount !== '' ? parseFloat(input.amount) : 0;
+        const unit = performed
+            ? String(input.unit || this.getBatchInputUnitName(batch) || '')
+            : String(input.unit || '');
+        return {
+            ...base,
+            performed,
+            transferDate: String(input.transferDate || ''),
+            sourceBatchId: String(input.sourceBatchId || ''),
+            sourceComposterId: String(input.sourceComposterId || ''),
+            destinationBatchId: String(input.destinationBatchId || ''),
+            destinationComposterId: String(input.destinationComposterId || ''),
+            materialType: String(input.materialType || ''),
+            amount: isNaN(parsedAmount) ? 0 : parsedAmount,
+            unit,
+            notes: String(input.notes || '')
+        };
+    },
+
+    normalizeRecordForCompatibility(record, batch = null) {
+        const raw = record && typeof record === 'object' ? record : {};
+        return {
+            ...raw,
+            id: String(raw.id || ''),
+            uploadedPhotos: this.normalizePhotoList(raw.uploadedPhotos),
+            materialTransfer: this.normalizeMaterialTransfer(raw.materialTransfer, batch),
+            metadata: this.normalizeRecordMetadata(raw.metadata)
+        };
+    },
+
+    getBatchComposterIds(batch) {
+        const compostingInfo = batch?.compostingSystemInformation || {};
+        const composterIdsFromTable = Array.isArray(compostingInfo.composters)
+            ? compostingInfo.composters
+                .map((composter) => (composter && composter.composterId != null) ? String(composter.composterId).trim() : '')
+                .filter((value) => !!value)
+            : [];
+        const fallbackCount = (compostingInfo.numberOfCompostersUsed != null && !isNaN(compostingInfo.numberOfCompostersUsed))
+            ? Math.max(1, Math.min(50, parseInt(compostingInfo.numberOfCompostersUsed, 10)))
+            : 2;
+        return composterIdsFromTable.length > 0
+            ? Array.from(new Set(composterIdsFromTable))
+            : Array.from({ length: fallbackCount }, (_, index) => String(index + 1));
+    },
+
+    formatComposterLabel(composterId) {
+        const value = String(composterId || '').trim();
+        if (!value) return '—';
+        return /^composter\b/i.test(value) ? value : `Composter ${value}`;
+    },
+
+    findBatchByExactId(batchId) {
+        const target = String(batchId || '').trim();
+        if (!target) return null;
+        return this.data.batches.find((batch) => (
+            String(batch?.id || '').trim() === target
+            || String(batch?.cloudId || '').trim() === target
+            || String(this.getBatchRouteId(batch) || '').trim() === target
+        )) || null;
+    },
+
+    getCurrentOperatorIdentity() {
+        const authUser = firebaseAuth.currentUser || null;
+        const currentUser = this.data.currentUser || {};
+        const uid = String(currentUser.uid || authUser?.uid || '').trim();
+        const email = String(currentUser.email || authUser?.email || '').trim();
+        const cachedProfile = uid ? (this.loadCachedUserProfile(uid) || {}) : {};
+        const rawName = String(
+            currentUser.displayName
+            || authUser?.displayName
+            || cachedProfile.name
+            || cachedProfile.fullName
+            || cachedProfile.displayName
+            || ''
+        ).trim();
+        const emailFallback = email.includes('@') ? email.split('@')[0] : email;
+        return {
+            uid,
+            email,
+            name: rawName || emailFallback || ''
+        };
+    },
+
+    getMaterialTransferState(record, batch, recordDate = '') {
+        const normalizedRecord = this.normalizeRecordForCompatibility(record, batch);
+        const base = normalizedRecord.materialTransfer || this.getDefaultMaterialTransfer();
+        const composterIds = this.getBatchComposterIds(batch);
+        return {
+            ...base,
+            transferDate: base.transferDate || recordDate || '',
+            sourceBatchId: base.sourceBatchId || batch?.id || '',
+            sourceComposterId: base.sourceComposterId || String(record?.composterId || composterIds[0] || ''),
+            destinationBatchId: base.destinationBatchId || batch?.id || '',
+            destinationComposterId: base.destinationComposterId || '',
+            unit: base.unit || this.getBatchInputUnitName(batch)
+        };
+    },
+
+    hasMaterialTransferContent(transfer) {
+        const normalized = this.normalizeMaterialTransfer(transfer);
+        return normalized.performed;
+    },
+
+    getTransferBatchLabel(batchId, currentBatch = null) {
+        const value = String(batchId || '').trim();
+        if (!value) return '—';
+        if (currentBatch && this.batchMatchesTransferId(currentBatch, value)) return currentBatch.id || value;
+        const matchedBatch = this.findBatchByExactId(value);
+        return matchedBatch?.id || value;
+    },
+
+    batchMatchesTransferId(batch, transferBatchId) {
+        const target = String(transferBatchId || '').trim();
+        if (!batch || !target) return false;
+        return [batch.id, batch.cloudId, this.getBatchRouteId(batch)]
+            .map((value) => String(value || '').trim())
+            .filter(Boolean)
+            .includes(target);
+    },
+
+    collectBatchTransferData(batch, options = {}) {
+        const inputUnit = this.getBatchInputUnitName(batch);
+        const dateFrom = String(options.dateFrom || '').trim();
+        const dateTo = String(options.dateTo || '').trim();
+        const summary = {
+            incomingCount: 0,
+            incomingAmount: 0,
+            outgoingCount: 0,
+            outgoingAmount: 0,
+            history: []
+        };
+        if (!batch) return summary;
+
+        this.data.batches.forEach((batchEntry) => {
+            const records = Array.isArray(batchEntry?.records) ? batchEntry.records : [];
+            records.forEach((rawRecord) => {
+                const record = this.normalizeRecordForCompatibility(rawRecord, batchEntry);
+                const transfer = this.normalizeMaterialTransfer(record.materialTransfer, batch);
+                if (!transfer.performed) return;
+                const effectiveDate = String(transfer.transferDate || record.date || '').trim();
+                if (dateFrom && effectiveDate && effectiveDate < dateFrom) return;
+                if (dateTo && effectiveDate && effectiveDate > dateTo) return;
+
+                const isIncoming = this.batchMatchesTransferId(batch, transfer.destinationBatchId);
+                const isOutgoing = this.batchMatchesTransferId(batch, transfer.sourceBatchId);
+                if (!isIncoming && !isOutgoing) return;
+
+                const amount = transfer.amount != null && !isNaN(transfer.amount) ? (parseFloat(transfer.amount) || 0) : 0;
+                if (isIncoming) {
+                    summary.incomingCount += 1;
+                    summary.incomingAmount += amount;
+                }
+                if (isOutgoing) {
+                    summary.outgoingCount += 1;
+                    summary.outgoingAmount += amount;
+                }
+
+                summary.history.push({
+                    effectiveDate,
+                    recordDate: record.date || '',
+                    ownerBatchId: batchEntry?.id || '',
+                    composterId: record.composterId || '',
+                    sourceBatchLabel: this.getTransferBatchLabel(transfer.sourceBatchId, batch),
+                    sourceComposterLabel: this.formatComposterLabel(transfer.sourceComposterId),
+                    destinationBatchLabel: this.getTransferBatchLabel(transfer.destinationBatchId, batch),
+                    destinationComposterLabel: this.formatComposterLabel(transfer.destinationComposterId),
+                    materialType: transfer.materialType || '',
+                    amount,
+                    unit: transfer.unit || inputUnit,
+                    notes: transfer.notes || '',
+                    metadata: this.normalizeRecordMetadata(record.metadata),
+                    isIncoming,
+                    isOutgoing
+                });
+            });
+        });
+
+        summary.history.sort((a, b) => {
+            const dateCompare = String(b.effectiveDate || '').localeCompare(String(a.effectiveDate || ''));
+            if (dateCompare !== 0) return dateCompare;
+            return String(b.recordDate || '').localeCompare(String(a.recordDate || ''));
+        });
+
+        return summary;
+    },
+
+    formatTransferSummaryText(count, amount, unit) {
+        const safeCount = count || 0;
+        const label = safeCount === 1 ? 'transfer' : 'transfers';
+        return `${this.formatNumber(amount || 0, 3)} ${unit} (${safeCount} ${label})`;
     },
 
     async loadCloudBatches() {
@@ -926,12 +1189,16 @@ const App = {
     },
 
     calculateTotalMaterialInput(batch) {
-        return this.calculateInitialStockAmount(batch) + this.calculateTotalInput(batch) + this.calculateTotalWaterAdded(batch);
+        return this.calculateBatchMaterialTotals(batch).totalMaterialInput;
+    },
+
+    calculateTotalSystemMassInput(batch) {
+        return this.calculateInitialStockAmount(batch) + this.calculateTotalMaterialInput(batch) + this.calculateTotalWaterAdded(batch);
     },
 
     calculateEstimatedCompostOutput(batch) {
         const settings = this.getBatchCalculationSettings(batch);
-        return this.calculateTotalMaterialInput(batch) * settings.compostConversionRate;
+        return (this.calculateInitialStockAmount(batch) + this.calculateTotalMaterialInput(batch)) * settings.compostConversionRate;
     },
 
     getICTAMonitoringState(record) {
@@ -1101,6 +1368,7 @@ const App = {
             maintenance.totalAdditionalInput,
             maintenance.totalOrganicWaste,
             maintenance.totalStructuralMaterial,
+            maintenance.totalMaterialInput,
             maintenance.totalOrganicInput,
             maintenance.foodWasteCocina,
             maintenance.foodWastePlanta0,
@@ -1827,7 +2095,8 @@ const App = {
             additionalStructuralMaterial: breakdown.additionalStructuralMaterial,
             totalAdditionalInput: breakdown.totalAdditionalInput,
             totalOrganicWaste: breakdown.totalOrganicWaste,
-            totalOrganicInput: breakdown.totalOrganicInput,
+            totalMaterialInput: breakdown.totalMaterialInput,
+            totalOrganicInput: breakdown.totalMaterialInput,
             foodStructuralRatio
         };
     },
@@ -2010,8 +2279,8 @@ const App = {
                             ${this.renderMaintenanceSummaryInfoButton('Structural Material', 'Regular Structural Material + Additional Structural Material')}
                         </div>
                         <div class="maintenance-summary-value maintenance-summary-value-row" style="margin-top: 10px;">
-                            <span>Total Organic Input: <span id="totalOrganicInput">${this.formatNumber(maintenance.totalOrganicInput || 0, 3)}</span> ${inputUnit}</span>
-                            ${this.renderMaintenanceSummaryInfoButton('Total Organic Input', 'Organic Waste + Structural Material')}
+                            <span>Total Material Input: <span id="totalMaterialInput">${this.formatNumber((maintenance.totalMaterialInput ?? maintenance.totalOrganicInput) || 0, 3)}</span> ${inputUnit}</span>
+                            ${this.renderMaintenanceSummaryInfoButton('Total Material Input', 'Organic Waste + Structural Material')}
                         </div>
                     </div>
                 </div>
@@ -2300,7 +2569,7 @@ const App = {
         const regularStructuralMaterial = structuralMaterialEntries.reduce((sum, item) => sum + ((item.amount != null && !isNaN(item.amount)) ? (parseFloat(item.amount) || 0) : 0), 0);
         const totalOrganicWaste = totalFoodWaste + additionalTotals.additionalOrganicMaterial;
         const totalStructuralMaterial = regularStructuralMaterial + additionalTotals.additionalStructuralMaterial;
-        const totalOrganicInput = totalOrganicWaste + totalStructuralMaterial;
+        const totalMaterialInput = totalOrganicWaste + totalStructuralMaterial;
 
         return {
             batchUnit: inputUnit,
@@ -2316,7 +2585,8 @@ const App = {
             totalAdditionalInput: additionalTotals.totalAdditionalInput,
             totalOrganicWaste,
             totalStructuralMaterial,
-            totalOrganicInput,
+            totalMaterialInput,
+            totalOrganicInput: totalMaterialInput,
             moduleExpanded: !!draft?.moduleExpanded,
             otherOrganicExpanded: !!draft?.otherOrganicExpanded
         };
@@ -2494,8 +2764,8 @@ const App = {
                             ${this.renderMaintenanceSummaryInfoButton('Structural Material', 'Regular Structural Material + Additional Structural Material')}
                         </div>
                         <div class="maintenance-summary-value maintenance-summary-value-row" style="margin-top: 10px;">
-                            <span>Total Organic Input: <span id="totalOrganicInput">${this.formatNumber(maintenance.totalOrganicInput || 0, 3)}</span> ${inputUnit}</span>
-                            ${this.renderMaintenanceSummaryInfoButton('Total Organic Input', 'Organic Waste + Structural Material')}
+                            <span>Total Material Input: <span id="totalMaterialInput">${this.formatNumber((maintenance.totalMaterialInput ?? maintenance.totalOrganicInput) || 0, 3)}</span> ${inputUnit}</span>
+                            ${this.renderMaintenanceSummaryInfoButton('Total Material Input', 'Organic Waste + Structural Material')}
                         </div>
                     </div>
                 </div>
@@ -2574,6 +2844,149 @@ const App = {
         `;
     },
 
+    renderTransferBatchOptions(currentBatch, selectedBatchId) {
+        const selected = String(selectedBatchId || '').trim();
+        const options = [];
+        const seen = new Set();
+        const appendOption = (batch, labelSuffix = '') => {
+            const value = String(batch?.id || '').trim();
+            if (!value || seen.has(value)) return;
+            seen.add(value);
+            const label = `${batch.id}${labelSuffix}`;
+            options.push(`<option value="${this.escapeAttr(value)}" ${selected === value ? 'selected' : ''}>${this.escapeHtml(label)}</option>`);
+        };
+
+        if (currentBatch?.id) appendOption(currentBatch, ' (Current Batch)');
+        this.data.batches.forEach((batch) => {
+            if (!batch?.id || (currentBatch?.id && String(batch.id) === String(currentBatch.id))) return;
+            appendOption(batch);
+        });
+
+        if (selected && !seen.has(selected)) {
+            options.push(`<option value="${this.escapeAttr(selected)}" selected>${this.escapeHtml(selected)} (Unavailable)</option>`);
+        }
+
+        return options.join('');
+    },
+
+    renderTransferComposterOptions(batchId, selectedComposterId) {
+        const selected = String(selectedComposterId || '').trim();
+        const matchedBatch = this.findBatchByExactId(batchId);
+        const composterIds = this.getBatchComposterIds(matchedBatch);
+        const seen = new Set();
+        const options = ['<option value="">Select composter...</option>'];
+
+        composterIds.forEach((composterId) => {
+            const value = String(composterId || '').trim();
+            if (!value || seen.has(value)) return;
+            seen.add(value);
+            options.push(`<option value="${this.escapeAttr(value)}" ${selected === value ? 'selected' : ''}>${this.escapeHtml(this.formatComposterLabel(value))}</option>`);
+        });
+
+        if (selected && !seen.has(selected)) {
+            options.push(`<option value="${this.escapeAttr(selected)}" selected>${this.escapeHtml(this.formatComposterLabel(selected))} (Unavailable)</option>`);
+        }
+
+        return options.join('');
+    },
+
+    renderMaterialTransferModule(batch, transfer) {
+        const isCompleted = this.hasMaterialTransferContent(transfer);
+        const inputUnit = this.getBatchInputUnitName(batch);
+        const materialTypes = [
+            'Active Compost',
+            'Semi-mature Compost',
+            'Mature Compost',
+            'Structural Material',
+            'Other'
+        ];
+        const sourceBatchValue = transfer.sourceBatchId || batch?.id || '';
+        const destinationBatchValue = transfer.destinationBatchId || batch?.id || '';
+        return `
+            <div class="card">
+                <div style="display: flex; align-items: center; justify-content: space-between; cursor: pointer;" onclick="app.toggleICTAMaterialTransferModule()">
+                    <h2 class="card-title module-title maintenance" id="materialTransferToggleText" data-completed="${isCompleted ? 'true' : 'false'}" style="margin: 0;">${this.getModuleToggleLabel('Material Transfer', isCompleted)}</h2>
+                    <span id="materialTransferToggleIcon" style="color: var(--gray); font-weight: 700;">▸</span>
+                </div>
+
+                <div id="materialTransferModuleContent" style="display: none; margin-top: 20px;">
+                    <div class="form-group">
+                        <label class="form-label">Material Transfer Performed?</label>
+                        <div class="radio-group" style="gap: 18px;">
+                            <label class="radio-item">
+                                <input type="radio" name="materialTransferPerformed" value="yes" ${transfer.performed ? 'checked' : ''} onchange="app.updateMaterialTransferVisibility()">
+                                Yes
+                            </label>
+                            <label class="radio-item">
+                                <input type="radio" name="materialTransferPerformed" value="no" ${!transfer.performed ? 'checked' : ''} onchange="app.updateMaterialTransferVisibility()">
+                                No
+                            </label>
+                        </div>
+                    </div>
+
+                    <div id="materialTransferFields" style="${transfer.performed ? '' : 'display:none;'}">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label class="form-label">Transfer Date</label>
+                                <input type="date" class="form-input" id="materialTransferDate" value="${this.escapeAttr(transfer.transferDate || '')}">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Material Type</label>
+                                <select class="form-input" id="materialTransferMaterialType">
+                                    <option value="">Select material type...</option>
+                                    ${materialTypes.map((type) => `<option value="${this.escapeAttr(type)}" ${transfer.materialType === type ? 'selected' : ''}>${this.escapeHtml(type)}</option>`).join('')}
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Transferred Amount</label>
+                                <input type="number" class="form-input" id="materialTransferAmount" step="any" value="${transfer.amount != null && transfer.amount !== 0 ? this.escapeAttr(transfer.amount) : ''}" placeholder="Enter amount">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Unit</label>
+                                <input type="text" class="form-input" id="materialTransferUnit" value="${this.escapeAttr(transfer.unit || inputUnit)}" readonly>
+                            </div>
+                        </div>
+
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label class="form-label">Source Batch</label>
+                                <select class="form-input" id="materialTransferSourceBatchId" onchange="app.updateMaterialTransferVisibility()">
+                                    ${this.renderTransferBatchOptions(batch, sourceBatchValue)}
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Source Composter</label>
+                                <select class="form-input" id="materialTransferSourceComposterId">
+                                    ${this.renderTransferComposterOptions(sourceBatchValue, transfer.sourceComposterId)}
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label class="form-label">Destination Batch</label>
+                                <select class="form-input" id="materialTransferDestinationBatchId" onchange="app.updateMaterialTransferVisibility()">
+                                    ${this.renderTransferBatchOptions(batch, destinationBatchValue)}
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Destination Composter</label>
+                                <select class="form-input" id="materialTransferDestinationComposterId">
+                                    ${this.renderTransferComposterOptions(destinationBatchValue, transfer.destinationComposterId)}
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Notes</label>
+                            <textarea class="form-input icta-notes-textarea" id="materialTransferNotes" placeholder="Optional notes about this transfer">${this.escapeHtml(transfer.notes || '')}</textarea>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+    },
+
     getICTAPhotosState(record) {
         const photos = Array.isArray(record?.uploadedPhotos) ? record.uploadedPhotos : [];
         return this.normalizePhotoList(photos);
@@ -2638,6 +3051,25 @@ const App = {
         return String(record?.notes ?? record?.observation?.notes ?? '');
     },
 
+    getMaterialTransferFormState(batch, recordDate = '') {
+        const performed = document.querySelector('input[name="materialTransferPerformed"]:checked')?.value === 'yes';
+        if (!performed) return this.getDefaultMaterialTransfer();
+        const amountRaw = document.getElementById('materialTransferAmount')?.value;
+        const amount = amountRaw != null && String(amountRaw).trim() !== '' ? parseFloat(amountRaw) : 0;
+        return this.normalizeMaterialTransfer({
+            performed: true,
+            transferDate: document.getElementById('materialTransferDate')?.value || recordDate || '',
+            sourceBatchId: document.getElementById('materialTransferSourceBatchId')?.value || '',
+            sourceComposterId: document.getElementById('materialTransferSourceComposterId')?.value || '',
+            destinationBatchId: document.getElementById('materialTransferDestinationBatchId')?.value || '',
+            destinationComposterId: document.getElementById('materialTransferDestinationComposterId')?.value || '',
+            materialType: document.getElementById('materialTransferMaterialType')?.value || '',
+            amount: isNaN(amount) ? 0 : amount,
+            unit: this.getBatchInputUnitName(batch),
+            notes: document.getElementById('materialTransferNotes')?.value || ''
+        }, batch);
+    },
+
     renderICTANotesModule(notes) {
         const isCompleted = this.hasNotesContent(notes);
         return `
@@ -2674,7 +3106,7 @@ const App = {
             }
         }
 
-        this.data.batches = Array.isArray(localBatches) ? localBatches : [];
+        this.data.batches = (Array.isArray(localBatches) ? localBatches : []).map((batch) => this.normalizeBatchForCompatibility(batch));
 
         try {
             if (this.getBatchesCollection() && this.data.currentUser?.uid) {
@@ -2687,7 +3119,7 @@ const App = {
                     ));
                     if (!exists) merged.push(localBatch);
                 });
-                this.data.batches = merged;
+                this.data.batches = merged.map((batch) => this.normalizeBatchForCompatibility(batch));
                 this.saveData();
             }
         } catch (error) {
@@ -2925,7 +3357,7 @@ const App = {
     },
 
     calculateTotalInput(batch) {
-        return this.calculateBatchMaterialTotals(batch).totalOrganicInput;
+        return this.calculateBatchMaterialTotals(batch).totalMaterialInput;
     },
 
     calculateTotalWaterAdded(batch) {
@@ -3046,12 +3478,20 @@ const App = {
                     : (regularStructuralMaterial + additionalTotals.additionalStructuralMaterial)
             );
 
-        const totalOrganicInput = (maintenance.totalOrganicInput != null && !isNaN(maintenance.totalOrganicInput))
-            ? (parseFloat(maintenance.totalOrganicInput) || 0)
+        const totalMaterialInput = (maintenance.totalMaterialInput != null && !isNaN(maintenance.totalMaterialInput))
+            ? (parseFloat(maintenance.totalMaterialInput) || 0)
             : (
-                (input.totalOrganicInput != null && !isNaN(input.totalOrganicInput))
-                    ? (parseFloat(input.totalOrganicInput) || 0)
-                    : (totalOrganicWaste + totalStructuralMaterial)
+                (maintenance.totalOrganicInput != null && !isNaN(maintenance.totalOrganicInput))
+                    ? (parseFloat(maintenance.totalOrganicInput) || 0)
+                    : (
+                        (input.totalMaterialInput != null && !isNaN(input.totalMaterialInput))
+                            ? (parseFloat(input.totalMaterialInput) || 0)
+                            : (
+                                (input.totalOrganicInput != null && !isNaN(input.totalOrganicInput))
+                                    ? (parseFloat(input.totalOrganicInput) || 0)
+                                    : (totalOrganicWaste + totalStructuralMaterial)
+                            )
+                    )
             );
 
         return {
@@ -3063,7 +3503,8 @@ const App = {
             totalAdditionalInput: additionalTotals.totalAdditionalInput,
             totalOrganicWaste,
             totalStructuralMaterial,
-            totalOrganicInput
+            totalMaterialInput,
+            totalOrganicInput: totalMaterialInput
         };
     },
 
@@ -3077,6 +3518,7 @@ const App = {
                 totalAdditionalInput: 0,
                 totalOrganicWaste: 0,
                 totalStructuralMaterial: 0,
+                totalMaterialInput: 0,
                 totalOrganicInput: 0
             };
         }
@@ -3090,7 +3532,8 @@ const App = {
             acc.totalAdditionalInput += breakdown.totalAdditionalInput;
             acc.totalOrganicWaste += breakdown.totalOrganicWaste;
             acc.totalStructuralMaterial += breakdown.totalStructuralMaterial;
-            acc.totalOrganicInput += breakdown.totalOrganicInput;
+            acc.totalMaterialInput += breakdown.totalMaterialInput;
+            acc.totalOrganicInput += breakdown.totalMaterialInput;
             return acc;
         }, {
             regularOrganicWaste: 0,
@@ -3100,12 +3543,21 @@ const App = {
             totalAdditionalInput: 0,
             totalOrganicWaste: 0,
             totalStructuralMaterial: 0,
+            totalMaterialInput: 0,
             totalOrganicInput: 0
         });
     },
 
+    calculateBatchTotalMaterialInput(batch) {
+        return this.calculateBatchMaterialTotals(batch).totalMaterialInput;
+    },
+
+    calculateRecordTotalMaterialInput(record) {
+        return this.calculateRecordMaterialBreakdown(record).totalMaterialInput;
+    },
+
     calculateRecordTotalOrganicInput(record) {
-        return this.calculateRecordMaterialBreakdown(record).totalOrganicInput;
+        return this.calculateRecordTotalMaterialInput(record);
     },
 
     calculateAvgTemperature(record) {
@@ -3225,7 +3677,7 @@ const App = {
     },
 
     hasMaintenanceData(record) {
-        return this.calculateRecordTotalOrganicInput(record) > 0;
+        return this.calculateRecordTotalMaterialInput(record) > 0;
     },
 
     getVisitTypeInfo(record) {
@@ -3309,22 +3761,22 @@ const App = {
         const sortedRecords = Array.isArray(batch?.records)
             ? [...batch.records].sort((a, b) => new Date(a.date) - new Date(b.date))
             : [];
-        let cumulativeOrganicInput = 0;
+        let cumulativeMaterialInput = 0;
 
         return sortedRecords.map((record) => {
             const coreTemperature = record?.monitoring?.coreTemperature != null
                 ? (parseFloat(record.monitoring.coreTemperature) || 0)
                 : (record?.process?.core != null ? (parseFloat(record.process.core) || 0) : null);
-            const organicInputAddedToday = this.calculateRecordTotalOrganicInput(record);
-            cumulativeOrganicInput += organicInputAddedToday;
+            const materialInputAddedToday = this.calculateRecordTotalMaterialInput(record);
+            cumulativeMaterialInput += materialInputAddedToday;
             return {
                 id: record.id,
                 date: record.date,
                 shortDate: this.formatShortDate(record.date),
                 fullDate: this.formatDate(record.date),
                 coreTemperature,
-                organicInputAddedToday,
-                cumulativeOrganicInput
+                materialInputAddedToday,
+                cumulativeMaterialInput
             };
         });
     },
@@ -3420,11 +3872,11 @@ const App = {
             fullDate: item.fullDate,
             value: item.coreTemperature
         }));
-        const organicInputPoints = trendData.map((item) => ({
+        const materialInputPoints = trendData.map((item) => ({
             label: item.shortDate,
             fullDate: item.fullDate,
-            value: item.cumulativeOrganicInput,
-            addedToday: item.organicInputAddedToday
+            value: item.cumulativeMaterialInput,
+            addedToday: item.materialInputAddedToday
         }));
 
         return `
@@ -3440,12 +3892,12 @@ const App = {
                         })}
                     </div>
                     <div class="trend-chart-card">
-                        <div class="trend-chart-title">Total Organic Input Trend</div>
+                        <div class="trend-chart-title">Total Material Input Trend</div>
                         ${this.renderLineTrendChart({
-                            points: organicInputPoints,
-                            yAxisLabel: `Organic Input (${inputUnit})`,
-                            emptyMessage: 'No organic input records yet.',
-                            tooltipFormatter: (point) => `${point.fullDate}\nAdded Today: ${this.formatNumber(point.addedToday, 3)} ${inputUnit}\nCumulative Total: ${this.formatNumber(point.value, 3)} ${inputUnit}`
+                            points: materialInputPoints,
+                            yAxisLabel: `Material Input (${inputUnit})`,
+                            emptyMessage: 'No material input records yet.',
+                            tooltipFormatter: (point) => `${point.fullDate}\nAdded Today: ${this.formatNumber(point.addedToday, 3)} ${inputUnit}\nCumulative Material Input: ${this.formatNumber(point.value, 3)} ${inputUnit}`
                         })}
                     </div>
                 </div>
@@ -3656,7 +4108,7 @@ const App = {
 
     renderBatchCard(batch) {
         const sortedRecords = [...(batch.records || [])].sort((a, b) => new Date(a.date) - new Date(b.date));
-        const totalInput = this.calculateTotalInput(batch);
+        const totalInput = this.calculateBatchTotalMaterialInput(batch);
         const inputUnit = this.getBatchInputUnitName(batch);
         const daysRunning = this.calculateDaysRunning(batch);
         const lastActivity = sortedRecords.length > 0
@@ -3697,7 +4149,7 @@ const App = {
                         <span class="info-value">${batch.manager}</span>
                     </div>
                     <div class="info-item">
-                        <span class="info-label">Total Input</span>
+                        <span class="info-label">Total Material Input</span>
                         <span class="info-value">${this.formatNumber(totalInput, 3)} ${inputUnit}</span>
                     </div>
                     <div class="info-item">
@@ -4635,20 +5087,23 @@ const App = {
         const recordsDescending = [...sortedRecords].reverse();
         const inputUnit = this.getBatchInputUnitName(batch);
         const materialTotals = this.calculateBatchMaterialTotals(batch);
-        const totalInput = materialTotals.totalOrganicInput;
+        const totalInput = materialTotals.totalMaterialInput;
         const daysRunning = this.calculateDaysRunning(batch);
         const lastActivity = sortedRecords.length > 0
             ? this.formatDate(sortedRecords[sortedRecords.length - 1].date)
             : 'No records';
         const phaseInfo = this.getPhaseInfo(batch);
         const currentPhase = phaseInfo.status === 'ok' ? phaseInfo.phase : '-';
-        const totalOrganicInputDisplay = `${this.formatNumber(totalInput, 3)} ${inputUnit}`;
+        const totalMaterialInputDisplay = `${this.formatNumber(totalInput, 3)} ${inputUnit}`;
         const organicWasteDisplay = `${this.formatNumber(materialTotals.totalOrganicWaste, 3)} ${inputUnit}`;
         const structuralMaterialDisplay = `${this.formatNumber(materialTotals.totalStructuralMaterial, 3)} ${inputUnit}`;
         const daysRunningDisplay = `${daysRunning} ${daysRunning === 1 ? 'day' : 'days'}`;
         const activeBatchInfoPanel = this.getActiveBatchInfoPanel(batch);
         const collaborators = this.getBatchCollaborators(batch);
         const activityEntries = this.getBatchActivityLog(batch);
+        const transferOverview = this.collectBatchTransferData(batch);
+        const incomingTransferDisplay = this.formatTransferSummaryText(transferOverview.incomingCount, transferOverview.incomingAmount, inputUnit);
+        const outgoingTransferDisplay = this.formatTransferSummaryText(transferOverview.outgoingCount, transferOverview.outgoingAmount, inputUnit);
 
         return `
             <div class="header">
@@ -4720,8 +5175,8 @@ const App = {
                     <h2 class="card-title">📈 Batch Summary</h2>
                     <div class="summary-grid">
                         <div class="summary-item">
-                            <div class="summary-label">Batch Total Organic Input</div>
-                            <div class="summary-value">${totalOrganicInputDisplay}</div>
+                            <div class="summary-label">Batch Total Material Input</div>
+                            <div class="summary-value">${totalMaterialInputDisplay}</div>
                         </div>
                         <div class="summary-item">
                             <div class="summary-label">Organic Waste</div>
@@ -4743,7 +5198,51 @@ const App = {
                             <div class="summary-label">Current Phase</div>
                             <div class="summary-value">${currentPhase}</div>
                         </div>
+                        <div class="summary-item">
+                            <div class="summary-label">Incoming Transfers</div>
+                            <div class="summary-value">${incomingTransferDisplay}</div>
+                        </div>
+                        <div class="summary-item">
+                            <div class="summary-label">Outgoing Transfers</div>
+                            <div class="summary-value">${outgoingTransferDisplay}</div>
+                        </div>
                     </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h2 class="card-title">🔄 Transfer History</h2>
+                    </div>
+                    ${transferOverview.history.length === 0 ? `
+                        <div class="empty-state">
+                            <div class="empty-state-icon">🔄</div>
+                            <h3>No Material Transfers Yet</h3>
+                            <p>Transfers involving this batch will appear here.</p>
+                        </div>
+                    ` : `
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>Date</th>
+                                    <th>Route</th>
+                                    <th>Material</th>
+                                    <th>Amount</th>
+                                    <th>Notes</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${transferOverview.history.map((entry) => `
+                                    <tr>
+                                        <td>${this.formatDate(entry.effectiveDate || entry.recordDate)}</td>
+                                        <td>${this.escapeHtml(`${entry.sourceBatchLabel} / ${entry.sourceComposterLabel} → ${entry.destinationBatchLabel} / ${entry.destinationComposterLabel}`)}</td>
+                                        <td>${this.escapeHtml(entry.materialType || '—')}</td>
+                                        <td>${this.formatNumber(entry.amount || 0, 3)} ${this.escapeHtml(entry.unit || inputUnit)}</td>
+                                        <td>${this.escapeHtml(entry.notes || '—')}</td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    `}
                 </div>
 
                 ${this.renderBatchTrendSection(batch)}
@@ -4773,6 +5272,8 @@ const App = {
                             </thead>
                             <tbody>
                                 ${recordsDescending.map(record => {
+                                    const normalizedRecord = this.normalizeRecordForCompatibility(record, batch);
+                                    const metadata = this.normalizeRecordMetadata(normalizedRecord.metadata);
                                     const visitType = this.getVisitTypeInfo(record);
                                     const hasMonitoring = this.hasMonitoringData(record);
                                     const hasMaintenance = this.hasMaintenanceData(record);
@@ -4796,7 +5297,15 @@ const App = {
                                         .replace(/"/g, '&quot;');
                                     return `
                                         <tr>
-                                            <td>${this.formatDate(record.date)}</td>
+                                            <td>
+                                                <div>${this.formatDate(record.date)}</div>
+                                                <div style="margin-top: 6px; font-size: 0.82rem; color: var(--gray);">
+                                                    Created by: ${this.escapeHtml(metadata.createdByName || metadata.createdByEmail || '—')}
+                                                </div>
+                                                <div style="margin-top: 2px; font-size: 0.82rem; color: var(--gray);">
+                                                    Last Edited by: ${this.escapeHtml(metadata.lastEditedByName || metadata.lastEditedByEmail || '—')}
+                                                </div>
+                                            </td>
                                             <td>${record.composterId || '—'}</td>
                                             <td><span class="visit-type-badge ${visitType.badgeClass}">${visitType.icon} ${visitType.label}</span></td>
                                             <td>${temperatureDisplay}</td>
@@ -4862,22 +5371,10 @@ const App = {
         const isEdit = !!record;
         const selectedDate = record ? record.date : new Date().toISOString().split('T')[0];
         let composterId = record && record.composterId != null ? String(record.composterId) : '1';
-
-        const compostingInfo = batch.compostingSystemInformation || {};
-        const composterIdsFromTable = Array.isArray(compostingInfo.composters)
-            ? compostingInfo.composters
-                .map(c => (c && c.composterId != null) ? String(c.composterId).trim() : '')
-                .filter(v => !!v)
-            : [];
-        const fallbackCount = (compostingInfo.numberOfCompostersUsed != null && !isNaN(compostingInfo.numberOfCompostersUsed))
-            ? Math.max(1, Math.min(50, parseInt(compostingInfo.numberOfCompostersUsed, 10)))
-            : 2;
-        const composterIds = (composterIdsFromTable.length > 0
-            ? Array.from(new Set(composterIdsFromTable))
-            : Array.from({ length: fallbackCount }, (_, i) => String(i + 1)));
+        const composterIds = this.getBatchComposterIds(batch);
         if (!composterIds.includes(composterId)) composterId = composterIds[0] || '1';
         const composterOptionsHtml = composterIds
-            .map(id => `<option value="${String(id).replace(/"/g, '&quot;')}" ${composterId === id ? 'selected' : ''}>Composter ${String(id).replace(/</g, '&lt;')}</option>`)
+            .map((id) => `<option value="${this.escapeAttr(id)}" ${composterId === id ? 'selected' : ''}>${this.escapeHtml(this.formatComposterLabel(id))}</option>`)
             .join('');
 
         const monitoringState = this.getICTAMonitoringState(record);
@@ -4885,6 +5382,7 @@ const App = {
         const maintenanceState = isICTA
             ? this.getICTAMaintenanceState(record, batch)
             : this.getNonICTAMaintenanceState(record, batch);
+        const materialTransferState = this.getMaterialTransferState(record, batch, selectedDate);
         const actionTakenState = this.getICTAActionTakenState(record);
         const photosState = this.getICTAPhotosState(record);
         const notesState = this.getICTANotesState(record);
@@ -4906,7 +5404,7 @@ const App = {
                         <div class="form-row" style="margin-top: 20px;">
                             <div class="form-group">
                                 <label class="form-label required">Date</label>
-                                <input type="date" class="form-input" id="recordDate" value="${selectedDate}" required>
+                                <input type="date" class="form-input" id="recordDate" value="${selectedDate}" onchange="app.syncMaterialTransferDateWithRecordDate(); app.updateSystemRecommendationDom();" required>
                             </div>
                             <div class="form-group">
                                 <label class="form-label">Batch ID</label>
@@ -4924,6 +5422,8 @@ const App = {
                     ${isICTA ? this.renderICTAMonitoringModule(monitoringState) : this.renderNonICTAMonitoringModule(monitoringState)}
 
                     ${isICTA ? this.renderICTAMaintenanceModule(batch, maintenanceState) : this.renderNonICTAMaintenanceModule(batch, maintenanceState)}
+
+                    ${this.renderMaterialTransferModule(batch, materialTransferState)}
 
                     ${this.renderICTAActionTakenModule(actionTakenState)}
                     ${this.renderICTAPhotoUploadModule(photosState)}
@@ -5271,9 +5771,8 @@ const App = {
 
         const inputUnit = this.getBatchInputUnitName(batch);
         const initialStockAmount = this.calculateInitialStockAmount(batch);
-        const totalOrganicInput = this.calculateTotalInput(batch);
+        const totalMaterialInput = this.calculateTotalMaterialInput(batch);
         const totalWaterAdded = this.calculateTotalWaterAdded(batch);
-        const totalSystemInput = initialStockAmount + totalOrganicInput + totalWaterAdded;
         const output = batch.output || {};
         const harvestStatus = output.harvestStatus || 'pending';
         const estimatedOutput = output.estimatedOutput != null ? output.estimatedOutput : this.calculateEstimatedCompostOutput(batch);
@@ -5328,10 +5827,24 @@ const App = {
                         <h2 class="card-title">📊 Input Summary</h2>
                         <div class="summary-grid" style="margin-top: 18px;">
                             <div class="summary-item">
-                                <div class="summary-value">${this.formatNumber(totalSystemInput, 1)}</div>
-                                <div class="summary-label">Batch Total System Input (${inputUnit})</div>
+                                <div class="summary-value">${this.formatNumber(initialStockAmount, 1)}</div>
+                                <div class="summary-label">Initial Composting Stock (${inputUnit})</div>
                                 <div style="margin-top: 6px; color: var(--gray); font-size: 0.9rem;">
-                                    (Initial Composting Stock + Batch Total Organic Input + Total Water Added)
+                                    Existing materials already inside the composter at batch start
+                                </div>
+                            </div>
+                            <div class="summary-item">
+                                <div class="summary-value">${this.formatNumber(totalMaterialInput, 1)}</div>
+                                <div class="summary-label">Batch Total Material Input (${inputUnit})</div>
+                                <div style="margin-top: 6px; color: var(--gray); font-size: 0.9rem;">
+                                    Organic Waste + Structural Material
+                                </div>
+                            </div>
+                            <div class="summary-item">
+                                <div class="summary-value">${this.formatNumber(totalWaterAdded, 1)}</div>
+                                <div class="summary-label">Total Water Added (L)</div>
+                                <div style="margin-top: 6px; color: var(--gray); font-size: 0.9rem;">
+                                    Recorded separately from Total Material Input
                                 </div>
                             </div>
                         </div>
@@ -5344,7 +5857,7 @@ const App = {
                                 <div class="summary-value">${this.formatNumber(estimatedOutput, 1)}</div>
                                 <div class="summary-label">Estimated Compost Output (${inputUnit})</div>
                                 <div style="margin-top: 6px; color: var(--gray); font-size: 0.9rem;">
-                                    Read-only estimate based on total material input and conversion rate
+                                    Read-only estimate based on Initial Composting Stock + Total Material Input and conversion rate
                                 </div>
                             </div>
                             <div class="summary-item">
@@ -5479,7 +5992,7 @@ const App = {
                                     <div class="export-module-fields">
                                         ${this.renderExportFieldOption('batchSummary', 'exportSummaryBasic', 'Basic Overview', 'Exports batch ID, status, organization, community type, and input unit.')}
                                         ${this.renderExportFieldOption('batchSummary', 'exportSummaryDates', 'Dates and Filters', 'Exports batch start date, finished date, selected date range, and record count.')}
-                                        ${this.renderExportFieldOption('batchSummary', 'exportSummaryTotals', 'System Totals', 'Exports initial stock, total organic input, total water added, and batch total system input.')}
+                                        ${this.renderExportFieldOption('batchSummary', 'exportSummaryTotals', 'System Totals', 'Exports initial stock, total material input, and total water added.')}
                                         ${this.renderExportFieldOption('batchSummary', 'exportSummaryCalculation', 'Calculation Settings', 'Exports the compost conversion rate used for estimation.')}
                                     </div>
                                 </div>
@@ -5500,7 +6013,7 @@ const App = {
                                 </div>
                                 <div class="export-module-content" id="exportModuleContent-dailyRecords">
                                     <div class="export-module-fields">
-                                        ${this.renderExportFieldOption('dailyRecords', 'exportTotalInput', 'Organic / Structural / Total Input', 'Exports the total organic waste, total structural material, and total input for each daily record.')}
+                                        ${this.renderExportFieldOption('dailyRecords', 'exportTotalInput', 'Organic Waste / Structural Material / Total Material Input', 'Exports the total organic waste, total structural material, and total material input for each daily record.')}
                                         ${isICTA ? `
                                             ${this.renderExportFieldOption('dailyRecords', 'exportCocinaPlanta', 'Cocina / Planta Breakdown', 'Exports the ICTA food waste breakdown by Cocina and Planta collection points.')}
                                             ${this.renderExportFieldOption('dailyRecords', 'exportStructural', 'Structuring Material Breakdown', 'Exports ICTA structural inputs such as ratio, wood, and wood chips.')}
@@ -5516,6 +6029,28 @@ const App = {
                                         ${this.renderExportFieldOption('dailyRecords', 'exportOperations', 'Actions and Operations', 'Exports turning, mixing, water added, and water added amount.')}
                                         ${this.renderExportFieldOption('dailyRecords', 'exportOdour', 'Odour', 'Exports odour observation and any odour notes recorded on that date.')}
                                         ${this.renderExportFieldOption('dailyRecords', 'exportLeachate', 'Leachate', 'Exports leachate observation and any related notes recorded on that date.')}
+                                        ${this.renderExportFieldOption('dailyRecords', 'exportRecordMetadata', 'Operator Traceability', 'Exports created by, created email, created time, last edited by, and last edited time for each daily record.')}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="export-module-card" id="exportModuleCard-transferRecords">
+                                <div class="export-module-header">
+                                    <label class="export-module-main">
+                                        <input type="checkbox" id="exportModule-transferRecords" checked onchange="app.setExportModule('transferRecords', this.checked)">
+                                        <div>
+                                            <div class="export-module-title">🔄 Material Transfer</div>
+                                            <div class="export-module-subtitle">Transfer summary and transfer history involving the selected batch</div>
+                                        </div>
+                                    </label>
+                                    <button type="button" class="export-module-expand" onclick="app.toggleExportModule('transferRecords')">
+                                        <span id="exportModuleIcon-transferRecords">▾</span>
+                                    </button>
+                                </div>
+                                <div class="export-module-content" id="exportModuleContent-transferRecords">
+                                    <div class="export-module-fields">
+                                        ${this.renderExportFieldOption('transferRecords', 'exportTransferSummary', 'Transfer Summary', 'Exports incoming and outgoing transfer totals for the selected batch.')}
+                                        ${this.renderExportFieldOption('transferRecords', 'exportTransferHistory', 'Transfer History', 'Exports each material transfer involving the selected batch as a separate record.')}
                                     </div>
                                 </div>
                             </div>
@@ -5762,6 +6297,8 @@ const App = {
             this.updateAdvancedMonitoringFieldVisibility();
             this.initializeSystemRecommendationRealtime();
             this.initializeToggleableMonitoringRadios();
+            this.syncMaterialTransferDateWithRecordDate();
+            this.updateMaterialTransferVisibility();
             this.updateSystemRecommendationDom();
             this.updateMaintenanceTotals();
             this.updateICTAActionTakenVisibility();
@@ -6552,7 +7089,7 @@ const App = {
         const additionalTotals = this.calculateAdditionalInputTotals(additionalInputs);
         const totalOrganicWaste = regularOrganicWaste + additionalTotals.additionalOrganicMaterial;
         const totalStructuralMaterial = regularStructuralMaterial + additionalTotals.additionalStructuralMaterial;
-        const totalOrganicInput = totalOrganicWaste + totalStructuralMaterial;
+        const totalMaterialInput = totalOrganicWaste + totalStructuralMaterial;
 
         const regularOrganicWasteEl = document.getElementById('regularOrganicWaste');
         const regularStructuralEl = document.getElementById('regularStructuralMaterial');
@@ -6561,7 +7098,7 @@ const App = {
         const totalAdditionalEl = document.getElementById('totalAdditionalInput');
         const totalOrganicWasteEl = document.getElementById('totalOrganicWaste');
         const totalStructuralOverallEl = document.getElementById('totalStructuralMaterialOverall');
-        const totalOrganicEl = document.getElementById('totalOrganicInput');
+        const totalMaterialInputEl = document.getElementById('totalMaterialInput');
         if (regularOrganicWasteEl) regularOrganicWasteEl.textContent = this.formatNumber(regularOrganicWaste, 3);
         if (regularStructuralEl) regularStructuralEl.textContent = this.formatNumber(regularStructuralMaterial, 3);
         if (additionalOrganicEl) additionalOrganicEl.textContent = this.formatNumber(additionalTotals.additionalOrganicMaterial, 3);
@@ -6569,7 +7106,7 @@ const App = {
         if (totalAdditionalEl) totalAdditionalEl.textContent = this.formatNumber(additionalTotals.totalAdditionalInput, 3);
         if (totalOrganicWasteEl) totalOrganicWasteEl.textContent = this.formatNumber(totalOrganicWaste, 3);
         if (totalStructuralOverallEl) totalStructuralOverallEl.textContent = this.formatNumber(totalStructuralMaterial, 3);
-        if (totalOrganicEl) totalOrganicEl.textContent = this.formatNumber(totalOrganicInput, 3);
+        if (totalMaterialInputEl) totalMaterialInputEl.textContent = this.formatNumber(totalMaterialInput, 3);
 
         const ratioEl = document.getElementById('foodStructuralRatio');
         if (ratioEl) {
@@ -6631,60 +7168,84 @@ const App = {
         this.updateNonICTAMaintenanceTotals();
     },
 
-    async addNonICTAFoodWasteSource() {
+    addNonICTAFoodWasteSource() {
         const batch = this.data.currentBatch;
         if (!batch) return;
         this.ensureNonICTAMaterialLibraries(batch);
-
-        const source = (window.prompt('New Source Name') || '').trim();
-        if (!source) return;
-
+        const typeOptions = this.getNonICTAFoodTypeOptions();
         const suggested = 'Mixed Organic Waste';
-        const type = (window.prompt(`Food Waste Type\nSuggested options: ${this.getNonICTAFoodTypeOptions().join(', ')}`, suggested) || '').trim();
-        if (!type) {
-            alert('Please enter a Food Waste Type.');
-            return;
-        }
+        this.showFormModal({
+            id: 'addFoodWasteSourceModal',
+            title: 'Add Food Waste Source',
+            confirmText: 'Add',
+            fields: [
+                { id: 'foodWasteSourceName', label: 'Source Name', type: 'text', value: '', placeholder: 'e.g., Community kitchen', required: true },
+                { id: 'foodWasteSourceType', label: 'Food Waste Type', type: 'select', value: suggested, options: typeOptions, required: true }
+            ],
+            onConfirm: async (values) => {
+                const source = String(values.foodWasteSourceName || '').trim();
+                const type = String(values.foodWasteSourceType || '').trim();
+                if (!source) throw new Error('Source Name is required.');
+                if (!type) throw new Error('Food Waste Type is required.');
 
-        const exists = batch.foodWasteLibrary.some((item) => item.active !== false
-            && String(item.source || '').trim().toLowerCase() === source.toLowerCase()
-            && String(item.type || '').trim().toLowerCase() === type.toLowerCase());
-        if (exists) {
-            alert('This food waste source and type already exist in the Batch library.');
-            return;
-        }
+                const exists = batch.foodWasteLibrary.some((item) => item.active !== false
+                    && String(item.source || '').trim().toLowerCase() === source.toLowerCase()
+                    && String(item.type || '').trim().toLowerCase() === type.toLowerCase());
+                if (exists) throw new Error('This food waste source and type already exist in the Batch library.');
 
-        batch.foodWasteLibrary.push({
-            id: this.makeNonICTALibraryItemId('food'),
-            source,
-            type,
-            active: true
+                batch.foodWasteLibrary.push({
+                    id: this.makeNonICTALibraryItemId('food'),
+                    source,
+                    type,
+                    active: true
+                });
+                await this.persistNonICTAMaterialLibraryChange('✅ Food waste source added');
+            }
         });
-        await this.persistNonICTAMaterialLibraryChange('✅ Food waste source added');
     },
 
-    async renameNonICTAFoodWasteSource(sourceId) {
+    renameNonICTAFoodWasteSource(sourceId) {
         const batch = this.data.currentBatch;
         if (!batch) return;
         this.ensureNonICTAMaterialLibraries(batch);
         const item = batch.foodWasteLibrary.find((entry) => String(entry.id) === String(sourceId));
         if (!item) return;
-        const nextSource = (window.prompt('Rename Source', item.source || '') || '').trim();
-        if (!nextSource || nextSource === item.source) return;
-        item.source = nextSource;
-        await this.persistNonICTAMaterialLibraryChange('✅ Food waste source renamed');
+        this.showFormModal({
+            id: 'renameFoodWasteSourceModal',
+            title: 'Rename Food Waste Source',
+            confirmText: 'Save',
+            fields: [
+                { id: 'renameFoodWasteSourceName', label: 'Source Name', type: 'text', value: item.source || '', required: true }
+            ],
+            onConfirm: async (values) => {
+                const nextSource = String(values.renameFoodWasteSourceName || '').trim();
+                if (!nextSource || nextSource === item.source) return;
+                item.source = nextSource;
+                await this.persistNonICTAMaterialLibraryChange('✅ Food waste source renamed');
+            }
+        });
     },
 
-    async editNonICTAFoodWasteType(sourceId) {
+    editNonICTAFoodWasteType(sourceId) {
         const batch = this.data.currentBatch;
         if (!batch) return;
         this.ensureNonICTAMaterialLibraries(batch);
         const item = batch.foodWasteLibrary.find((entry) => String(entry.id) === String(sourceId));
         if (!item) return;
-        const nextType = (window.prompt(`Edit Food Waste Type\nSuggested options: ${this.getNonICTAFoodTypeOptions().join(', ')}`, item.type || '') || '').trim();
-        if (!nextType || nextType === item.type) return;
-        item.type = nextType;
-        await this.persistNonICTAMaterialLibraryChange('✅ Food waste type updated');
+        this.showFormModal({
+            id: 'editFoodWasteTypeModal',
+            title: 'Edit Food Waste Type',
+            confirmText: 'Save',
+            fields: [
+                { id: 'editFoodWasteTypeValue', label: 'Food Waste Type', type: 'select', value: item.type || '', options: this.getNonICTAFoodTypeOptions(), required: true }
+            ],
+            onConfirm: async (values) => {
+                const nextType = String(values.editFoodWasteTypeValue || '').trim();
+                if (!nextType || nextType === item.type) return;
+                item.type = nextType;
+                await this.persistNonICTAMaterialLibraryChange('✅ Food waste type updated');
+            }
+        });
     },
 
     async removeNonICTAFoodWasteSource(sourceId) {
@@ -6698,39 +7259,55 @@ const App = {
         await this.persistNonICTAMaterialLibraryChange('✅ Food waste source removed from active library');
     },
 
-    async addNonICTAStructuralMaterial() {
+    addNonICTAStructuralMaterial() {
         const batch = this.data.currentBatch;
         if (!batch) return;
         this.ensureNonICTAMaterialLibraries(batch);
+        this.showFormModal({
+            id: 'addStructuralMaterialModal',
+            title: 'Add Structural Material',
+            confirmText: 'Add',
+            fields: [
+                { id: 'addStructuralMaterialName', label: 'Material Name', type: 'text', value: '', placeholder: 'e.g., Wood chips', required: true }
+            ],
+            onConfirm: async (values) => {
+                const material = String(values.addStructuralMaterialName || '').trim();
+                if (!material) throw new Error('Material Name is required.');
 
-        const material = (window.prompt('Material Name') || '').trim();
-        if (!material) return;
+                const exists = batch.structuralMaterialLibrary.some((item) => item.active !== false
+                    && String(item.material || '').trim().toLowerCase() === material.toLowerCase());
+                if (exists) throw new Error('This structural material already exists in the Batch library.');
 
-        const exists = batch.structuralMaterialLibrary.some((item) => item.active !== false
-            && String(item.material || '').trim().toLowerCase() === material.toLowerCase());
-        if (exists) {
-            alert('This structural material already exists in the Batch library.');
-            return;
-        }
-
-        batch.structuralMaterialLibrary.push({
-            id: this.makeNonICTALibraryItemId('struct'),
-            material,
-            active: true
+                batch.structuralMaterialLibrary.push({
+                    id: this.makeNonICTALibraryItemId('struct'),
+                    material,
+                    active: true
+                });
+                await this.persistNonICTAMaterialLibraryChange('✅ Structural material added');
+            }
         });
-        await this.persistNonICTAMaterialLibraryChange('✅ Structural material added');
     },
 
-    async renameNonICTAStructuralMaterial(materialId) {
+    renameNonICTAStructuralMaterial(materialId) {
         const batch = this.data.currentBatch;
         if (!batch) return;
         this.ensureNonICTAMaterialLibraries(batch);
         const item = batch.structuralMaterialLibrary.find((entry) => String(entry.id) === String(materialId));
         if (!item) return;
-        const nextMaterial = (window.prompt('Rename Structural Material', item.material || '') || '').trim();
-        if (!nextMaterial || nextMaterial === item.material) return;
-        item.material = nextMaterial;
-        await this.persistNonICTAMaterialLibraryChange('✅ Structural material renamed');
+        this.showFormModal({
+            id: 'renameStructuralMaterialModal',
+            title: 'Rename Structural Material',
+            confirmText: 'Save',
+            fields: [
+                { id: 'renameStructuralMaterialName', label: 'Material Name', type: 'text', value: item.material || '', required: true }
+            ],
+            onConfirm: async (values) => {
+                const nextMaterial = String(values.renameStructuralMaterialName || '').trim();
+                if (!nextMaterial || nextMaterial === item.material) return;
+                item.material = nextMaterial;
+                await this.persistNonICTAMaterialLibraryChange('✅ Structural material renamed');
+            }
+        });
     },
 
     async removeNonICTAStructuralMaterial(materialId) {
@@ -6773,7 +7350,7 @@ const App = {
         const additionalTotals = this.calculateAdditionalInputTotals(additionalInputs);
         const totalOrganicWaste = regularOrganicWaste + additionalTotals.additionalOrganicMaterial;
         const totalStructuralMaterial = regularStructuralMaterial + additionalTotals.additionalStructuralMaterial;
-        const totalOrganicInput = totalOrganicWaste + totalStructuralMaterial;
+        const totalMaterialInput = totalOrganicWaste + totalStructuralMaterial;
 
         const regularOrganicWasteEl = document.getElementById('regularOrganicWaste');
         const regularStructuralEl = document.getElementById('regularStructuralMaterial');
@@ -6782,7 +7359,7 @@ const App = {
         const totalAdditionalEl = document.getElementById('totalAdditionalInput');
         const totalOrganicWasteEl = document.getElementById('totalOrganicWaste');
         const totalStructuralOverallEl = document.getElementById('totalStructuralMaterialOverall');
-        const totalOrganicEl = document.getElementById('totalOrganicInput');
+        const totalMaterialInputEl = document.getElementById('totalMaterialInput');
         if (regularOrganicWasteEl) regularOrganicWasteEl.textContent = this.formatNumber(regularOrganicWaste, 3);
         if (regularStructuralEl) regularStructuralEl.textContent = this.formatNumber(regularStructuralMaterial, 3);
         if (additionalOrganicEl) additionalOrganicEl.textContent = this.formatNumber(additionalTotals.additionalOrganicMaterial, 3);
@@ -6790,7 +7367,7 @@ const App = {
         if (totalAdditionalEl) totalAdditionalEl.textContent = this.formatNumber(additionalTotals.totalAdditionalInput, 3);
         if (totalOrganicWasteEl) totalOrganicWasteEl.textContent = this.formatNumber(totalOrganicWaste, 3);
         if (totalStructuralOverallEl) totalStructuralOverallEl.textContent = this.formatNumber(totalStructuralMaterial, 3);
-        if (totalOrganicEl) totalOrganicEl.textContent = this.formatNumber(totalOrganicInput, 3);
+        if (totalMaterialInputEl) totalMaterialInputEl.textContent = this.formatNumber(totalMaterialInput, 3);
     },
 
     toggleICTAActionTakenModule() {
@@ -6836,6 +7413,58 @@ const App = {
             const desc = document.getElementById('otherActionDescription');
             if (desc) desc.value = '';
         }
+    },
+
+    toggleICTAMaterialTransferModule() {
+        const content = document.getElementById('materialTransferModuleContent');
+        const icon = document.getElementById('materialTransferToggleIcon');
+        const text = document.getElementById('materialTransferToggleText');
+        if (!content || !icon || !text) return;
+        const isHidden = content.style.display === 'none' || content.style.display === '';
+        content.style.display = isHidden ? 'block' : 'none';
+        icon.textContent = isHidden ? '▾' : '▸';
+        this.syncModuleToggleText(text, 'Material Transfer');
+        if (isHidden) this.updateMaterialTransferVisibility();
+    },
+
+    updateMaterialTransferVisibility() {
+        const performed = document.querySelector('input[name="materialTransferPerformed"]:checked')?.value === 'yes';
+        const fields = document.getElementById('materialTransferFields');
+        const unitInput = document.getElementById('materialTransferUnit');
+        const sourceBatchSelect = document.getElementById('materialTransferSourceBatchId');
+        const sourceComposterSelect = document.getElementById('materialTransferSourceComposterId');
+        const destinationBatchSelect = document.getElementById('materialTransferDestinationBatchId');
+        const destinationComposterSelect = document.getElementById('materialTransferDestinationComposterId');
+        const transferDateInput = document.getElementById('materialTransferDate');
+        const recordDateInput = document.getElementById('recordDate');
+        const inputUnit = this.getBatchInputUnitName(this.data.currentBatch);
+
+        if (fields) fields.style.display = performed ? 'block' : 'none';
+        if (unitInput) unitInput.value = inputUnit;
+
+        if (transferDateInput && performed && !transferDateInput.value) {
+            transferDateInput.value = recordDateInput?.value || '';
+        }
+
+        const updateComposterSelect = (batchSelect, composterSelect) => {
+            if (!batchSelect || !composterSelect) return;
+            const selectedValue = composterSelect.value || '';
+            composterSelect.innerHTML = this.renderTransferComposterOptions(batchSelect.value, selectedValue);
+        };
+
+        updateComposterSelect(sourceBatchSelect, sourceComposterSelect);
+        updateComposterSelect(destinationBatchSelect, destinationComposterSelect);
+    },
+
+    syncMaterialTransferDateWithRecordDate() {
+        const recordDate = document.getElementById('recordDate')?.value || '';
+        const transferDateInput = document.getElementById('materialTransferDate');
+        if (!transferDateInput) return;
+        const previousRecordDate = transferDateInput.dataset.recordDate || '';
+        if (!transferDateInput.value || transferDateInput.value === previousRecordDate) {
+            transferDateInput.value = recordDate;
+        }
+        transferDateInput.dataset.recordDate = recordDate;
     },
 
     toggleICTAPhotoUploadModule() {
@@ -7139,6 +7768,143 @@ const App = {
         }
 
         document.body.appendChild(modal);
+    },
+
+    showFormModal(options = {}) {
+        const {
+            id = 'formModal',
+            title = 'Input',
+            fields = [],
+            confirmText = 'Save',
+            cancelText = 'Cancel',
+            confirmClass = 'btn btn-primary',
+            cancelClass = 'btn btn-secondary',
+            onConfirm = null,
+            onCancel = null
+        } = options;
+
+        try {
+            document.querySelectorAll('.modal-overlay').forEach((el) => el.remove());
+        } catch (error) {
+        }
+
+        const existing = document.getElementById(id);
+        if (existing) existing.remove();
+
+        const renderField = (field) => {
+            const fieldId = String(field?.id || '');
+            const label = String(field?.label || '');
+            const type = String(field?.type || 'text');
+            const value = field?.value != null ? String(field.value) : '';
+            const placeholder = field?.placeholder != null ? String(field.placeholder) : '';
+            const required = field?.required === true;
+            const helpText = field?.helpText != null ? String(field.helpText) : '';
+            const optionsList = Array.isArray(field?.options) ? field.options : [];
+            const optionsHtml = optionsList.map((opt) => {
+                const raw = String(opt);
+                return `<option value="${this.escapeAttr(raw)}" ${raw === value ? 'selected' : ''}>${this.escapeHtml(raw)}</option>`;
+            }).join('');
+
+            const control = type === 'select'
+                ? `<select class="form-input" id="${this.escapeAttr(fieldId)}" ${required ? 'required' : ''}>
+                        <option value="">Select...</option>
+                        ${optionsHtml}
+                   </select>`
+                : `<input class="form-input" id="${this.escapeAttr(fieldId)}" type="${this.escapeAttr(type)}" value="${this.escapeAttr(value)}" placeholder="${this.escapeAttr(placeholder)}" ${required ? 'required' : ''}>`;
+
+            return `
+                <div class="form-group">
+                    <label class="form-label ${required ? 'required' : ''}" for="${this.escapeAttr(fieldId)}">${this.escapeHtml(label)}</label>
+                    ${helpText ? `<div style="margin-bottom: 8px; color: var(--gray); font-size: 0.9rem;">${this.escapeHtml(helpText)}</div>` : ''}
+                    ${control}
+                </div>
+            `;
+        };
+
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.id = id;
+        modal.innerHTML = `
+            <div class="modal" style="max-width: 560px;">
+                <div class="modal-header">
+                    <h2 class="modal-title">${this.escapeHtml(title)}</h2>
+                </div>
+                <div class="modal-body">
+                    <form id="${this.escapeAttr(id)}Form">
+                        ${fields.map(renderField).join('')}
+                        <div class="modal-footer" style="padding: 0; border-top: none; justify-content: flex-end; gap: 10px;">
+                            <button type="button" class="${this.escapeAttr(cancelClass)}" data-role="cancel">${this.escapeHtml(cancelText)}</button>
+                            <button type="submit" class="${this.escapeAttr(confirmClass)}" data-role="confirm">${this.escapeHtml(confirmText)}</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        `;
+
+        modal.addEventListener('click', (event) => {
+            if (event.target === modal) {
+                modal.remove();
+                if (typeof onCancel === 'function') onCancel();
+            }
+        });
+
+        const form = modal.querySelector('form');
+        const cancelBtn = modal.querySelector('[data-role="cancel"]');
+        const confirmBtn = modal.querySelector('[data-role="confirm"]');
+
+        if (cancelBtn) {
+            cancelBtn.addEventListener('click', () => {
+                modal.remove();
+                if (typeof onCancel === 'function') onCancel();
+            });
+        }
+
+        if (form) {
+            form.addEventListener('submit', async (event) => {
+                event.preventDefault();
+                const values = {};
+                for (const field of fields) {
+                    const fieldId = String(field?.id || '');
+                    if (!fieldId) continue;
+                    const el = document.getElementById(fieldId);
+                    const value = el ? String(el.value || '').trim() : '';
+                    values[fieldId] = value;
+                    if (field?.required && !value) {
+                        alert(`Please fill in: ${field?.label || fieldId}`);
+                        return;
+                    }
+                }
+
+                if (typeof onConfirm !== 'function') {
+                    modal.remove();
+                    return;
+                }
+
+                try {
+                    if (confirmBtn) confirmBtn.disabled = true;
+                    await onConfirm(values);
+                    modal.remove();
+                } catch (error) {
+                    alert(error?.message || 'Operation failed. Please try again.');
+                    if (confirmBtn) confirmBtn.disabled = false;
+                }
+            });
+        }
+
+        document.body.appendChild(modal);
+
+        const firstId = fields.find((f) => f?.id)?.id;
+        if (firstId) {
+            try {
+                const rawId = String(firstId);
+                const escaped = (window.CSS && typeof window.CSS.escape === 'function')
+                    ? window.CSS.escape(rawId)
+                    : rawId.replace(/([ !"#$%&'()*+,./:;<=>?@[\\\]^`{|}~])/g, '\\$1');
+                const firstEl = modal.querySelector(`#${escaped}`);
+                if (firstEl && typeof firstEl.focus === 'function') firstEl.focus();
+            } catch (error) {
+            }
+        }
     },
 
     showTransientSuccessMessage(message, duration = 2300) {
@@ -7510,11 +8276,14 @@ const App = {
         if (!batch) return;
         const batchRouteId = this.getBatchRouteId(batch);
         const previousRecord = this.data.editingRecord
-            ? batch.records.find((r) => String(r.id) === String(this.data.editingRecord)) || null
+            ? this.normalizeRecordForCompatibility(batch.records.find((r) => String(r.id) === String(this.data.editingRecord)) || null, batch)
             : null;
 
         const date = document.getElementById('recordDate').value;
         const composterId = (document.getElementById('composterId')?.value || '').trim();
+        const duplicateDateRecord = !this.data.editingRecord
+            ? this.normalizeRecordForCompatibility(batch.records.find((r) => String(r.date || '') === String(date || '')) || null, batch)
+            : null;
 
         const isICTA = this.isICTAUser();
 
@@ -7546,6 +8315,7 @@ const App = {
             totalOrganicWaste: 0,
             regularStructuralMaterial: 0,
             totalStructuralMaterial: 0,
+            totalMaterialInput: 0,
             totalOrganicInput: 0,
             quality: qualityEl ? qualityEl.value : '',
             contaminants,
@@ -7602,7 +8372,7 @@ const App = {
             const additionalTotals = this.calculateAdditionalInputTotals(additionalInputs);
             const totalOrganicWaste = totalFoodWaste + additionalTotals.additionalOrganicMaterial;
             const totalStructuralMaterial = regularStructuralMaterial + additionalTotals.additionalStructuralMaterial;
-            const totalOrganicInput = totalOrganicWaste + totalStructuralMaterial;
+            const totalMaterialInput = totalOrganicWaste + totalStructuralMaterial;
             const inputMethod = this.getBatchMeasurementSettings(batch)?.inputMethod || '';
             const foodStructuralRatio = inputMethod === 'volume' ? this.simplifyRatio(totalOrganicWaste, totalStructuralMaterial) : '';
 
@@ -7621,7 +8391,8 @@ const App = {
                 additionalInputs,
                 totalAdditionalInput: additionalTotals.totalAdditionalInput,
                 totalOrganicWaste,
-                totalOrganicInput,
+                totalMaterialInput,
+                totalOrganicInput: totalMaterialInput,
                 foodStructuralRatio
             };
 
@@ -7645,7 +8416,8 @@ const App = {
             input.totalOrganicWaste = totalOrganicWaste;
             input.regularStructuralMaterial = regularStructuralMaterial;
             input.totalStructuralMaterial = totalStructuralMaterial;
-            input.totalOrganicInput = totalOrganicInput;
+            input.totalMaterialInput = totalMaterialInput;
+            input.totalOrganicInput = totalMaterialInput;
             input.totalWasteInput = totalOrganicWaste;
             input.ratio = (totalOrganicWaste > 0) ? `1:${Math.round((totalStructuralMaterial / totalOrganicWaste) * 100) / 100}` : '';
         } else {
@@ -7684,7 +8456,7 @@ const App = {
             const additionalTotals = this.calculateAdditionalInputTotals(additionalInputs);
             const totalOrganicWaste = totalFoodWaste + additionalTotals.additionalOrganicMaterial;
             const totalStructuralMaterial = regularStructuralMaterial + additionalTotals.additionalStructuralMaterial;
-            const totalOrganicInput = totalOrganicWaste + totalStructuralMaterial;
+            const totalMaterialInput = totalOrganicWaste + totalStructuralMaterial;
 
             maintenance = {
                 foodWasteEntries,
@@ -7697,7 +8469,8 @@ const App = {
                 additionalInputs,
                 totalAdditionalInput: additionalTotals.totalAdditionalInput,
                 totalOrganicWaste,
-                totalOrganicInput
+                totalMaterialInput,
+                totalOrganicInput: totalMaterialInput
             };
 
             input.regularOrganicWaste = totalFoodWaste;
@@ -7725,7 +8498,8 @@ const App = {
             input.totalWasteInput = totalOrganicWaste;
             input.regularStructuralMaterial = regularStructuralMaterial;
             input.totalStructuralMaterial = totalStructuralMaterial;
-            input.totalOrganicInput = totalOrganicInput;
+            input.totalMaterialInput = totalMaterialInput;
+            input.totalOrganicInput = totalMaterialInput;
             input.ratio = (totalOrganicWaste > 0) ? `1:${Math.round((totalStructuralMaterial / totalOrganicWaste) * 100) / 100}` : '';
         }
 
@@ -7867,8 +8641,41 @@ const App = {
             notes
         };
 
-        const record = {
-            id: this.data.editingRecord ? String(this.data.editingRecord) : String(Date.now()),
+        if (duplicateDateRecord) {
+            if (!confirm(`A record for ${this.formatDate(date)} already exists. Do you want to update it?`)) {
+                return;
+            }
+        }
+
+        const materialTransfer = this.getMaterialTransferFormState(batch, date);
+        const metadataSourceRecord = previousRecord || duplicateDateRecord;
+        const previousMetadata = this.normalizeRecordMetadata(metadataSourceRecord?.metadata);
+        const operator = this.getCurrentOperatorIdentity();
+        const nowIso = new Date().toISOString();
+        const metadata = metadataSourceRecord
+            ? {
+                ...previousMetadata,
+                createdByUID: previousMetadata.createdByUID || operator.uid,
+                createdByEmail: previousMetadata.createdByEmail || operator.email,
+                createdByName: previousMetadata.createdByName || operator.name,
+                createdAt: previousMetadata.createdAt || nowIso,
+                lastEditedByUID: operator.uid,
+                lastEditedByEmail: operator.email,
+                lastEditedByName: operator.name,
+                lastEditedAt: nowIso
+            }
+            : {
+                ...previousMetadata,
+                createdByUID: operator.uid,
+                createdByEmail: operator.email,
+                createdByName: operator.name,
+                createdAt: nowIso
+            };
+
+        const record = this.normalizeRecordForCompatibility({
+            id: this.data.editingRecord
+                ? String(this.data.editingRecord)
+                : String(metadataSourceRecord?.id || Date.now()),
             date,
             composterId,
             input,
@@ -7876,6 +8683,8 @@ const App = {
             observation,
             monitoring,
             maintenance,
+            materialTransfer,
+            metadata,
             actionTaken,
             actionTurning,
             actionMixing,
@@ -7887,9 +8696,9 @@ const App = {
             otherActionDescription,
             uploadedPhotos,
             notes
-        };
+        }, batch);
 
-        const isNewRecord = !this.data.editingRecord && !previousRecord;
+        const isNewRecord = !previousRecord && !duplicateDateRecord;
 
         if (this.data.editingRecord) {
             const index = batch.records.findIndex(r => r.id === this.data.editingRecord);
@@ -7897,12 +8706,8 @@ const App = {
                 batch.records[index] = record;
             }
         } else {
-            const existingIndex = batch.records.findIndex(r => r.date === date);
+            const existingIndex = batch.records.findIndex(r => String(r.date || '') === String(date || ''));
             if (existingIndex >= 0) {
-                if (!confirm(`A record for ${this.formatDate(date)} already exists. Do you want to update it?`)) {
-                    return;
-                }
-                record.id = String(batch.records[existingIndex].id);
                 batch.records[existingIndex] = record;
             } else {
                 batch.records.push(record);
@@ -7918,8 +8723,8 @@ const App = {
 
         const cloudPhotosEnabled = this.isCloudPhotoStorageEnabled();
         const sharedBatch = this.isBatchShared(batch);
-        const priorPhotoPaths = cloudPhotosEnabled ? this.getPhotoStoragePaths(previousRecord?.uploadedPhotos || []) : [];
-        const priorPhotoCount = cloudPhotosEnabled ? this.normalizePhotoList(previousRecord?.uploadedPhotos || []).length : 0;
+        const priorPhotoPaths = cloudPhotosEnabled ? this.getPhotoStoragePaths(metadataSourceRecord?.uploadedPhotos || []) : [];
+        const priorPhotoCount = cloudPhotosEnabled ? this.normalizePhotoList(metadataSourceRecord?.uploadedPhotos || []).length : 0;
         let removedPhotoPaths = [];
         let nextPhotoCount = this.normalizePhotoList(record.uploadedPhotos).length;
         if (cloudPhotosEnabled) {
@@ -8199,7 +9004,7 @@ const App = {
         const batch = this.data.currentBatch;
         if (!batch) return;
 
-        const totalInput = this.calculateTotalInput(batch);
+        const totalInput = this.calculateBatchTotalMaterialInput(batch);
         const compostOutput = parseFloat(document.getElementById('compostOutput')?.value) || 0;
         const estimatedLoss = totalInput - compostOutput;
 
@@ -8533,7 +9338,7 @@ const App = {
                                     <div class="summary-value">${this.formatNumber(estimatedOutput, 1)}</div>
                                     <div class="summary-label">Estimated Compost Output (${inputUnit})</div>
                                     <div style="margin-top: 6px; color: var(--gray); font-size: 0.9rem;">
-                                        (Initial Composting Stock + Total Organic Input + Total Water Added) × ${this.formatNumber(conversionSettings.compostConversionRate * 100, 2)}% conversion rate
+                                        (Initial Composting Stock + Total Material Input) × ${this.formatNumber(conversionSettings.compostConversionRate * 100, 2)}% conversion rate
                                     </div>
                                 </div>
                             </div>
@@ -8796,7 +9601,7 @@ const App = {
         const dateTo = document.getElementById('exportDateTo')?.value;
         const format = document.querySelector('input[name="exportFormat"]:checked')?.value || 'csv';
 
-        let records = batch.records;
+        let records = (Array.isArray(batch.records) ? batch.records : []).map((record) => this.normalizeRecordForCompatibility(record, batch));
         if (dateFrom) {
             records = records.filter(r => r.date >= dateFrom);
         }
@@ -8807,6 +9612,7 @@ const App = {
         const isICTA = this.isICTAUser();
         const batchSummaryEnabled = document.getElementById('exportModule-batchSummary')?.checked ?? true;
         const dailyRecordsEnabled = document.getElementById('exportModule-dailyRecords')?.checked ?? true;
+        const transferRecordsEnabled = document.getElementById('exportModule-transferRecords')?.checked ?? true;
         const harvestEnabled = document.getElementById('exportModule-harvest')?.checked ?? true;
         const finalAssessmentEnabled = document.getElementById('exportModule-finalAssessment')?.checked ?? true;
         const inputUnit = this.getBatchInputUnitName(batch);
@@ -8814,9 +9620,8 @@ const App = {
         const finalAssessment = batch.finalAssessment || {};
         const finishedDate = batch.finishedDate || '';
         const initialStockAmount = this.calculateInitialStockAmount(batch);
-        const totalOrganicInput = this.calculateTotalInput(batch);
+        const totalMaterialInput = this.calculateTotalMaterialInput(batch);
         const totalWaterAdded = this.calculateTotalWaterAdded(batch);
-        const totalSystemInput = this.calculateTotalMaterialInput(batch);
         const calculationSettings = this.getBatchCalculationSettings(batch);
         const communityType = this.data.currentCommunityType === 'Other'
             ? (this.data.currentCommunityTypeOther || 'Other')
@@ -8846,7 +9651,7 @@ const App = {
             };
         };
         if (dailyRecordsEnabled) {
-            if (document.getElementById('exportTotalInput')?.checked) headers.push(`Organic Waste (${inputUnit})`, `Structural Material (${inputUnit})`, `Total Organic Input (${inputUnit})`);
+            if (document.getElementById('exportTotalInput')?.checked) headers.push(`Organic Waste (${inputUnit})`, `Structural Material (${inputUnit})`, `Total Material Input (${inputUnit})`);
             if (isICTA) {
                 if (document.getElementById('exportCocinaPlanta')?.checked) {
                     headers.push(`Cocina (${inputUnit})`, `Planta 0 (${inputUnit})`, `Planta 1 (${inputUnit})`, `Planta 3 (${inputUnit})`);
@@ -8870,6 +9675,7 @@ const App = {
 
             if (document.getElementById('exportOdour')?.checked) headers.push('Odour', 'Odour Note');
             if (document.getElementById('exportLeachate')?.checked) headers.push('Leachate', 'Leachate Note');
+            if (document.getElementById('exportRecordMetadata')?.checked) headers.push('Created By', 'Created Email', 'Created Time', 'Last Edited By', 'Last Edited Time');
         }
 
         const escapeCsv = (value) => {
@@ -8931,9 +9737,8 @@ const App = {
             if (document.getElementById('exportSummaryTotals')?.checked) {
                 batchSummaryEntries.push(
                     [`Initial Composting Stock (${inputUnit})`, initialStockAmount],
-                    [`Total Organic Input (${inputUnit})`, totalOrganicInput],
-                    ['Total Water Added (L)', totalWaterAdded],
-                    [`Batch Total System Input (${inputUnit})`, totalSystemInput]
+                    [`Total Material Input (${inputUnit})`, totalMaterialInput],
+                    ['Total Water Added (L)', totalWaterAdded]
                 );
             }
             if (document.getElementById('exportSummaryCalculation')?.checked) {
@@ -8964,9 +9769,10 @@ const App = {
                 const materialBreakdown = this.calculateRecordMaterialBreakdown(r);
                 const monitoringState = this.getICTAMonitoringState(r);
                 const actionExport = getRecordActionExportValues(r);
+                const metadata = this.normalizeRecordMetadata(r?.metadata);
 
                 if (document.getElementById('exportTotalInput')?.checked) {
-                    row.push(materialBreakdown.totalOrganicWaste, materialBreakdown.totalStructuralMaterial, materialBreakdown.totalOrganicInput);
+                    row.push(materialBreakdown.totalOrganicWaste, materialBreakdown.totalStructuralMaterial, materialBreakdown.totalMaterialInput);
                 }
                 if (isICTA) {
                     if (document.getElementById('exportCocinaPlanta')?.checked) {
@@ -9042,9 +9848,61 @@ const App = {
                     row.push(r.observation?.leachate || '');
                     row.push(r.observation?.leachateNote || '');
                 }
+                if (document.getElementById('exportRecordMetadata')?.checked) {
+                    row.push(
+                        metadata.createdByName || metadata.createdByEmail || '',
+                        metadata.createdByEmail || '',
+                        metadata.createdAt || '',
+                        metadata.lastEditedByName || metadata.lastEditedByEmail || '',
+                        metadata.lastEditedAt || ''
+                    );
+                }
 
                 pushExportRow(row, 'data');
             });
+        }
+
+        if (transferRecordsEnabled) {
+            const transferOverview = this.collectBatchTransferData(batch, { dateFrom, dateTo });
+            if (document.getElementById('exportTransferSummary')?.checked) {
+                addFieldValueSection('MATERIAL TRANSFER SUMMARY', [
+                    ['Incoming Transfers', this.formatTransferSummaryText(transferOverview.incomingCount, transferOverview.incomingAmount, inputUnit)],
+                    ['Outgoing Transfers', this.formatTransferSummaryText(transferOverview.outgoingCount, transferOverview.outgoingAmount, inputUnit)]
+                ]);
+            }
+            if (document.getElementById('exportTransferHistory')?.checked) {
+                addSectionTitle('MATERIAL TRANSFER HISTORY');
+                if (transferOverview.history.length === 0) {
+                    pushExportRow(['No material transfers found for the selected date range.'], 'note');
+                } else {
+                    pushExportRow([
+                        'Transfer Date',
+                        'Record Date',
+                        'Source Batch',
+                        'Source Composter',
+                        'Destination Batch',
+                        'Destination Composter',
+                        'Material Type',
+                        `Transferred Amount (${inputUnit})`,
+                        'Unit',
+                        'Notes'
+                    ], 'header');
+                    transferOverview.history.forEach((entry) => {
+                        pushExportRow([
+                            entry.effectiveDate || '',
+                            entry.recordDate || '',
+                            entry.sourceBatchLabel || '',
+                            entry.sourceComposterLabel || '',
+                            entry.destinationBatchLabel || '',
+                            entry.destinationComposterLabel || '',
+                            entry.materialType || '',
+                            entry.amount || 0,
+                            entry.unit || inputUnit,
+                            entry.notes || ''
+                        ], 'data');
+                    });
+                }
+            }
         }
 
         if (harvestEnabled && batch.output) {
