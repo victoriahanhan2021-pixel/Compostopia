@@ -12,7 +12,10 @@ service cloud.firestore {
     function isCollaborator(batchData) {
       return signedIn()
         && request.auth.token.email != null
-        && request.auth.token.email in batchData.collaboratorEmails;
+        && (
+          request.auth.token.email in batchData.collaboratorEmails
+          || request.auth.token.email in (batchData.collaborationSettings?.collaborators || [])
+        );
     }
 
     function canAccessBatch(batchData) {

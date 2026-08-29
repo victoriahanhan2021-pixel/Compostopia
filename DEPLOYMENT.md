@@ -46,7 +46,11 @@ firebase deploy --only firestore:rules
 
 说明：
 - 方案 A（不启用 Storage）只需要部署 Firestore rules。
-- 如果未来要启用“照片共享”，再启用 Storage 并补上 Storage rules 部署。
+- 方案 B（启用照片共享 Storage）：**额外**再部署 Storage rules（Firebase Console → Storage 先启用，再运行）：
+  ```bash
+  firebase deploy --only firestore:rules,storage:rules
+  ```
+  注意 `firebase.json` 没有显式声明 storage rules 路径，默认会匹配根目录 `storage.rules`（本项目已提供）。启用后 `storage.rules` 中的 `batch-photos/{ownerUid}/{batchRouteId}/**` 路径才会真正强制共享照片权限。
 
 ## 5) 发布前端到 GitHub Pages
 

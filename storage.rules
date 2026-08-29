@@ -16,7 +16,10 @@ service firebase.storage {
           batchDoc(ownerUid, batchRouteId).data.ownerUid == request.auth.uid
           || (
             request.auth.token.email != null
-            && request.auth.token.email in batchDoc(ownerUid, batchRouteId).data.collaboratorEmails
+            && (
+              request.auth.token.email in batchDoc(ownerUid, batchRouteId).data.collaboratorEmails
+              || request.auth.token.email in (batchDoc(ownerUid, batchRouteId).data.collaborationSettings?.collaborators || [])
+            )
           )
         );
     }

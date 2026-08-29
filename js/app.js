@@ -31,6 +31,7 @@ try {
 
 const App = {
     data: {
+        projectId: "composting-74985",
         batches: [],
         currentBatch: null,
         currentPage: 'login',
@@ -87,7 +88,7 @@ const App = {
             const page = String(params.get('page') || '').trim();
             const batchId = String(params.get('batchId') || '').trim();
             const recordId = params.get('recordId');
-            const allowedPages = new Set(['dashboard', 'createBatch', 'batchDetail', 'dailyRecord', 'output', 'export']);
+            const allowedPages = new Set(['dashboard', 'projectDashboard', 'createBatch', 'batchDetail', 'dailyRecord', 'output', 'export', 'carbonReduction']);
             if (!allowedPages.has(page)) return null;
             const route = { page };
             if (batchId) route.batchId = batchId;
@@ -337,6 +338,29 @@ const App = {
 
     canDeleteBatch(batch) {
         return this.isBatchOwner(batch);
+    },
+
+    // Compostopia v1: No multi-project structure yet.
+    // All batches implicitly share one "virtual" global project per user/org.
+    // These stubs make Carbon page back-navigation and Archived gates behave
+    // correctly without needing a formal Create Project UI (Phase ≥?).
+    getProjectByBatch(batch) {
+        if (!batch) return null;
+        const ownerEmail = batch.ownerEmail || this.data.currentUser?.email || '';
+        const orgName = this.data.currentOrganization || 'Global';
+        return {
+            id: this.data.projectId || 'global-default-project',
+            projectName: `${orgName} Compost Project${ownerEmail ? ` (${ownerEmail.split('@')[0]})` : ''}`,
+            ownerEmail,
+            archived: !!(batch.projectArchived || batch.__stale_archived)
+        };
+    },
+    getProjectRouteId(project) {
+        return project ? String(project.id || 'global-default-project') : null;
+    },
+    isProjectArchived(batch) {
+        const project = this.getProjectByBatch(batch);
+        return !!(project?.archived || batch?.archived || batch?.projectArchived);
     },
 
     getBatchCollaborators(batch) {
@@ -3663,7 +3687,7 @@ const App = {
             acc.totalOrganicWaste += breakdown.totalOrganicWaste;
             acc.totalStructuralMaterial += breakdown.totalStructuralMaterial;
             acc.totalMaterialInput += breakdown.totalMaterialInput;
-            acc.totalOrganicInput += breakdown.totalMaterialInput;
+            acc.totalOrganicInput += breakdown.totalOrganicWaste;
             return acc;
         }, {
             regularOrganicWaste: 0,
@@ -3687,7 +3711,7 @@ const App = {
     },
 
     calculateRecordTotalOrganicInput(record) {
-        return this.calculateRecordTotalMaterialInput(record);
+        return this.calculateRecordMaterialBreakdown(record).totalOrganicWaste;
     },
 
     calculateAvgTemperature(record) {
@@ -4062,6 +4086,13 @@ const App = {
                 break;
             case 'output':
                 app.innerHTML = this.renderOutput();
+                break;
+            case 'carbonReduction':
+                app.innerHTML = this.renderCarbonReductionPage();
+                break;
+            case 'projectDashboard':
+            case 'dashboard':
+                app.innerHTML = this.renderDashboard();
                 break;
             case 'export':
                 app.innerHTML = this.renderExport();
@@ -5248,13 +5279,16 @@ const App = {
                 <div class="card">
                     <div class="card-header" style="margin-bottom: 0; padding-bottom: 0; border-bottom: none;">
                         <h2 class="card-title">📊 Batch Information</h2>
-                        ${batch.status === 'active' ? `
-                            <div class="btn-group" style="justify-content: flex-end;">
+                        <div class="btn-group" style="justify-content: flex-end; gap: 8px; flex-wrap: wrap;">
+                            <button class="btn btn-secondary" style="background: #ECFDF5; border-color:#A7F3D0; color:#064E3B;" onclick="app.navigate('carbonReduction', {batchId: '${escapedRouteId}'})">
+                                🌍 Carbon Reduction
+                            </button>
+                            ${batch.status === 'active' ? `
                                 <button class="btn btn-danger" onclick="app.showFinishModal('${escapedRouteId}')">
                                     🏁 Finish Batch
                                 </button>
-                            </div>
-                        ` : `<div></div>`}
+                            ` : ''}
+                        </div>
                     </div>
                     <div class="batch-info" style="margin-top: 20px;">
                         <div class="info-item">
@@ -5801,6 +5835,684 @@ const App = {
         `;
     },
 
+    // =====================================================================================
+    // PHASE 7.2 Carbon Reduction — General Model v2.0 Engine + Schema + Page Renderer
+    // (Replaces legacy Phase 7.0/7.1 embedded mini module above; above kept for historical compat only)
+    // Permanent Redlines (enforced EVERYWHERE):
+    //   Redline 1: Analytical Layer — Carbon Reduction NEVER modifies Batch operational records
+    //   Redline 2: Transport-only  — NOT a complete LCA (no process emissions / CH₄ / soil C / fertiliser offset)
+    //   Redline 3: No "Carbon Score/Benchmark/Recommended" wording
+    // Model Shape 4 branches:
+    //   I1 shared_collection_vehicle  → VLE=OW(effT) × distance × EF (one_way raw; user decides)
+    //   I1 dedicated_collection_trip → manual OR ceil(OW/effLoad) × trip_distance × basis × EF
+    //   I2 dedicated_procurement_trip → AvoidedTrips × RTD × EF (× Repl% effective replacement)
+    //   I2 amount_based_procurement  → (ReplacementKg / PerTripKg) × treatment(proportional|ceil) × RTD × EF
+    // §73 Both-only Total; §37 round(TotalRaw,3); Normalised = g CO₂-eq / kg OW
+    // =====================================================================================
+
+    buildCarbonReductionMetricsV2(analysisPatch = {}, context = {}) {
+        const batch = context.batch || null;
+        const norm = (v) => {
+            if (v === '' || v == null || v === undefined) return null;
+            const n = Number(v);
+            return isNaN(n) ? null : n;
+        };
+        const R3 = (v) => (v == null || isNaN(v) || !isFinite(v)) ? null : Math.round(v * 1000) / 1000;
+
+        // ----- 1. Canonical Operational Snapshot (Section A auto-derived, READ-ONLY) -----
+        const records = Array.isArray(batch?.records) ? batch.records : [];
+        let rawOwTotal = 0, hadOw = false;
+        records.forEach((r) => {
+            const brk = this.calculateRecordMaterialBreakdown(r);
+            const v = this.normalizeOptionalNumber(brk?.regularOrganicWaste);
+            if (v != null) { rawOwTotal += v; hadOw = true; }
+            const av = this.normalizeOptionalNumber(brk?.additionalOrganicMaterial);
+            if (av != null) { rawOwTotal += av; hadOw = true; }
+        });
+        const organicWasteRecordedValue = hadOw ? rawOwTotal : null;
+        const method = (batch?.measurementMethod || batch?.measurementMode || batch?.inputMode || 'weight').toString().toLowerCase();
+        const recordedUnit = (batch?.inputUnit || batch?.measurementUnit || (method === 'volume' ? 'L' : 'kg')).toString();
+        const massConversionFactor = norm(analysisPatch.conversionMassFactorForAnalysis);
+        let organicWasteCalculatedMassKg = null;
+        let conversionApplied = false;
+        if (organicWasteRecordedValue != null) {
+            if (method === 'weight' || /kg|kilogram|tonne|ton/i.test(recordedUnit)) {
+                organicWasteCalculatedMassKg = organicWasteRecordedValue;
+                conversionApplied = false;
+            } else if (massConversionFactor != null && massConversionFactor > 0) {
+                organicWasteCalculatedMassKg = organicWasteRecordedValue * massConversionFactor;
+                conversionApplied = true;
+            } else {
+                organicWasteCalculatedMassKg = null;
+                conversionApplied = true;
+            }
+        }
+        const out = batch?.output || {};
+        const compostActualKg = norm(out?.compostOutput);
+        const compostEstimatedKg = norm(out?.estimatedOutput);
+        let compostOutputAmountKg = null;
+        let compostOutputSource = 'No Batch Output Recorded';
+        if (compostActualKg != null && compostActualKg > 0) { compostOutputAmountKg = compostActualKg; compostOutputSource = 'Actual Output Record'; }
+        else if (compostEstimatedKg != null && compostEstimatedKg > 0) { compostOutputAmountKg = compostEstimatedKg; compostOutputSource = 'Estimated Compost Output'; }
+        const operationalSnapshot = {
+            organicWaste: { recordedValue: organicWasteRecordedValue, recordedUnit, measurementMethod: method, massConversionFactor, conversionAppliedForAnalysis: conversionApplied, calculatedMassKg: organicWasteCalculatedMassKg },
+            compostOutput: { amountKg: compostOutputAmountKg, source: compostOutputSource },
+            batch: { id: batch?.id || null, name: batch?.batchName || batch?.name || null, status: batch?.status || 'active' }
+        };
+
+        // ----- 2. Assumptions -----
+        const ass = analysisPatch.assumptions || this._defaultCarbonAssumptions(batch).assumptions;
+        const i1Rep = ass.impact1TransportRepresentation;
+        const i2Rep = ass.impact2ProcurementRepresentation;
+        const organicWasteKg = norm(organicWasteCalculatedMassKg);
+        const compostOutputKg = norm(compostOutputAmountKg);
+        const organicWasteT = (organicWasteKg != null && organicWasteKg >= 0) ? organicWasteKg / 1000 : null;
+
+        // ----- 3. Impact 1 -----
+        let impact1 = { ready: false, representation: i1Rep, avoidedCo2Kg: null, avoidedCo2KgRaw: null };
+        if (i1Rep === 'shared_collection_vehicle') {
+            const capT = norm(ass.impact1SharedVehicleCapacityT);
+            const loadPct = norm(ass.impact1SharedLoadingRatePct);
+            const distKm = norm(ass.impact1SharedDistanceKm);
+            const ef = norm(ass.impact1SharedCo2EfKgCo2eqPerVmKm);
+            const type = ass.impact1SharedDistanceType;
+            const effLoadT = (capT!=null && loadPct!=null && capT>=0 && loadPct>=0) ? (capT * (loadPct/100)) : null;
+            let vehicleLoadEquivalent = null;
+            if (organicWasteT != null && effLoadT != null && effLoadT > 0) vehicleLoadEquivalent = organicWasteT / effLoadT;
+            else if (effLoadT == null || effLoadT === 0) vehicleLoadEquivalent = null;
+            impact1.effectiveVehicleLoadT = effLoadT;
+            impact1.organicWasteT = organicWasteT;
+            impact1.vehicleLoadEquivalent = vehicleLoadEquivalent;
+            impact1.representedDistanceKm = distKm;
+            impact1.distanceType = type;
+            impact1.emissionFactor = ef;
+            const ready = organicWasteKg != null && organicWasteKg > 0
+                && distKm != null && distKm >= 0
+                && capT != null && capT > 0
+                && loadPct != null && loadPct > 0
+                && ef != null && ef >= 0
+                && effLoadT > 0
+                && vehicleLoadEquivalent != null && isFinite(vehicleLoadEquivalent);
+            impact1.ready = ready;
+            if (ready) {
+                const raw = vehicleLoadEquivalent * distKm * ef;
+                impact1.avoidedCo2KgRaw = raw;
+                impact1.avoidedCo2Kg = R3(raw);
+            }
+        } else if (i1Rep === 'dedicated_collection_trip') {
+            const mode = ass.impact1DedicatedTripCalcMode;
+            const capacityT = norm(ass.impact1DedicatedVehicleCapacityT);
+            const loadPct = norm(ass.impact1DedicatedLoadingRatePct);
+            const manualTrips = norm(ass.impact1DedicatedNumberTrips);
+            const distPerTrip = norm(ass.impact1DedicatedDistancePerTripKm);
+            const basis = ass.impact1DedicatedDistanceBasis;
+            const ef = norm(ass.impact1DedicatedCo2EfKgCo2eqPerVmKm);
+            const effLoadT = (capacityT!=null && loadPct!=null && capacityT>=0 && loadPct>=0) ? (capacityT * (loadPct/100)) : null;
+            let numberTrips = null;
+            let tripsDerivedViaCeil = false;
+            if (mode === 'manual_trips') numberTrips = manualTrips;
+            else if (mode === 'from_capacity') {
+                if (organicWasteT != null && effLoadT != null && effLoadT > 0) {
+                    numberTrips = Math.ceil(organicWasteT / effLoadT);
+                    tripsDerivedViaCeil = true;
+                }
+            }
+            let effTripDist = null;
+            if (distPerTrip != null && basis === 'round_trip') effTripDist = distPerTrip;
+            else if (distPerTrip != null && basis === 'one_way_doubled') effTripDist = distPerTrip * 2;
+            impact1.organicWasteT = organicWasteT;
+            impact1.effectiveVehicleLoadT = effLoadT;
+            impact1.tripCalcMode = mode;
+            impact1.numberTrips = numberTrips;
+            impact1.tripsDerivedViaCeil = tripsDerivedViaCeil;
+            impact1.enteredDistancePerTripKm = distPerTrip;
+            impact1.distanceBasis = basis;
+            impact1.effectiveTravelDistancePerTripKm = effTripDist;
+            impact1.emissionFactor = ef;
+            const ready = organicWasteKg != null && organicWasteKg > 0
+                && mode != null
+                && numberTrips != null && numberTrips >= 0 && isFinite(numberTrips)
+                && effTripDist != null && effTripDist >= 0
+                && ef != null && ef >= 0;
+            impact1.ready = ready;
+            if (ready) {
+                const raw = numberTrips * effTripDist * ef;
+                impact1.avoidedCo2KgRaw = raw;
+                impact1.avoidedCo2Kg = R3(raw);
+            }
+        }
+
+        // ----- 4. Impact 2 (shared Replacement Fraction) -----
+        const replPct = norm(ass.impact2ReplacementFractionPct);
+        const replFrac = (replPct != null && replPct >= 0) ? replPct / 100 : null;
+        const effectiveReplacementKg = (compostOutputKg != null && compostOutputKg >= 0 && replFrac != null) ? compostOutputKg * replFrac : null;
+        let impact2 = { ready: false, representation: i2Rep, avoidedCo2Kg: null, avoidedCo2KgRaw: null };
+        impact2.selectedCompostOutputKg = compostOutputKg;
+        impact2.replacementFractionPct = replPct;
+        impact2.effectiveReplacementKg = effectiveReplacementKg;
+        if (i2Rep === 'dedicated_procurement_trip') {
+            const trips = norm(ass.impact2DedicatedAvoidedTrips);
+            const rtd = norm(ass.impact2DedicatedRoundTripKm);
+            const ef = norm(ass.impact2DedicatedCo2EfKgCo2eqPerVmKm);
+            impact2.avoidedTrips = trips;
+            impact2.roundTripDistanceKm = rtd;
+            impact2.emissionFactor = ef;
+            const ready = effectiveReplacementKg != null && effectiveReplacementKg > 0
+                && trips != null && trips >= 0
+                && rtd != null && rtd >= 0
+                && ef != null && ef >= 0;
+            impact2.ready = ready;
+            if (ready) {
+                const raw = trips * rtd * ef;
+                impact2.avoidedCo2KgRaw = raw;
+                impact2.avoidedCo2Kg = R3(raw);
+            }
+        } else if (i2Rep === 'amount_based_procurement') {
+            const perTripKg = norm(ass.impact2AmountBasedCompostPerTripKg);
+            const treatment = ass.impact2AmountBasedTripTreatment;
+            const rtd = norm(ass.impact2AmountBasedRoundTripKm);
+            const ef = norm(ass.impact2AmountBasedCo2EfKgCo2eqPerVmKm);
+            let tripsEq = null; let tripsWhole = null; let usedTreatment = null;
+            if (effectiveReplacementKg != null && effectiveReplacementKg > 0 && perTripKg != null && perTripKg > 0) {
+                if (treatment === 'proportional') { tripsEq = effectiveReplacementKg / perTripKg; usedTreatment = 'proportional'; }
+                else if (treatment === 'whole_trips') { tripsWhole = Math.ceil(effectiveReplacementKg / perTripKg); usedTreatment = 'whole_trips'; }
+            }
+            impact2.compostPerProcurementTripKg = perTripKg;
+            impact2.avoidedTripEquivalent = tripsEq;
+            impact2.avoidedTrips = tripsWhole;
+            impact2.tripTreatment = usedTreatment || treatment;
+            impact2.roundTripDistanceKm = rtd;
+            impact2.emissionFactor = ef;
+            const tripsReady = (usedTreatment === 'proportional' && tripsEq != null && isFinite(tripsEq))
+                            || (usedTreatment === 'whole_trips' && tripsWhole != null && isFinite(tripsWhole));
+            const ready = effectiveReplacementKg != null && effectiveReplacementKg > 0
+                && perTripKg != null && perTripKg > 0
+                && treatment != null
+                && tripsReady
+                && rtd != null && rtd >= 0
+                && ef != null && ef >= 0;
+            impact2.ready = ready;
+            if (ready) {
+                const tripsVal = usedTreatment === 'proportional' ? tripsEq : tripsWhole;
+                const raw = tripsVal * rtd * ef;
+                impact2.avoidedCo2KgRaw = raw;
+                impact2.avoidedCo2Kg = R3(raw);
+            }
+        }
+
+        // ----- 5. Summary Both-only §73 -----
+        const i1Raw = impact1.avoidedCo2KgRaw;
+        const i2Raw = impact2.avoidedCo2KgRaw;
+        const bothReady = impact1.ready && impact2.ready;
+        let totalRaw = null, totalR3 = null, normGPerKgOw = null;
+        if (bothReady && i1Raw != null && i2Raw != null) {
+            totalRaw = i1Raw + i2Raw;
+            totalR3 = R3(totalRaw);
+            if (organicWasteKg != null && organicWasteKg > 0) {
+                normGPerKgOw = (totalRaw / organicWasteKg) * 1000;
+            }
+        }
+
+        return {
+            modelVersion: '2.0',
+            calculatedAtISO: new Date().toISOString(),
+            operationalSnapshot,
+            impact1,
+            impact2,
+            summary: {
+                bothReady,
+                impact1AvoidedCo2Kg: impact1.avoidedCo2Kg,
+                impact2AvoidedCo2Kg: impact2.avoidedCo2Kg,
+                totalAvoidedCo2Raw: totalRaw,
+                totalAvoidedCo2Kg: totalR3,
+                normalisedReductionGPerKgOw: normGPerKgOw != null ? R3(normGPerKgOw) : null,
+                perKgOrganicWaste_I1: (organicWasteKg != null && organicWasteKg > 0 && impact1.avoidedCo2KgRaw != null) ? R3(impact1.avoidedCo2KgRaw / organicWasteKg) : null,
+                perKgCompostProduced_I2: (compostOutputKg != null && compostOutputKg > 0 && impact2.avoidedCo2KgRaw != null) ? R3(impact2.avoidedCo2KgRaw / compostOutputKg) : null,
+                perKgCompostProduced_Total: (compostOutputKg != null && compostOutputKg > 0 && totalRaw != null) ? R3(totalRaw / compostOutputKg) : null
+            }
+        };
+    },
+
+    _defaultCarbonAssumptions(batch) {
+        return {
+            modelVersion: '2.0',
+            assumptionSetLabel: 'Custom Local Assumptions',
+            sourceReferenceNotes: '',
+            lastModifiedISO: new Date().toISOString(),
+            assumptions: {
+                impact1TransportRepresentation: null,
+                impact1SharedDistanceKm: null,
+                impact1SharedDistanceType: null,
+                impact1SharedVehicleCapacityT: null,
+                impact1SharedLoadingRatePct: null,
+                impact1SharedCo2EfKgCo2eqPerVmKm: null,
+                impact1DedicatedTripCalcMode: null,
+                impact1DedicatedNumberTrips: null,
+                impact1DedicatedVehicleCapacityT: null,
+                impact1DedicatedLoadingRatePct: null,
+                impact1DedicatedDistancePerTripKm: null,
+                impact1DedicatedDistanceBasis: null,
+                impact1DedicatedCo2EfKgCo2eqPerVmKm: null,
+                impact2ReplacementFractionPct: null,
+                impact2ProcurementRepresentation: null,
+                impact2DedicatedAvoidedTrips: null,
+                impact2DedicatedRoundTripKm: null,
+                impact2DedicatedCo2EfKgCo2eqPerVmKm: null,
+                impact2AmountBasedCompostPerTripKg: null,
+                impact2AmountBasedTripTreatment: null,
+                impact2AmountBasedRoundTripKm: null,
+                impact2AmountBasedCo2EfKgCo2eqPerVmKm: null
+            }
+        };
+    },
+
+    loadICTATFMExamplePreset(batchId) {
+        const batch = this.getBatchById(batchId);
+        if (!batch) return;
+        const preset = {
+            modelVersion: '2.0',
+            assumptionSetLabel: 'ICTA-UAB TFM Example Preset — for validation / reference only',
+            sourceReferenceNotes: 'ICTA-UAB TFM 2025: Case study example values (Barcelona). Community MUST verify against their local context before using for any reporting.',
+            lastModifiedISO: new Date().toISOString(),
+            assumptions: {
+                impact1TransportRepresentation: 'shared_collection_vehicle',
+                impact1SharedDistanceKm: 6.8,
+                impact1SharedDistanceType: 'one_way',
+                impact1SharedVehicleCapacityT: 9.2,
+                impact1SharedLoadingRatePct: 100,
+                impact1SharedCo2EfKgCo2eqPerVmKm: 2.6,
+                impact1DedicatedTripCalcMode: null,
+                impact1DedicatedNumberTrips: null,
+                impact1DedicatedVehicleCapacityT: null,
+                impact1DedicatedLoadingRatePct: null,
+                impact1DedicatedDistancePerTripKm: null,
+                impact1DedicatedDistanceBasis: null,
+                impact1DedicatedCo2EfKgCo2eqPerVmKm: null,
+                impact2ReplacementFractionPct: 100,
+                impact2ProcurementRepresentation: 'dedicated_procurement_trip',
+                impact2DedicatedAvoidedTrips: 1,
+                impact2DedicatedRoundTripKm: 63.6,
+                impact2DedicatedCo2EfKgCo2eqPerVmKm: 0.118,
+                impact2AmountBasedCompostPerTripKg: null,
+                impact2AmountBasedTripTreatment: null,
+                impact2AmountBasedRoundTripKm: null,
+                impact2AmountBasedCo2EfKgCo2eqPerVmKm: null
+            }
+        };
+        this.data.carbonReductionDraft = { ...this.data.carbonReductionDraft, ...preset };
+        this.data.carbonIctaPresetLoaded = true;
+        this.render();
+    },
+
+    getCarbonReductionAnalysis(batch) {
+        if (!batch) return { draft: this._defaultCarbonAssumptions(null), saved: null, mismatch: false, currentMetrics: null, conversionMassFactorForAnalysis: null };
+        const defaults = this._defaultCarbonAssumptions(batch);
+        const draft = (this.data.carbonReductionDraft && this.data.carbonReductionDraft.modelVersion === '2.0')
+            ? { ...defaults, ...this.data.carbonReductionDraft, assumptions: { ...defaults.assumptions, ...(this.data.carbonReductionDraft.assumptions || {}) } }
+            : { ...defaults };
+        const saved = (batch.carbonReductionAnalysis && batch.carbonReductionAnalysis.modelVersion === '2.0') ? batch.carbonReductionAnalysis : null;
+        const mismatch = !!saved && JSON.stringify(saved.assumptions) !== JSON.stringify(draft.assumptions);
+        const conversionMassFactorForAnalysis = this.data.carbonReductionDraft?.conversionMassFactorForAnalysis || null;
+        const patchForPreview = { ...draft, conversionMassFactorForAnalysis };
+        const currentMetrics = this.buildCarbonReductionMetricsV2(patchForPreview, { batch });
+        return { draft, saved, mismatch, currentMetrics, conversionMassFactorForAnalysis };
+    },
+
+    saveCarbonReductionAnalysis(batchId) {
+        const batch = this.getBatchById(batchId);
+        if (!batch) return;
+        if (this.isProjectArchived(batch)) {
+            this.data.toast = { message: 'Archived Project — cannot edit Carbon Reduction Analysis.', level: 'warning' };
+            this.render();
+            return;
+        }
+        const { draft, currentMetrics } = this.getCarbonReductionAnalysis(batch);
+        if (!currentMetrics.summary.bothReady) {
+            if (!confirm('Impact 1 + Impact 2 are not both ready yet. Save anyway as incomplete draft?')) return;
+        }
+        const snapshotPatch = { ...draft, conversionMassFactorForAnalysis: this.data.carbonReductionDraft?.conversionMassFactorForAnalysis || null };
+        const savedSnapshot = this.buildCarbonReductionMetricsV2(snapshotPatch, { batch });
+        batch.carbonReductionAnalysis = {
+            ...draft,
+            modelVersion: '2.0',
+            savedAtISO: new Date().toISOString(),
+            savedSnapshot,
+            conversionMassFactorForAnalysis: snapshotPatch.conversionMassFactorForAnalysis,
+            status: (currentMetrics.summary.bothReady) ? 'saved_complete' : 'saved_incomplete'
+        };
+        this.data.carbonReductionDraft = { ...batch.carbonReductionAnalysis, assumptions: { ...batch.carbonReductionAnalysis.assumptions } };
+        this.data.toast = { message: '✅ Carbon Reduction Analysis saved.', level: 'success' };
+        this.saveData();
+        this.render();
+    },
+
+    editCarbonReductionAnalysisFromSaved(batchId) {
+        const batch = this.getBatchById(batchId);
+        if (!batch || !batch.carbonReductionAnalysis) return;
+        if (this.isProjectArchived(batch)) {
+            this.data.toast = { message: 'Archived Project — read-only mode.', level: 'info' };
+            this.render();
+            return;
+        }
+        const saved = batch.carbonReductionAnalysis;
+        this.data.carbonReductionDraft = {
+            ...this._defaultCarbonAssumptions(batch),
+            ...saved,
+            assumptions: { ...saved.assumptions },
+            conversionMassFactorForAnalysis: saved.conversionMassFactorForAnalysis || null
+        };
+        this.render();
+    },
+
+    toggleCarbonReductionUseCurrentBatchData(batchId) {
+        const batch = this.getBatchById(batchId);
+        if (!batch) return;
+        this.data.carbonReductionDraft = { ...this._defaultCarbonAssumptions(batch) };
+        this.data.carbonIctaPresetLoaded = false;
+        this.render();
+    },
+
+    _onCarbonAssumptionFieldChange(fieldPath, rawValue, batchId) {
+        const batch = this.getBatchById(batchId);
+        if (!batch) return;
+        if (this.isProjectArchived(batch)) return;
+        const defaults = this._defaultCarbonAssumptions(batch);
+        const current = { ...defaults, ...(this.data.carbonReductionDraft || {}), assumptions: { ...defaults.assumptions, ...((this.data.carbonReductionDraft || {}).assumptions || {}) }, conversionMassFactorForAnalysis: (this.data.carbonReductionDraft || {}).conversionMassFactorForAnalysis || null };
+        const keys = fieldPath.split('.');
+        let target = current;
+        for (let i = 0; i < keys.length - 1; i++) target = target[keys[i]] = target[keys[i]] || {};
+        const lastKey = keys[keys.length - 1];
+        if (lastKey === 'conversionMassFactorForAnalysis') {
+            current.conversionMassFactorForAnalysis = (rawValue === '' || rawValue == null) ? null : Number(rawValue);
+        } else if (/Km|Pct|Capacity|Trips|Distance|Factor|PerTripKg|FractionPct/.test(lastKey)) {
+            target[lastKey] = (rawValue === '' || rawValue == null) ? null : Number(rawValue);
+        } else {
+            target[lastKey] = (rawValue === '' || rawValue == null) ? null : rawValue;
+        }
+        current.lastModifiedISO = new Date().toISOString();
+        this.data.carbonReductionDraft = current;
+        this.render();
+    },
+
+    _renderCarbonCalculationDetails(metrics) {
+        const rows = [];
+        const push = (label, value, note='') => rows.push(`<div class="carbon-detail-row"><span class="carbon-detail-label">${label}</span><span class="carbon-detail-value">${value}</span>${note?`<span class="carbon-detail-note">${note}</span>`:''}</div>`);
+        rows.push('<div class="carbon-detail-section-block"><h4 class="carbon-detail-heading" style="color:#0F766E;">Impact 1 — Avoided Organic Waste Collection Transport</h4>');
+        if (metrics.impact1.representation === 'shared_collection_vehicle') {
+            push('Transport Model', 'Shared Collection Vehicle');
+            push('Vehicle Capacity', this.formatCarbonMetric(metrics.impact1.effectiveVehicleLoadT, 't effective load'), 'Capacity × Loading Rate');
+            push('Organic Waste', this.formatCarbonMetric(metrics.impact1.organicWasteT, 't'));
+            push('Vehicle-load Equivalent', metrics.impact1.vehicleLoadEquivalent ? metrics.impact1.vehicleLoadEquivalent.toFixed(4) : '—', 'OW(t) / EffectiveLoad(t)');
+            push('Represented Distance', this.formatCarbonMetric(metrics.impact1.representedDistanceKm, 'km'), `Type: ${metrics.impact1.distanceType || '—'}`);
+            push('CO₂ Emission Factor', this.formatCarbonMetric(metrics.impact1.emissionFactor, 'kg CO₂-eq / vehicle-km'));
+            if (metrics.impact1.avoidedCo2KgRaw != null) push('Impact 1 Avoided CO₂', `<strong style="color:#0F766E">${this.formatCarbonMetric(metrics.impact1.avoidedCo2Kg, 'kg CO₂-eq', 3)}</strong>`, `Raw: ${metrics.impact1.avoidedCo2KgRaw.toFixed(6)}`);
+        } else if (metrics.impact1.representation === 'dedicated_collection_trip') {
+            push('Transport Model', 'Dedicated Collection Trips');
+            push('Trip Calculation', metrics.impact1.tripCalcMode === 'manual_trips' ? 'Manual entry' : (metrics.impact1.tripsDerivedViaCeil ? 'Derived via ceil(OW / EffectiveLoad)' : '—'));
+            if (metrics.impact1.effectiveVehicleLoadT != null) push('Effective Vehicle Load', this.formatCarbonMetric(metrics.impact1.effectiveVehicleLoadT, 't'));
+            push('Number of Trips', metrics.impact1.numberTrips ?? '—', metrics.impact1.tripsDerivedViaCeil ? 'Discrete trips (ceil applied)' : '');
+            push('Distance Basis', metrics.impact1.distanceBasis || '—', `Input per trip: ${this.formatCarbonMetric(metrics.impact1.enteredDistancePerTripKm, 'km')}`);
+            push('Effective Distance per Trip', this.formatCarbonMetric(metrics.impact1.effectiveTravelDistancePerTripKm, 'km'));
+            push('CO₂ Emission Factor', this.formatCarbonMetric(metrics.impact1.emissionFactor, 'kg CO₂-eq / vehicle-km'));
+            if (metrics.impact1.avoidedCo2KgRaw != null) push('Impact 1 Avoided CO₂', `<strong style="color:#0F766E;">${this.formatCarbonMetric(metrics.impact1.avoidedCo2Kg, 'kg CO₂-eq', 3)}</strong>`, `Raw: ${metrics.impact1.avoidedCo2KgRaw.toFixed(6)}`);
+        } else {
+            rows.push(`<div class="muted" style="padding:10px 0;">No Impact 1 transport model selected.</div>`);
+        }
+        rows.push('</div>');
+        rows.push('<div class="carbon-detail-section-block" style="border-top:1px solid #E2E8F0; margin-top:14px;"><h4 class="carbon-detail-heading" style="color:#7C3AED;">Impact 2 — Avoided Commercial Compost Procurement Transport</h4>');
+        push('Compost Output', this.formatCarbonMetric(metrics.impact2.selectedCompostOutputKg, 'kg'));
+        push('Replacement Fraction', (metrics.impact2.replacementFractionPct != null) ? `${metrics.impact2.replacementFractionPct.toFixed(1)} %` : '— (blank → Impact 2 incomplete)');
+        push('Effective Replacement Kg', this.formatCarbonMetric(metrics.impact2.effectiveReplacementKg, 'kg'));
+        if (metrics.impact2.representation === 'dedicated_procurement_trip') {
+            push('Procurement Model', 'Dedicated Procurement Trips');
+            push('Avoided Trips', metrics.impact2.avoidedTrips ?? '—');
+            push('Round-trip Distance (RTD)', this.formatCarbonMetric(metrics.impact2.roundTripDistanceKm, 'km'));
+            push('CO₂ Emission Factor', this.formatCarbonMetric(metrics.impact2.emissionFactor, 'kg CO₂-eq / vehicle-km'));
+            if (metrics.impact2.avoidedCo2KgRaw != null) push('Impact 2 Avoided CO₂', `<strong style="color:#7C3AED;">${this.formatCarbonMetric(metrics.impact2.avoidedCo2Kg, 'kg CO₂-eq', 3)}</strong>`, `Raw: ${metrics.impact2.avoidedCo2KgRaw.toFixed(6)}`);
+        } else if (metrics.impact2.representation === 'amount_based_procurement') {
+            push('Procurement Model', 'Amount-based Procurement');
+            push('Compost per Trip', this.formatCarbonMetric(metrics.impact2.compostPerProcurementTripKg, 'kg'));
+            push('Trip Treatment', metrics.impact2.tripTreatment === 'proportional' ? 'Proportional (fractional trips)' : (metrics.impact2.tripTreatment === 'whole_trips' ? 'Whole trips (ceil applied)' : '—'));
+            push('Avoided Trips', (metrics.impact2.tripTreatment === 'proportional' ? metrics.impact2.avoidedTripEquivalent : metrics.impact2.avoidedTrips) ?? '—');
+            push('Round-trip Distance (RTD)', this.formatCarbonMetric(metrics.impact2.roundTripDistanceKm, 'km'));
+            push('CO₂ Emission Factor', this.formatCarbonMetric(metrics.impact2.emissionFactor, 'kg CO₂-eq / vehicle-km'));
+            if (metrics.impact2.avoidedCo2KgRaw != null) push('Impact 2 Avoided CO₂', `<strong style="color:#7C3AED;">${this.formatCarbonMetric(metrics.impact2.avoidedCo2Kg, 'kg CO₂-eq', 3)}</strong>`, `Raw: ${metrics.impact2.avoidedCo2KgRaw.toFixed(6)}`);
+        } else {
+            rows.push(`<div class="muted" style="padding:10px 0;">No Impact 2 procurement model selected.</div>`);
+        }
+        rows.push('</div>');
+        rows.push('<div class="carbon-detail-section-block" style="border-top:2px solid #0F172A; margin-top:16px;"><h4 class="carbon-detail-heading">Summary</h4>');
+        push('Impact 1 Avoided CO₂', (metrics.summary.impact1AvoidedCo2Kg != null) ? this.formatCarbonMetric(metrics.summary.impact1AvoidedCo2Kg, 'kg CO₂-eq', 3) : '—');
+        push('Impact 2 Avoided CO₂', (metrics.summary.impact2AvoidedCo2Kg != null) ? this.formatCarbonMetric(metrics.summary.impact2AvoidedCo2Kg, 'kg CO₂-eq', 3) : '—');
+        push('Both Impact Branches Ready?', metrics.summary.bothReady ? '<span style="color:#0F766E;font-weight:600;">Yes → Total shown</span>' : '<span style="color:#94A3B8;">No → Total hidden (Phase 7.1 §73 Both-only rule)</span>');
+        if (metrics.summary.totalAvoidedCo2Kg != null) {
+            push('Total Transport-only Avoided CO₂', `<strong style="font-size:1.2em; color:#0F172A;">${this.formatCarbonMetric(metrics.summary.totalAvoidedCo2Kg, 'kg CO₂-eq', 3)}</strong>`, `Raw sum I1+I2 = ${metrics.summary.totalAvoidedCo2Raw.toFixed(6)}`);
+            push('Normalised Reduction (per kg Organic Waste)', this.formatCarbonMetric(metrics.summary.normalisedReductionGPerKgOw, 'g CO₂-eq / kg organic waste', 3));
+        }
+        rows.push('</div>');
+        return rows.join('');
+    },
+
+    renderCarbonReductionPage() {
+        const batch = this.data.currentBatch;
+        if (!batch) {
+            return `<div class="container" style="padding:30px 18px;"><button class="back-btn" onclick="app.navigate('dashboard')">← Back to Dashboard</button><div class="alert alert-warning" style="margin-top:16px;"><strong>No Batch selected.</strong><br>Open a Batch from Dashboard or Project view and launch Carbon Reduction Analysis from the ⋯ menu or Batch Output page.</div></div>`;
+        }
+        const project = this.getProjectByBatch(batch);
+        const projectName = project ? (project.projectName || project.name || 'Compost Project') : 'Compost Project';
+        const batchRouteId = this.getBatchRouteId(batch);
+        const projectRouteId = project ? this.getProjectRouteId(project) : null;
+        const backToBatch = projectRouteId ? `app.navigate('projectDashboard', {projectId: '${this.escapeAttr(projectRouteId)}'})` : `app.navigate('batchDetail', {batchId: '${this.escapeAttr(batchRouteId)}'})`;
+        const batchStatus = (batch.status || 'active').toString().toLowerCase();
+        const finished = batchStatus === 'finished';
+        const archived = this.isProjectArchived(batch);
+        const readOnly = !!archived;
+        const disabledAttr = readOnly ? `disabled style="opacity:0.62; cursor:not-allowed;"` : '';
+        const disableSelect = readOnly ? `disabled style="pointer-events:none; opacity:0.62;"` : '';
+
+        const { draft, saved, mismatch, currentMetrics, conversionMassFactorForAnalysis } = this.getCarbonReductionAnalysis(batch);
+        const ass = draft.assumptions;
+        const i1Rep = ass.impact1TransportRepresentation;
+        const i2Rep = ass.impact2ProcurementRepresentation;
+        const op = currentMetrics.operationalSnapshot;
+        const i1Ready = currentMetrics.impact1.ready;
+        const i2Ready = currentMetrics.impact2.ready;
+        const unitCo2eq = 'kg CO₂-eq';
+        const i1Co2Display = currentMetrics.summary.impact1AvoidedCo2Kg;
+        const i2Co2Display = currentMetrics.summary.impact2AvoidedCo2Kg;
+        const totalDisplay = currentMetrics.summary.totalAvoidedCo2Kg;
+        const bothReady = currentMetrics.summary.bothReady;
+
+        const needsConversion = op.organicWaste.measurementMethod !== 'weight' && !/kg|kilogram|tonne|ton/i.test(op.organicWaste.recordedUnit);
+        const conversionMissing = needsConversion && !conversionMassFactorForAnalysis;
+
+        const ictaPresetLoaded = !!this.data.carbonIctaPresetLoaded;
+
+        const inputNumber = (path, value, placeholder, min, step='any') => {
+            const safe = (value != null && !isNaN(value)) ? this.formatNumber(value, 6) : '';
+            return `<input type="number" ${disabledAttr} step="${step}" ${min!=null?`min="${min}"`:''} value="${safe}" placeholder="${placeholder||''}" oninput="app._onCarbonAssumptionFieldChange('${path}', this.value, '${this.escapeAttr(batch.id)}')">`;
+        };
+        const textInput = (path, value, placeholder) => {
+            const safe = value != null ? this.escapeAttr(value.toString()) : '';
+            return `<input type="text" ${disabledAttr} value="${safe}" placeholder="${placeholder||''}" oninput="app._onCarbonAssumptionFieldChange('${path}', this.value, '${this.escapeAttr(batch.id)}')">`;
+        };
+        const radioRow = (path, currentValue, options, helpRowLabel) => {
+            const groupId = `carbon_radio_${path.replace(/\./g,'_')}`;
+            return `<div class="carbon-radio-group-row"><label class="carbon-radio-label">${helpRowLabel}</label><div class="carbon-radio-options" id="${groupId}">${options.map(opt => {
+                const checked = (opt.value === currentValue) ? 'checked' : '';
+                const disabled = readOnly ? 'disabled' : '';
+                return `<label class="carbon-radio-chip ${checked?'carbon-radio-chip-active':''}"><input type="radio" name="${path.replace(/\./g,'__')}" ${disabled} ${checked} value="${opt.value}" onchange="app._onCarbonAssumptionFieldChange('${path}', this.value, '${this.escapeAttr(batch.id)}')"> ${opt.label}</label>`;
+            }).join('')}</div></div>`;
+        };
+        const selectOne = (path, currentValue, options) => {
+            return `<select ${disableSelect} onchange="app._onCarbonAssumptionFieldChange('${path}', this.value, '${this.escapeAttr(batch.id)}')"><option value="">— Select —</option>${options.map(o=>`<option value="${o.value}" ${currentValue===o.value?'selected':''}>${o.label}</option>`).join('')}</select>`;
+        };
+
+        const statusBanners = [];
+        if (archived) statusBanners.push(`<div class="alert alert-warning" style="margin-bottom:14px;"><strong>📦 Archived Project — Read-only mode.</strong><br>This Carbon Reduction Analysis is locked because its parent Project is Archived. To edit, go back to Project settings and Unarchive first.</div>`);
+        if (saved && !mismatch) statusBanners.push(`<div class="alert alert-info" style="margin-bottom:14px;"><strong>✅ Saved Analysis is up to date.</strong><br>Saved at: <code>${saved.savedAtISO ? new Date(saved.savedAtISO).toLocaleString() : '—'}</code>. Status: <code>${saved.status || 'saved'}</code>.</div>`);
+        if (saved && mismatch) statusBanners.push(`<div class="alert alert-warning" style="margin-bottom:14px;"><strong>⚠ Current Assumptions differ from Saved Analysis.</strong><br>Results shown below reflect <u>Current Draft</u>. Saved snapshot remains unchanged until you press "Save Analysis".</div>`);
+        if (ictaPresetLoaded) statusBanners.push(`<div class="alert alert-info" style="margin-bottom:14px;"><strong>🧪 ICTA-UAB TFM Example assumptions filled for validation / reference only.</strong><br>Example case study values (Barcelona). <u>Not recommendations</u> — replace with your community's local transport context and verified emission factors.</div>`);
+        if (conversionMissing) statusBanners.push(`<div class="alert alert-danger" style="margin-bottom:14px;"><strong>🧱 Mass conversion required (${op.organicWaste.measurementMethod}/${op.organicWaste.recordedUnit}).</strong><br>Fill the Conversion Factor in Section A before Impact 1 can compute.</div>`);
+
+        const savedSection = (saved) ? `
+            <div class="card" style="background: linear-gradient(135deg,#FAFAF9 0%,#FFFFFF 100%); border-color:#E7E5E4;">
+                <div class="card-header"><div><h3 class="card-title">📦 Saved Analysis Snapshot</h3><div class="muted">Read-only snapshot saved at ${saved.savedAtISO ? new Date(saved.savedAtISO).toLocaleString() : '—'}</div></div>${!readOnly ? `<div class="card-actions"><button type="button" class="btn btn-secondary" onclick="app.editCarbonReductionAnalysisFromSaved('${this.escapeAttr(batch.id)}')">Reload Saved Assumptions into Current Draft</button></div>` : ''}</div>
+                <div class="card-body">
+                    <div class="carbon-results-grid" style="margin-top:0;">
+                        <div class="carbon-result-card"><div class="carbon-result-label">Impact 1 (Snapshot)</div><div class="carbon-result-value">${this.formatCarbonMetric(saved?.savedSnapshot?.summary?.impact1AvoidedCo2Kg, unitCo2eq, 3)}</div></div>
+                        <div class="carbon-result-card"><div class="carbon-result-label">Impact 2 (Snapshot)</div><div class="carbon-result-value">${this.formatCarbonMetric(saved?.savedSnapshot?.summary?.impact2AvoidedCo2Kg, unitCo2eq, 3)}</div></div>
+                        <div class="carbon-result-card carbon-result-card-highlight"><div class="carbon-result-label">Total Transport-only (Snapshot)</div><div class="carbon-result-value">${this.formatCarbonMetric(saved?.savedSnapshot?.summary?.totalAvoidedCo2Kg, unitCo2eq, 3)}</div></div>
+                        <div class="carbon-result-card carbon-result-card-meta"><div class="carbon-result-label">Normalised Reduction</div><div class="carbon-result-value">${this.formatCarbonMetric(saved?.savedSnapshot?.summary?.normalisedReductionGPerKgOw, 'g CO₂-eq / kg OW', 3)}</div></div>
+                    </div>
+                    <div class="muted" style="margin-top:10px;">Status: <code>${saved.status || 'saved'}</code> · Model v${saved.modelVersion || '2.0'} · Assumption Label: <em>${saved.assumptionSetLabel || 'Custom Local Assumptions'}</em></div>
+                </div>
+            </div>` : `
+            <div class="card" style="background: #FBFBFB; border-style: dashed; border-color:#D1D5DB;">
+                <div class="card-body"><div class="muted" style="text-align:center; padding: 18px 12px;">💾 No Saved Analysis yet. Complete Assumptions + press <strong>Save Analysis</strong> below to create a frozen snapshot of this batch.</div></div>
+            </div>`;
+
+        return `
+            <div class="container" style="padding:24px 16px 80px; max-width:1240px; margin:0 auto;">
+                <button class="back-btn" onclick="${backToBatch}">← Back to ${project ? `${projectName} Dashboard` : 'Batch'}</button>
+
+                <div style="margin: 14px 0 22px;">
+                    <h1 style="margin:0 0 6px; font-size:2em;">🌍 Transport-related Carbon Reduction</h1>
+                    <div class="muted" style="font-size:0.95em; line-height:1.45;">
+                        <strong>Phase 7.</strong> Independent analytical layer (operational records are never modified).<br>
+                        Scope: <u>transport-related emission reduction only</u> — intentionally not a complete LCA (process emissions, CH₄, soil carbon, avoided fertiliser etc. are out of scope).
+                    </div>
+                </div>
+
+                ${statusBanners.join('')}
+
+                ${saved ? '' : '<div style="margin-bottom:16px;"><button type="button" class="btn btn-secondary" onclick="app.loadICTATFMExamplePreset(\'' + this.escapeAttr(batch.id) + '\')" ' + (readOnly ? 'disabled' : '') + '>🧪 Load ICTA-UAB TFM Example Assumptions</button></div>'}
+
+                <section class="card" style="margin-bottom:24px;">
+                    <div class="card-header"><h3 class="card-title">A. Operational Data — read directly from Batch</h3><div class="card-actions">${!readOnly && !saved ? `<button type="button" class="btn btn-secondary btn-small" onclick="app.toggleCarbonReductionUseCurrentBatchData('${this.escapeAttr(batch.id)}')">↺ Reset Assumptions to Blank</button>` : ''}</div></div>
+                    <div class="card-body">
+                        <div class="carbon-grid-2col" style="display:grid; grid-template-columns:1fr 1fr; gap:16px 22px;">
+                            <div class="carbon-section-row"><label>Organic Waste Input</label><div class="carbon-readonly-value"><strong>${this.formatNumber(op.organicWaste.recordedValue, 1) ?? '—'}</strong> <span class="muted">${op.organicWaste.recordedUnit || 'kg'}</span> <span class="carbon-chip carbon-chip-info">${op.organicWaste.measurementMethod || 'weight'}</span></div></div>
+                            ${needsConversion ? `
+                            <div class="carbon-section-row"><label>🔬 Conversion Factor (${op.organicWaste.recordedUnit || 'L'} → kg)</label><div class="carbon-input-with-unit" style="max-width:260px;">${inputNumber('conversionMassFactorForAnalysis', conversionMassFactorForAnalysis, 'e.g. 0.7 for L→kg', 0, 0.01)}<span class="carbon-input-unit">kg / ${op.organicWaste.recordedUnit || 'L'}</span></div><div class="carbon-field-help">Applied only to this Carbon analysis; original operational record preserved.</div></div>` : ''}
+                            <div class="carbon-section-row"><label>Analytical Mass (Carbon only)</label><div class="carbon-readonly-value"><strong>${this.formatNumber(op.organicWaste.calculatedMassKg, 1) ?? '—'}</strong> <span class="muted">kg</span>${op.organicWaste.conversionAppliedForAnalysis ? ' <span class="carbon-chip carbon-chip-warning">converted</span>' : ''}</div></div>
+                            <div class="carbon-section-row"><label>Compost Output</label><div class="carbon-readonly-value"><strong>${this.formatNumber(op.compostOutput.amountKg, 1) ?? '—'}</strong> <span class="muted">kg</span><div class="muted" style="font-size:0.82em; margin-top:2px;">source: ${op.compostOutput.source || 'No Batch Output Recorded'}</div></div></div>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="card" style="margin-bottom:24px;">
+                    <div class="card-header"><h3 class="card-title">B. Local Transport Baseline Assumptions</h3><div class="card-actions"><div class="muted" style="font-size:0.85em; text-align:right;"><strong>Source / Reference notes:</strong><br>fill here for your records</div></div></div>
+                    <div class="card-body">
+                        <div class="carbon-field-help" style="margin-bottom:16px;">Pick one Transport Model for <strong>Impact 1 (Collection)</strong> and one Procurement Model for <strong>Impact 2 (Compost Replacement)</strong>. Emission factor units: <em>kg CO₂-eq per vehicle-km</em> (fixed).</div>
+
+                        <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 0 28px; align-items:start;">
+                            <div style="border-right:1px dashed #E2E8F0; padding-right:28px;">
+                                <h4 style="color:#0F766E; margin:0 0 14px;">Impact 1 — Collection Transport Model</h4>
+                                ${radioRow('assumptions.impact1TransportRepresentation', i1Rep, [{value:'shared_collection_vehicle',label:'Shared Collection Vehicle'},{value:'dedicated_collection_trip',label:'Dedicated Collection Trips'}], 'Select Model')}
+                                <hr style="border:none; border-top:1px solid #F1F5F9; margin:18px 0;">
+                                ${i1Rep === 'shared_collection_vehicle' ? `
+                                    <div class="carbon-form-grid">
+                                        <div class="form-group"><label>Represented Distance</label><div class="carbon-input-with-unit">${inputNumber('assumptions.impact1SharedDistanceKm', ass.impact1SharedDistanceKm, 'e.g. 6.8', 0)}<span class="carbon-input-unit">km / leg</span></div></div>
+                                        <div class="form-group"><label>Distance Type</label>${selectOne('assumptions.impact1SharedDistanceType', ass.impact1SharedDistanceType, [{value:'one_way',label:'One-way (use raw, no ×2)'},{value:'round_trip',label:'Round trip (use raw)'}])}</div>
+                                        <div class="form-group"><label>Vehicle Capacity</label><div class="carbon-input-with-unit">${inputNumber('assumptions.impact1SharedVehicleCapacityT', ass.impact1SharedVehicleCapacityT, 'e.g. 9.2', 0)}<span class="carbon-input-unit">t</span></div></div>
+                                        <div class="form-group"><label>Vehicle Loading Rate</label><div class="carbon-input-with-unit">${inputNumber('assumptions.impact1SharedLoadingRatePct', ass.impact1SharedLoadingRatePct, '100', 0, 1)}<span class="carbon-input-unit">%</span></div></div>
+                                        <div class="form-group" style="grid-column: span 2;"><label>CO₂ Emission Factor (fixed unit)</label><div class="carbon-input-with-unit">${inputNumber('assumptions.impact1SharedCo2EfKgCo2eqPerVmKm', ass.impact1SharedCo2EfKgCo2eqPerVmKm, 'e.g. 2.6', 0)}<span class="carbon-input-unit">kg CO₂-eq / vehicle-km</span></div></div>
+                                    </div>` : ''}
+                                ${i1Rep === 'dedicated_collection_trip' ? `
+                                    ${radioRow('assumptions.impact1DedicatedTripCalcMode', ass.impact1DedicatedTripCalcMode, [{value:'manual_trips',label:'Manual trips (no capacity needed)'},{value:'from_capacity',label:'Derive trips via ceil(OW / effective capacity)'}], 'Trip Calculation')}
+                                    <div class="carbon-form-grid">
+                                        <div class="form-group"><label>Distance per Trip</label><div class="carbon-input-with-unit">${inputNumber('assumptions.impact1DedicatedDistancePerTripKm', ass.impact1DedicatedDistancePerTripKm, '', 0)}<span class="carbon-input-unit">km</span></div></div>
+                                        <div class="form-group"><label>Distance Basis</label>${selectOne('assumptions.impact1DedicatedDistanceBasis', ass.impact1DedicatedDistanceBasis, [{value:'round_trip',label:'Round-trip (use raw)'},{value:'one_way_doubled',label:'One-way ×2 = round-trip'}])}</div>
+                                        ${(ass.impact1DedicatedTripCalcMode === 'manual_trips') ? `<div class="form-group"><label>Number of Trips (Manual)</label><div class="carbon-input-with-unit">${inputNumber('assumptions.impact1DedicatedNumberTrips', ass.impact1DedicatedNumberTrips, '', 0, 1)}<span class="carbon-input-unit">trips</span></div></div>
+                                        <div class="form-group"></div>` : `<div class="form-group"><label>Vehicle Capacity</label><div class="carbon-input-with-unit">${inputNumber('assumptions.impact1DedicatedVehicleCapacityT', ass.impact1DedicatedVehicleCapacityT, '', 0)}<span class="carbon-input-unit">t</span></div></div>
+                                        <div class="form-group"><label>Loading Rate</label><div class="carbon-input-with-unit">${inputNumber('assumptions.impact1DedicatedLoadingRatePct', ass.impact1DedicatedLoadingRatePct, '100', 0, 1)}<span class="carbon-input-unit">%</span></div></div>`}
+                                        <div class="form-group" style="grid-column: span 2;"><label>CO₂ Emission Factor (fixed unit)</label><div class="carbon-input-with-unit">${inputNumber('assumptions.impact1DedicatedCo2EfKgCo2eqPerVmKm', ass.impact1DedicatedCo2EfKgCo2eqPerVmKm, '', 0)}<span class="carbon-input-unit">kg CO₂-eq / vehicle-km</span></div></div>
+                                    </div>` : ''}
+                                ${i1Rep ? `<div style="margin-top:14px; padding: 10px 14px; background: ${i1Ready ? '#ECFDF5' : '#FEF3C7'}; border-radius: 8px; font-size:0.9em;"><strong>${i1Ready ? '✅ Impact 1 ready' : '⚠ Impact 1 incomplete'}</strong>${i1Ready ? (currentMetrics.impact1.vehicleLoadEquivalent != null ? ` · Vehicle-load Equivalent = ${currentMetrics.impact1.vehicleLoadEquivalent.toFixed(4)}` : '') : ' — fill all fields above'}</div>` : `<div class="muted" style="padding:12px 0; font-size:0.9em;">⬆ Choose a Collection Transport Model to enable Impact 1.</div>`}
+                            </div>
+
+                            <div style="padding-left:0;">
+                                <h4 style="color:#7C3AED; margin:0 0 14px;">Impact 2 — Commercial Compost Replacement</h4>
+                                <div class="carbon-form-grid">
+                                    <div class="form-group" style="grid-column: span 2;"><label style="font-weight:600;">Replacement Fraction (% of compost output that replaces purchased compost)</label><div class="carbon-input-with-unit">${inputNumber('assumptions.impact2ReplacementFractionPct', ass.impact2ReplacementFractionPct, 'blank → I2 incomplete', 0, 1)}<span class="carbon-input-unit">%</span></div><div class="carbon-field-help">Leave blank if not applicable (Impact 2 will not compute). Do <strong>not</strong> assume 100% — only use the fraction your community actually verifies replaces external purchases.</div></div>
+                                </div>
+                                ${radioRow('assumptions.impact2ProcurementRepresentation', i2Rep, [{value:'dedicated_procurement_trip',label:'Dedicated Procurement Trips'},{value:'amount_based_procurement',label:'Amount-based (kg compost / trip)'}], 'Select Model')}
+                                <hr style="border:none; border-top:1px solid #F1F5F9; margin:18px 0;">
+                                ${i2Rep === 'dedicated_procurement_trip' ? `
+                                    <div class="carbon-form-grid">
+                                        <div class="form-group"><label>Avoided Procurement Trips</label><div class="carbon-input-with-unit">${inputNumber('assumptions.impact2DedicatedAvoidedTrips', ass.impact2DedicatedAvoidedTrips, '', 0, 1)}<span class="carbon-input-unit">trips</span></div></div>
+                                        <div class="form-group"><label>Round-trip Distance</label><div class="carbon-input-with-unit">${inputNumber('assumptions.impact2DedicatedRoundTripKm', ass.impact2DedicatedRoundTripKm, 'e.g. 63.6', 0)}<span class="carbon-input-unit">km (RTD)</span></div></div>
+                                        <div class="form-group" style="grid-column: span 2;"><label>CO₂ Emission Factor (fixed unit)</label><div class="carbon-input-with-unit">${inputNumber('assumptions.impact2DedicatedCo2EfKgCo2eqPerVmKm', ass.impact2DedicatedCo2EfKgCo2eqPerVmKm, 'e.g. 0.118', 0)}<span class="carbon-input-unit">kg CO₂-eq / vehicle-km</span></div></div>
+                                    </div>` : ''}
+                                ${i2Rep === 'amount_based_procurement' ? `
+                                    <div class="carbon-form-grid">
+                                        <div class="form-group"><label>Compost per Procurement Trip</label><div class="carbon-input-with-unit">${inputNumber('assumptions.impact2AmountBasedCompostPerTripKg', ass.impact2AmountBasedCompostPerTripKg, '', 0)}<span class="carbon-input-unit">kg / trip</span></div></div>
+                                        <div class="form-group"><label>Trip Treatment</label>${selectOne('assumptions.impact2AmountBasedTripTreatment', ass.impact2AmountBasedTripTreatment, [{value:'proportional',label:'Proportional (fractional trips)'},{value:'whole_trips',label:'Whole trips (ceil applied)'}])}</div>
+                                        <div class="form-group"><label>Round-trip Distance</label><div class="carbon-input-with-unit">${inputNumber('assumptions.impact2AmountBasedRoundTripKm', ass.impact2AmountBasedRoundTripKm, '', 0)}<span class="carbon-input-unit">km (RTD)</span></div></div>
+                                        <div class="form-group"></div>
+                                        <div class="form-group" style="grid-column: span 2;"><label>CO₂ Emission Factor (fixed unit)</label><div class="carbon-input-with-unit">${inputNumber('assumptions.impact2AmountBasedCo2EfKgCo2eqPerVmKm', ass.impact2AmountBasedCo2EfKgCo2eqPerVmKm, '', 0)}<span class="carbon-input-unit">kg CO₂-eq / vehicle-km</span></div></div>
+                                    </div>` : ''}
+                                ${i2Rep ? `<div style="margin-top:14px; padding: 10px 14px; background: ${i2Ready ? '#F5F3FF' : '#FEF3C7'}; border-radius: 8px; font-size:0.9em;"><strong>${i2Ready ? '✅ Impact 2 ready' : '⚠ Impact 2 incomplete'}</strong>${i2Ready ? ` · Effective Replacement = ${this.formatNumber(currentMetrics.impact2.effectiveReplacementKg,1)} kg` : (ass.impact2ReplacementFractionPct==null?' — Replacement Fraction is blank':' — fill all fields above')}</div>` : `<div class="muted" style="padding:12px 0; font-size:0.9em;">⬆ Choose a Procurement Model + fill Replacement Fraction to enable Impact 2.</div>`}
+                            </div>
+                        </div>
+
+                        <hr style="border:none; border-top:1px solid #F1F5F9; margin:24px 0 14px;">
+                        <div class="form-group" style="max-width:880px;"><label>Assumption Set Label</label>${textInput('assumptionSetLabel', draft.assumptionSetLabel, 'e.g. "Santo Antoni Barcelona 2026 local baselines"')}<div class="carbon-field-help">Short label for this Saved Analysis snapshot.</div></div>
+                        <div class="form-group" style="max-width:880px;"><label>Source / Reference Notes (optional)</label><textarea rows="2" ${disabledAttr} oninput="app._onCarbonAssumptionFieldChange('sourceReferenceNotes', this.value, '${this.escapeAttr(batch.id)}')" placeholder="Where did these numbers come from? Local government report, supplier invoice, emission factor database, community interview…">${draft.sourceReferenceNotes || ''}</textarea></div>
+                    </div>
+                </section>
+
+                <section class="card" style="margin-bottom:24px;">
+                    <div class="card-header"><h3 class="card-title">C. Results — Transport-only Emission Reduction</h3></div>
+                    <div class="card-body">
+                        <div class="carbon-results-grid" style="grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));">
+                            <div class="carbon-result-card" style="border-left-color:${i1Ready ? '#0F766E' : '#CBD5E1'};">
+                                <div class="carbon-result-label">Impact 1 — Collection Transport Avoided</div>
+                                <div class="carbon-result-value" style="color:${i1Ready ? '#0F766E' : '#94A3B8'};">${i1Ready ? this.formatCarbonMetric(i1Co2Display, unitCo2eq, 3) : '—'}</div>
+                                ${i1Ready && currentMetrics.summary.perKgOrganicWaste_I1 != null ? `<div class="carbon-result-note">Per kg organic waste: ${this.formatCarbonMetric(currentMetrics.summary.perKgOrganicWaste_I1, `${unitCo2eq} / kg`, 4)}</div>` : ''}
+                            </div>
+                            <div class="carbon-result-card" style="border-left-color:${i2Ready ? '#7C3AED' : '#CBD5E1'};">
+                                <div class="carbon-result-label">Impact 2 — Compost Procurement Avoided</div>
+                                <div class="carbon-result-value" style="color:${i2Ready ? '#7C3AED' : '#94A3B8'};">${i2Ready ? this.formatCarbonMetric(i2Co2Display, unitCo2eq, 3) : '—'}</div>
+                                ${i2Ready && currentMetrics.summary.perKgCompostProduced_I2 != null ? `<div class="carbon-result-note">Per kg compost produced: ${this.formatCarbonMetric(currentMetrics.summary.perKgCompostProduced_I2, `${unitCo2eq} / kg`, 4)}</div>` : ''}
+                            </div>
+                            <div class="carbon-result-card carbon-result-card-highlight" style="border-left-color:${bothReady ? '#0F172A' : '#CBD5E1'};">
+                                <div class="carbon-result-label">Total Transport-only CO₂ Reduction</div>
+                                <div class="carbon-result-value" style="color:${bothReady ? '#0F172A' : '#94A3B8'};">${bothReady ? this.formatCarbonMetric(totalDisplay, unitCo2eq, 3) : '— <span class="muted" style="font-size:0.75em;">(both I1 & I2 required — §73)</span>'}</div>
+                                ${bothReady && currentMetrics.summary.perKgCompostProduced_Total != null ? `<div class="carbon-result-note">Per kg compost produced: ${this.formatCarbonMetric(currentMetrics.summary.perKgCompostProduced_Total, `${unitCo2eq} / kg`, 4)}</div>` : ''}
+                            </div>
+                            <div class="carbon-result-card carbon-result-card-meta">
+                                <div class="carbon-result-label">Normalised Reduction</div>
+                                <div class="carbon-result-value">${(bothReady && currentMetrics.summary.normalisedReductionGPerKgOw != null) ? this.formatCarbonMetric(currentMetrics.summary.normalisedReductionGPerKgOw, 'g CO₂-eq / kg OW', 3) : '—'}</div>
+                                <div class="carbon-result-note">Phase 7.1 §73 — g CO₂-eq avoided per kg organic waste</div>
+                            </div>
+                        </div>
+
+                        <details style="margin-top:22px;" ${(i1Ready || i2Ready) ? 'open' : ''}>
+                            <summary style="cursor:pointer; font-weight:600; padding: 10px 0; user-select:none;">📐 Show Calculation Details & Step Traceability</summary>
+                            <div style="padding: 14px 4px 2px; background:#FAFAF9; border-radius: 10px;">${this._renderCarbonCalculationDetails(currentMetrics)}</div>
+                        </details>
+                    </div>
+                </section>
+
+                <section style="margin-bottom:24px;">${savedSection}</section>
+
+                <section class="card" style="border-color:#0F172A; border-width:1.5px; margin-bottom:24px;">
+                    <div class="card-header" style="background:#0F172A; color:#F8FAFC;"><div><h3 class="card-title" style="color:#F8FAFC;">E. Save & Lifecycle Status</h3><div class="muted" style="opacity:0.85; font-size:0.85em;">Batch Status: <code>${batchStatus || 'active'}</code>${finished ? ' · ✅ FINISHED' : ''}${archived ? ' · 📦 ARCHIVED' : ''}</div></div><div class="card-actions">${!readOnly ? `<button type="button" class="btn btn-primary" onclick="app.saveCarbonReductionAnalysis('${this.escapeAttr(batch.id)}')">💾 Save Analysis Snapshot</button>` : ''}</div></div>
+                    <div class="card-body">
+                        <div class="muted" style="line-height:1.55;">
+                            <strong>💡 Lifecycle guidance:</strong><br>
+                            1. Fill in Operational Data → Finish the batch → Create Output record → come back here to run Carbon Reduction (natural flow).<br>
+                            2. <strong>Saved snapshot is frozen</strong> — even if daily records later change, your analysis remains comparable and traceable.<br>
+                            3. Archived Projects lock Carbon in read-only mode per Project archival rules.
+                        </div>
+                    </div>
+                </section>
+            </div>
+        `;
+    },
+
     toggleCarbonReductionModule() {
         this.data.carbonReductionExpanded = !this.data.carbonReductionExpanded;
         if (!this.data.carbonReductionExpanded) {
@@ -6026,7 +6738,27 @@ const App = {
                         </div>
                     </div>
 
-                    ${this.renderCarbonReductionModule()}
+                    ${batch.status === 'finished' ? `
+                    <div class="card" style="background: linear-gradient(135deg,#F0FDF4 0%,#ECFEFF 100%); border-color:#86EFAC; margin-bottom: 18px;">
+                        <div class="card-header" style="border:none;"><div>
+                            <h3 class="card-title" style="color:#065F46;">🌍 Transport-related Carbon Reduction Analysis</h3>
+                            <div class="muted" style="margin-top:4px; color:#064E3B; opacity:0.85;">
+                                Run the Phase 7 independent transport-only carbon analysis for this batch.
+                                Uses the operational data + Output record you've already completed.
+                            </div>
+                        </div><div class="card-actions">
+                            <button type="button" class="btn btn-primary" style="background:#0F766E; border-color:#0F766E;" onclick="app.navigate('carbonReduction', {batchId: '${this.escapeAttr(this.getBatchRouteId(batch))}'})">
+                                → Open Carbon Reduction
+                            </button>
+                        </div></div>
+                        <div class="card-body" style="padding-top:0; padding-bottom: 14px;">
+                            <div class="muted" style="font-size:0.9em;">
+                                • Read-only analytical layer (your Batch operational records are <strong>never</strong> modified)<br>
+                                • Scope: <u>transport-related emission reduction only</u> (not a complete LCA)<br>
+                                • Supports kg / L / Volume / Custom Units + custom local baselines (4 transport model branches)
+                            </div>
+                        </div>
+                    </div>` : ''}
 
                     <div class="action-panel">
                         <div class="btn-group">
@@ -6395,29 +7127,12 @@ const App = {
                 });
             }
 
-            [
-                ['carbonTotalOrganicWaste', 'totalOrganicWaste'],
-                ['carbonMunicipalCollectionDistance', 'municipalCollectionDistance'],
-                ['carbonMunicipalVehiclePayloadCapacityT', 'municipalVehiclePayloadCapacityT'],
-                ['carbonMunicipalVehicleCo2Ef', 'municipalVehicleCo2EmissionFactor'],
-                ['carbonMunicipalVehicleEnergyEf', 'municipalVehicleEnergyConsumptionFactor'],
-                ['carbonCompostProduced', 'compostProduced'],
-                ['carbonCommercialCompostPerEvent', 'commercialCompostPurchasedPerEvent'],
-                ['carbonCommercialSupplierDistance', 'commercialCompostSupplierDistance'],
-                ['carbonPassengerVehicleCo2Ef', 'passengerVehicleCo2EmissionFactor']
-            ].forEach(([id, field]) => {
-                const element = document.getElementById(id);
-                if (!element) return;
-                element.addEventListener('input', () => {
-                    this.setCarbonReductionDraftField(field, element.value);
-                    this.updateCarbonReductionPreview();
-                });
-            });
+            // Phase 7.3: Legacy embedded Carbon module (Phase 7.0/7.1) removed.
+            // Carbon Reduction is now an independent page accessed via the
+            // 🌍 Carbon Reduction button on Batch Detail page or the Output CTA card.
+            // The deleted listener block was for IDs that no longer exist in the DOM.
 
             this.updateOutputDurationDisplay();
-            if (this.data.carbonReductionExpanded) {
-                this.updateCarbonReductionPreview();
-            }
         }
 
         if (this.data.currentPage === 'export') {
@@ -9720,7 +10435,9 @@ const App = {
                 );
             }
         }
-        const estimatedOutput = this.calculateEstimatedCompostOutput(batch);
+        const estimatedOutput = (batch.output?.estimatedOutput != null && !isNaN(batch.output.estimatedOutput))
+            ? batch.output.estimatedOutput
+            : this.calculateEstimatedCompostOutput(batch);
         batch.status = 'finished';
         batch.currentPhase = 'Finished';
         batch.finishedDate = this.getTodayISODateInTimeZone('Europe/Madrid');
