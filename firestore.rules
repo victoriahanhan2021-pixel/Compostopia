@@ -5,39 +5,152 @@ service cloud.firestore {
       return request.auth != null;
     }
 
-    function isBatchOwner(batchData) {
-      return signedIn() && batchData.ownerUid == request.auth.uid;
+    function normalizedEmail(email) {
+      return email is string && email.size() > 0
+        ? email.lower().split('@')[0].replace('\\.', '') + '@' + email.lower().split('@')[1]
+        : (email is string ? email : '');
     }
 
-    function isCollaborator(batchData) {
-      return signedIn()
-        && request.auth.token.email != null
-        && (
-          request.auth.token.email in batchData.collaboratorEmails
-          || request.auth.token.email in (batchData.collaborationSettings?.collaborators || [])
-        );
+    function emailMatches(raw) {
+      if (request.auth == null || request.auth.token.email == null) return false;
+      const current = normalizedEmail(request.auth.token.email);
+      if (raw is list) {
+        return raw.any((e) => e is string && normalizedEmail(e) == current);
+      }
+      return raw is string && normalizedEmail(raw) == current;
+    }
+
+    function isBatchOwner(batchData) {
+      if (!signedIn()) return false;
+      if (batchData.ownerUid is string && batchData.ownerUid.size() > 0) {
+        return request.auth.uid == batchData.ownerUid;
+      }
+      return emailMatches(batchData.ownerEmail);
+    }
+
+    function isDirectBatchCollaborator(batchData) {
+      if (!signedIn()) return false;
+      const directEmails = []
+        .concat(batchData.collaboratorEmails is list ? batchData.collaboratorEmails : [])
+        .concat((batchData.collaborationSettings is map && batchData.collaborationSettings.collaborators is list) ? batchData.collaborationSettings.collaborators : [])
+        .concat((batchData.collaborationSettings is map && batchData.collaborationSettings.customCollaborators is list) ? batchData.collaborationSettings.customCollaborators : []);
+      return emailMatches(directEmails);
+    }
+
+    function batchIsProjectSelected(batchData) {
+      if (!(batchData.collaborationSettings is map)) return false;
+      const t = ((batchData.collaborationSettings.accessMode is string) ? batchData.collaborationSettings.accessMode :
+                 ((batchData.collaborationSettings.mode is string) ? batchData.collaborationSettings.mode :
+                  ((batchData.collaborationSettings.type is string) ? batchData.collaborationSettings.type : ''))).lower();
+      return t == 'project_selected' || t == 'project-collaborators' || t == 'selected' || t == 'project';
+    }
+
+    function isSelectedProjectCollaborator(batchData, projectData) {
+      if (!signedIn()) return false;
+      if (!batchIsProjectSelected(batchData)) return false;
+      const selectedEmails = (batchData.collaborationSettings is map && batchData.collaborationSettings.selectedProjectCollaborators is list)
+        ? batchData.collaborationSettings.selectedProjectCollaborators
+        : ((batchData.collaborationSettings is map && batchData.collaborationSettings.collaborators is list) ? batchData.collaborationSettings.collaborators : []);
+      if (!emailMatches(selectedEmails)) return false;
+      const projectPool = []
+        .concat(projectData.collaboratorEmails is list ? projectData.collaboratorEmails : [])
+        .concat((projectData.collaborationSettings is map && projectData.collaborationSettings.collaborators is list) ? projectData.collaborationSettings.collaborators : []);
+      return emailMatches(projectPool);
+    }
+
+    function isProjectOwner(projectData) {
+      if (!signedIn()) return false;
+      if (projectData.ownerUid is string && projectData.ownerUid.size() > 0) {
+        return request.auth.uid == projectData.ownerUid;
+      }
+      return emailMatches(projectData.ownerEmail);
+    }
+
+    function isProjectManager(projectData) {
+      if (!signedIn()) return false;
+      if (isProjectOwner(projectData)) return false;
+      if (emailMatches(projectData.managerEmail)) return true;
+      if (projectData.managerUid is string && projectData.managerUid.size() > 0 && request.auth.uid == projectData.managerUid) return true;
+      return false;
+    }
+
+    function batchProjectOwnerOrManager(batchData) {
+      if (!signedIn()) return false;
+      const projectExists = (batchData.projectId is string && batchData.projectId.size() > 0)
+        ? exists(/databases/$(database)/documents/projects/$(batchData.projectId))
+        : exists(/databases/$(database)/documents/projects/global-default-project);
+      if (!projectExists) return false;
+      const projectData = (batchData.projectId is string && batchData.projectId.size() > 0)
+        ? get(/databases/$(database)/documents/projects/$(batchData.projectId)).data
+        : get(/databases/$(database)/documents/projects/global-default-project).data;
+      return isProjectOwner(projectData) || isProjectManager(projectData);
     }
 
     function canAccessBatch(batchData) {
-      return isBatchOwner(batchData) || isCollaborator(batchData);
+      if (isBatchOwner(batchData)) return true;
+      if (isDirectBatchCollaborator(batchData)) return true;
+      if (batchProjectOwnerOrManager(batchData)) return true;
+      if (!batchIsProjectSelected(batchData)) return false;
+      const projectExists = (batchData.projectId is string && batchData.projectId.size() > 0)
+        ? exists(/databases/$(database)/documents/projects/$(batchData.projectId))
+        : exists(/databases/$(database)/documents/projects/global-default-project);
+      if (!projectExists) return false;
+      const projectData = (batchData.projectId is string && batchData.projectId.size() > 0)
+        ? get(/databases/$(database)/documents/projects/$(batchData.projectId)).data
+        : get(/databases/$(database)/documents/projects/global-default-project).data;
+      return isSelectedProjectCollaborator(batchData, projectData);
     }
 
     match /users/{userId} {
       allow read, write: if signedIn() && request.auth.uid == userId;
     }
 
+    match /projects/{projectId} {
+      allow create: if signedIn() && (
+        (request.resource.data.ownerUid is string && request.resource.data.ownerUid == request.auth.uid)
+        || emailMatches(request.resource.data.ownerEmail)
+      );
+      allow read: if signedIn() && (
+        isProjectOwner(resource.data)
+        || isProjectManager(resource.data)
+        || emailMatches(resource.data.collaboratorEmails)
+        || (resource.data.collaborationSettings is map && emailMatches(resource.data.collaborationSettings.collaborators))
+      );
+      allow update: if signedIn() && (
+        isProjectOwner(resource.data)
+        || isProjectManager(resource.data)
+      ) && (
+        request.resource.data.ownerUid == resource.data.ownerUid
+        || !(request.resource.data.keys().hasAny(['ownerUid', 'ownerEmail']))
+      ) && (
+        request.resource.data.id == resource.data.id
+        || !(request.resource.data.keys().hasAny(['id', 'projectId']))
+      );
+      allow delete: if signedIn() && isProjectOwner(resource.data);
+    }
+
     match /batches/{batchId} {
-      allow create: if signedIn() && request.resource.data.ownerUid == request.auth.uid;
+      allow create: if signedIn() && (
+        (request.resource.data.ownerUid is string && request.resource.data.ownerUid == request.auth.uid)
+        || emailMatches(request.resource.data.ownerEmail)
+      );
       allow read: if canAccessBatch(resource.data);
       allow update: if canAccessBatch(resource.data)
         && request.resource.data.ownerUid == resource.data.ownerUid
+        && (
+          (request.resource.data.keys().hasAny(['ownerEmail']) && request.resource.data.ownerEmail == resource.data.ownerEmail)
+          || !(request.resource.data.keys().hasAny(['ownerEmail']))
+        )
         && request.resource.data.id == resource.data.id;
-      allow delete: if isBatchOwner(resource.data);
+      allow delete: if isBatchOwner(resource.data) || batchProjectOwnerOrManager(resource.data);
 
       match /records/{recordId} {
-        allow read: if canAccessBatch(get(/databases/$(database)/documents/batches/$(batchId)).data);
-        allow create, update: if canAccessBatch(get(/databases/$(database)/documents/batches/$(batchId)).data);
-        allow delete: if canAccessBatch(get(/databases/$(database)/documents/batches/$(batchId)).data);
+        function parentBatchData() {
+          return get(/databases/$(database)/documents/batches/$(batchId)).data;
+        }
+        allow read: if canAccessBatch(parentBatchData());
+        allow create, update: if canAccessBatch(parentBatchData());
+        allow delete: if canAccessBatch(parentBatchData());
       }
     }
   }

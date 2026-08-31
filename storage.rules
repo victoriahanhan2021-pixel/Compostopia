@@ -5,27 +5,141 @@ service firebase.storage {
       return request.auth != null;
     }
 
+    function normalizedEmail(email) {
+      return email is string && email.size() > 0
+        ? email.lower().split('@')[0].replace('\\.', '') + '@' + email.lower().split('@')[1]
+        : (email is string ? email : '');
+    }
+
+    function emailMatches(rawList) {
+      if (request.auth == null || request.auth.token.email == null) return false;
+      const current = normalizedEmail(request.auth.token.email);
+      if (!(rawList is list)) return false;
+      return rawList.any((e) => e is string && normalizedEmail(e) == current);
+    }
+
+    function emailMatchesValue(v) {
+      if (request.auth == null || request.auth.token.email == null) return false;
+      return v is string && normalizedEmail(v) == normalizedEmail(request.auth.token.email);
+    }
+
     function batchDoc(ownerUid, batchRouteId) {
       return firestore.get(/databases/(default)/documents/batches/$(batchRouteId));
     }
 
+    function batchExists(ownerUid, batchRouteId) {
+      return firestore.exists(/databases/(default)/documents/batches/$(batchRouteId));
+    }
+
+    function batchData(ownerUid, batchRouteId) {
+      return batchDoc(ownerUid, batchRouteId).data;
+    }
+
+    function isBatchOwner(ownerUid, batchRouteId) {
+      if (!signedIn() || !batchExists(ownerUid, batchRouteId)) return false;
+      const d = batchData(ownerUid, batchRouteId);
+      if (d.ownerUid is string && d.ownerUid.size() > 0) {
+        return request.auth.uid == d.ownerUid;
+      }
+      return emailMatchesValue(d.ownerEmail);
+    }
+
+    function directCollaborators(ownerUid, batchRouteId) {
+      const d = batchData(ownerUid, batchRouteId);
+      const c1 = (d.collaboratorEmails is list) ? d.collaboratorEmails : [];
+      const c2 = (d.collaborationSettings is map && d.collaborationSettings.collaborators is list)
+        ? d.collaborationSettings.collaborators : [];
+      const c3 = (d.collaborationSettings is map && d.collaborationSettings.customCollaborators is list)
+        ? d.collaborationSettings.customCollaborators : [];
+      return c1.concat(c2).concat(c3);
+    }
+
+    function isDirectCollaborator(ownerUid, batchRouteId) {
+      if (!signedIn() || !batchExists(ownerUid, batchRouteId)) return false;
+      return emailMatches(directCollaborators(ownerUid, batchRouteId));
+    }
+
+    function batchIsProjectSelected(ownerUid, batchRouteId) {
+      if (!batchExists(ownerUid, batchRouteId)) return false;
+      const d = batchData(ownerUid, batchRouteId);
+      if (!(d.collaborationSettings is map)) return false;
+      const t = ((d.collaborationSettings.accessMode is string) ? d.collaborationSettings.accessMode :
+                 ((d.collaborationSettings.mode is string) ? d.collaborationSettings.mode :
+                  ((d.collaborationSettings.type is string) ? d.collaborationSettings.type : ''))).lower();
+      return t == 'project_selected' || t == 'project-collaborators' || t == 'selected' || t == 'project';
+    }
+
+    function projectDoc(ownerUid, batchRouteId) {
+      const d = batchData(ownerUid, batchRouteId);
+      const pid = (d.projectId is string && d.projectId.size() > 0) ? d.projectId : 'global-default-project';
+      return firestore.get(/databases/(default)/documents/projects/$(pid));
+    }
+
+    function projectExists(ownerUid, batchRouteId) {
+      const d = batchData(ownerUid, batchRouteId);
+      const pid = (d.projectId is string && d.projectId.size() > 0) ? d.projectId : 'global-default-project';
+      return firestore.exists(/databases/(default)/documents/projects/$(pid));
+    }
+
+    function selectedProjectCollaborators(ownerUid, batchRouteId) {
+      const d = batchData(ownerUid, batchRouteId);
+      if (!(d.collaborationSettings is map)) return [];
+      return (d.collaborationSettings.selectedProjectCollaborators is list)
+        ? d.collaborationSettings.selectedProjectCollaborators
+        : ((d.collaborationSettings.collaborators is list) ? d.collaborationSettings.collaborators : []);
+    }
+
+    function projectCollaborators(ownerUid, batchRouteId) {
+      const pd = projectDoc(ownerUid, batchRouteId).data;
+      const c1 = (pd.collaboratorEmails is list) ? pd.collaboratorEmails : [];
+      const c2 = (pd.collaborationSettings is map && pd.collaborationSettings.collaborators is list)
+        ? pd.collaborationSettings.collaborators : [];
+      return c1.concat(c2);
+    }
+
+    function isSelectedProjectCollaborator(ownerUid, batchRouteId) {
+      if (!signedIn() || !batchExists(ownerUid, batchRouteId) || !projectExists(ownerUid, batchRouteId)) return false;
+      if (!batchIsProjectSelected(ownerUid, batchRouteId)) return false;
+      if (!emailMatches(selectedProjectCollaborators(ownerUid, batchRouteId))) return false;
+      return emailMatches(projectCollaborators(ownerUid, batchRouteId));
+    }
+
+    function projectOwnerOrManager(ownerUid, batchRouteId) {
+      if (!signedIn() || !batchExists(ownerUid, batchRouteId) || !projectExists(ownerUid, batchRouteId)) return false;
+      const pd = projectDoc(ownerUid, batchRouteId).data;
+      if (pd.ownerUid is string && pd.ownerUid.size() > 0 && request.auth.uid == pd.ownerUid) return true;
+      if (emailMatchesValue(pd.ownerEmail)) return true;
+      if (emailMatchesValue(pd.managerEmail)) return true;
+      if (pd.managerUid is string && pd.managerUid.size() > 0 && request.auth.uid == pd.managerUid) return true;
+      return false;
+    }
+
     function canAccessBatch(ownerUid, batchRouteId) {
-      return signedIn()
-        && batchDoc(ownerUid, batchRouteId).data != null
-        && (
-          batchDoc(ownerUid, batchRouteId).data.ownerUid == request.auth.uid
-          || (
-            request.auth.token.email != null
-            && (
-              request.auth.token.email in batchDoc(ownerUid, batchRouteId).data.collaboratorEmails
-              || request.auth.token.email in (batchDoc(ownerUid, batchRouteId).data.collaborationSettings?.collaborators || [])
-            )
-          )
-        );
+      if (!signedIn() || !batchExists(ownerUid, batchRouteId)) return false;
+      return isBatchOwner(ownerUid, batchRouteId)
+        || isDirectCollaborator(ownerUid, batchRouteId)
+        || isSelectedProjectCollaborator(ownerUid, batchRouteId)
+        || projectOwnerOrManager(ownerUid, batchRouteId);
+    }
+
+    function batchPhotoOwnerMatchesPath(ownerUid) {
+      if (!signedIn() || !(ownerUid is string) || ownerUid.size() == 0) return false;
+      return ownerUid == request.auth.uid;
     }
 
     match /batch-photos/{ownerUid}/{batchRouteId}/{allPaths=**} {
-      allow read, write: if canAccessBatch(ownerUid, batchRouteId);
+      allow read: if batchExists(ownerUid, batchRouteId);
+      allow write: if (
+        canAccessBatch(ownerUid, batchRouteId)
+        && batchPhotoOwnerMatchesPath(ownerUid)
+      ) || (
+        batchExists(ownerUid, batchRouteId)
+        && isBatchOwner(ownerUid, batchRouteId)
+      );
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
     }
   }
 }
