@@ -67,6 +67,30 @@ const App = {
     },
 
     init() {
+        try {
+            if (!window.__compostopiaErrorHandlersBound) {
+                window.__compostopiaErrorHandlersBound = true;
+                window.addEventListener('error', (evt) => {
+                    try {
+                        const msg = String(evt?.message || evt?.error?.message || 'Unknown JS error');
+                        const file = String(evt?.filename || '').slice(-40);
+                        const line = evt?.lineno || '?';
+                        const col = evt?.colno || '?';
+                        const stack = String(evt?.error?.stack || '').slice(0, 300);
+                        try { console.error('Compostopia window.onerror', { msg, file, line, col, stack }); } catch (e) {}
+                        alert(`⚠️ Something went wrong in the app:\n\n• Error: ${msg}\n• Location: ${file || '(unknown)'} line ${line} col ${col}\n${stack ? `• Stack: ${stack}\n` : ''}\nPlease refresh the page and try again. If this keeps happening, copy this message and send it to support.`);
+                    } catch (outer) {}
+                }, true);
+                window.addEventListener('unhandledrejection', (evt) => {
+                    try {
+                        const reason = String(evt?.reason?.message || evt?.reason || 'Unhandled async error');
+                        const stack = String(evt?.reason?.stack || '').slice(0, 300);
+                        try { console.error('Compostopia unhandledrejection', { reason, stack }); } catch (e) {}
+                        alert(`⚠️ Async operation failed:\n\n• ${reason}\n${stack ? `\n• ${stack}\n` : ''}\nPlease refresh and try again.`);
+                    } catch (outer) {}
+                });
+            }
+        } catch (e) {}
         this.data.currentPage = 'landing';
         this.data.rememberMe = localStorage.getItem('compostRememberMe') === 'true';
         this.data.pendingRoute = this.parseRouteFromUrl();
@@ -125,6 +149,46 @@ const App = {
         } catch (error) {
         }
     },
+    syncUrlRouteFromState() {
+        try {
+            const url = new URL(window.location.href);
+            const resetAll = ['landing', 'login', 'register'];
+            if (resetAll.includes(String(this.data.currentPage || ''))) {
+                ['page', 'projectId', 'batchId', 'recordId', 'view', 'copyBatchId', 'projectRouteId'].forEach(k => url.searchParams.delete(k));
+            } else {
+                const cp = String(this.data.currentPage || '').trim() || 'dashboard';
+                const dashboardLike = ['dashboard', 'projectsOverview', 'profile'];
+                url.searchParams.set('page', cp);
+                if (dashboardLike.includes(cp)) {
+                    ['projectId', 'batchId', 'recordId', 'view', 'copyBatchId', 'projectRouteId'].forEach(k => url.searchParams.delete(k));
+                } else {
+                    if (this.data.currentProject) {
+                        const prid = String(this.getProjectRouteId(this.data.currentProject) || this.data.currentProject.id || this.data.currentProjectRouteId || '').trim();
+                        if (prid) url.searchParams.set('projectId', encodeURIComponent(prid)); else url.searchParams.delete('projectId');
+                    } else if (this.data.currentProjectRouteId) {
+                        url.searchParams.set('projectId', encodeURIComponent(String(this.data.currentProjectRouteId)));
+                    } else {
+                        url.searchParams.delete('projectId');
+                    }
+                    if (this.data.currentBatch) {
+                        const brid = String(this.getBatchRouteId(this.data.currentBatch) || this.data.currentBatch.id || this.data.currentBatch.cloudId || '').trim();
+                        if (brid) url.searchParams.set('batchId', encodeURIComponent(brid)); else url.searchParams.delete('batchId');
+                    } else {
+                        url.searchParams.delete('batchId');
+                    }
+                    if (this.data.editingRecord != null && String(this.data.editingRecord).trim() !== '') {
+                        url.searchParams.set('recordId', encodeURIComponent(String(this.data.editingRecord)));
+                    } else {
+                        url.searchParams.delete('recordId');
+                    }
+                }
+            }
+            const target = url.pathname + url.search + url.hash;
+            if ((window.location.search || '') !== (url.search || '')) {
+                window.history.replaceState({}, document.title, target);
+            }
+        } catch (e) {}
+    },
 
     bindGlobalClickDelegation() {
         if (this.data.globalClickDelegationBound) return;
@@ -173,6 +237,9 @@ const App = {
 
     bindAuthState() {
         firebaseAuth.onAuthStateChanged(async (user) => {
+            if (user && user.email) {
+                try { localStorage.setItem('compostLastKnownUserEmail', String(user.email).trim()); } catch (e) {}
+            }
             this.data.currentUser = user ? {
                 uid: user.uid,
                 email: user.email,
@@ -183,15 +250,22 @@ const App = {
                 await this.loadData();
                 this.loadOrganization();
                 await this.loadUserProfile();
+                try { delete this.data.__loginGuardBackoffRan__; } catch (e) {}
             } else {
-                this.data.batches = [];
-                this.data.currentBatch = null;
-                this.data.editingRecord = null;
-                this.data.currentOrganization = '';
-                this.data.currentCommunityType = '';
-                this.data.currentCommunityTypeOther = '';
-                if (this.data.currentPage !== 'landing') {
-                    this.data.currentPage = 'landing';
+                const remember = localStorage.getItem('compostRememberMe') === 'true';
+                const lastEmail = String(localStorage.getItem('compostLastKnownUserEmail') || '').trim();
+                if (!remember && !lastEmail) {
+                    this.data.batches = [];
+                    this.data.currentBatch = null;
+                    this.data.editingRecord = null;
+                    this.data.currentOrganization = '';
+                    this.data.currentCommunityType = '';
+                    this.data.currentCommunityTypeOther = '';
+                    if (this.data.currentPage !== 'landing') {
+                        this.data.currentPage = 'landing';
+                    }
+                } else {
+                    try { console.warn('[bindAuthState] Firebase user=null BUT SKIP clearing: RememberMe or LastKnownUser exists', { remember, lastEmail }); } catch (e) {}
                 }
             }
 
@@ -435,8 +509,30 @@ const App = {
     },
 
     findBatchByRouteId(batchId) {
-        const target = String(batchId || '');
-        return this.data.batches.find((batch) => this.getBatchRouteId(batch) === target || String(batch?.id || '') === target) || null;
+        if (!batchId) return null;
+        const targetRaw = String(batchId || '').trim();
+        if (!targetRaw) return null;
+        const candidates = new Set([targetRaw]);
+        try {
+            const dec = decodeURIComponent(targetRaw);
+            if (dec !== targetRaw) candidates.add(dec);
+        } catch (e) {}
+        try {
+            const enc = encodeURIComponent(targetRaw);
+            if (enc !== targetRaw) candidates.add(enc);
+        } catch (e) {}
+        const all = Array.isArray(this.data.batches) ? this.data.batches.filter(Boolean) : [];
+        for (const t of candidates) {
+            const found = all.find(b => {
+                const r1 = String(this.getBatchRouteId(b) || '');
+                const r2 = String(b?.id || '');
+                const r3 = String(b?.cloudId || '');
+                const r4 = String(b?.batchId || '');
+                return (r1 && r1 === t) || (r2 && r2 === t) || (r3 && r3 === t) || (r4 && r4 === t);
+            });
+            if (found) return found;
+        }
+        return null;
     },
 
     escapeAttr(value) {
@@ -567,17 +663,56 @@ const App = {
     // correctly without needing a formal Create Project UI (Phase ≥?).
     getProjectByBatch(batch) {
         if (!batch) return null;
+        const pidRaw = String(batch.projectId || '').trim();
+        const projectsAll = Array.isArray(this.data.projects) ? this.data.projects.filter(Boolean) : [];
+        const fallbackProject = projectsAll.find(p => !p.archived) || projectsAll[0] || null;
+        if (pidRaw) {
+            let real = projectsAll.find(p => (p && String(p.id || '') === pidRaw));
+            if (!real) real = projectsAll.find(p => (p && String(this.getProjectRouteId(p) || '') === pidRaw));
+            if (!real) {
+                try {
+                    const decodedPid = decodeURIComponent(pidRaw);
+                    if (decodedPid !== pidRaw) {
+                        real = projectsAll.find(p => (p && String(p.id || '') === decodedPid));
+                        if (!real) real = projectsAll.find(p => (p && String(this.getProjectRouteId(p) || '') === decodedPid));
+                    }
+                } catch (e) {}
+            }
+            if (real) return real;
+        }
+        if (this.data.currentProject) return this.data.currentProject;
+        if (fallbackProject) return fallbackProject;
         const ownerEmail = batch.ownerEmail || this.data.currentUser?.email || '';
         const orgName = this.data.currentOrganization || 'Global';
         return {
-            id: this.data.projectId || 'global-default-project',
+            id: String(batch.projectId || this.GLOBAL_DEFAULT_PROJECT_ID || ''),
             projectName: `${orgName} Compost Project${ownerEmail ? ` (${ownerEmail.split('@')[0]})` : ''}`,
             ownerEmail,
             archived: !!(batch.projectArchived || batch.__stale_archived)
         };
     },
     getProjectRouteId(project) {
-        return project ? String(project.id || 'global-default-project') : null;
+        return project ? String(project.cloudId || project.id || 'global-default-project') : '';
+    },
+    findProjectByRouteId(projectId) {
+        if (!projectId) return null;
+        const targetRaw = String(projectId || '').trim();
+        if (!targetRaw) return null;
+        const all = Array.isArray(this.data.projects) ? this.data.projects.filter(Boolean) : [];
+        const candidates = new Set([targetRaw]);
+        try {
+            const dec = decodeURIComponent(targetRaw);
+            if (dec !== targetRaw) candidates.add(dec);
+        } catch (e) {}
+        try {
+            const enc = encodeURIComponent(targetRaw);
+            if (enc !== targetRaw) candidates.add(enc);
+        } catch (e) {}
+        for (const t of candidates) {
+            const r = all.find(p => (String(p.cloudId || '') === t) || (String(p.id || '') === t) || (String(this.getProjectRouteId(p) || '') === t));
+            if (r) return r;
+        }
+        return null;
     },
     isProjectArchived(batch) {
         const project = this.getProjectByBatch(batch);
@@ -2008,19 +2143,35 @@ const App = {
     },
 
     async deleteBatchFromCloud(batch) {
-        if (!firestoreDb || !batch?.cloudId) return;
-        const recordsCollection = this.getRecordsCollection(batch);
-        const photoPaths = [];
-        (Array.isArray(batch?.records) ? batch.records : []).forEach((record) => {
-            photoPaths.push(...this.getPhotoStoragePaths(record?.uploadedPhotos || []));
-        });
-        photoPaths.push(...this.getPhotoStoragePaths(batch?.finalAssessment?.finalCompostPhotos || []));
-        if (recordsCollection) {
-            const recordsSnap = await recordsCollection.get();
-            await Promise.all(recordsSnap.docs.map((doc) => doc.ref.delete()));
+        try {
+            if (!firestoreDb || !batch?.cloudId) return;
+            const recordsCollection = this.getRecordsCollection(batch);
+            const photoPaths = [];
+            (Array.isArray(batch?.records) ? batch.records : []).forEach((record) => {
+                photoPaths.push(...this.getPhotoStoragePaths(record?.uploadedPhotos || []));
+            });
+            photoPaths.push(...this.getPhotoStoragePaths(batch?.finalAssessment?.finalCompostPhotos || []));
+            if (recordsCollection) {
+                try {
+                    const recordsSnap = await recordsCollection.get();
+                    await Promise.all(recordsSnap.docs.map((doc) => doc.ref.delete()));
+                } catch (subErr) {
+                    try { console.error('[deleteBatchFromCloud] records sub-error', subErr, { batchId: batch?.batchId || batch?.id }); } catch (e) {}
+                }
+            }
+            try {
+                await firestoreDb.collection('batches').doc(String(batch.cloudId)).delete();
+            } catch (subErr) {
+                try { console.error('[deleteBatchFromCloud] batch doc delete sub-error', subErr, { batchId: batch?.batchId || batch?.id, cloudId: batch?.cloudId }); } catch (e) {}
+            }
+            try {
+                await this.deleteStorageFiles(photoPaths);
+            } catch (subErr) {
+                try { console.error('[deleteBatchFromCloud] storage photos sub-error', subErr, { batchId: batch?.batchId || batch?.id, count: photoPaths.length }); } catch (e) {}
+            }
+        } catch (outerErr) {
+            try { console.error('[deleteBatchFromCloud] outer error (swallowed, never thrown)', outerErr, { batchId: batch?.batchId || batch?.id, cloudId: batch?.cloudId || null }); } catch (e) {}
         }
-        await firestoreDb.collection('batches').doc(String(batch.cloudId)).delete();
-        await this.deleteStorageFiles(photoPaths);
     },
 
     getBatchMeasurementSettings(batch) {
@@ -4981,8 +5132,26 @@ const App = {
                 project.collaboratorEmails = [...project.collaborationSettings.collaborators];
             }
         });
+        const existingProjectIds = new Set();
+        (this.data.projects || []).forEach(p => {
+            if (!p) return;
+            const localId = String(p.id || '').trim();
+            const routeId = String(this.getProjectRouteId(p) || '').trim();
+            if (localId) existingProjectIds.add(localId);
+            if (routeId) existingProjectIds.add(routeId);
+        });
+        let fallbackProjectId = '';
+        const firstActive = (this.data.projects || []).find(p => p && !p.archived);
+        if (firstActive) {
+            fallbackProjectId = String(this.getProjectRouteId(firstActive) || firstActive.id || '');
+        } else if ((this.data.projects || []).length > 0) {
+            fallbackProjectId = String(this.getProjectRouteId(this.data.projects[0]) || this.data.projects[0].id || '');
+        }
         this.data.batches.forEach(batch => {
-            if (batch && !batch.projectId) batch.projectId = this.GLOBAL_DEFAULT_PROJECT_ID;
+            if (!batch) return;
+            const currentProjectId = String(batch.projectId || '').trim();
+            if (currentProjectId && existingProjectIds.has(currentProjectId)) return;
+            batch.projectId = fallbackProjectId || '';
         });
     },
 
@@ -5012,6 +5181,77 @@ const App = {
 
     getProjectRouteId(project) {
         return project ? String(project.cloudId || project.id || '') : '';
+    },
+
+    batchBelongsToProject(batch, project) {
+        if (!batch || !project) return false;
+        const bpid = String(batch?.projectId || '').trim();
+        if (!bpid) return false;
+        const pid = String(project?.id || '').trim();
+        const prid = String(this.getProjectRouteId(project) || '').trim();
+        const candidates = new Set([bpid]);
+        try { const dec = decodeURIComponent(bpid); if (dec) candidates.add(dec); } catch (e) {}
+        try { const enc = encodeURIComponent(bpid); if (enc) candidates.add(enc); } catch (e) {}
+        for (const c of candidates) {
+            if (!c) continue;
+            if (pid && c === pid) return true;
+            if (prid && c === prid) return true;
+            if (prid && pid && c === String(pid + '|' + prid).slice(0, c.length)) continue;
+        }
+        return false;
+    },
+
+    normalizeAllBatchProjectIdsOnce() {
+        try {
+            if (!Array.isArray(this.data.batches) || this.data.batches.length === 0) return;
+            if (!Array.isArray(this.data.projects) || this.data.projects.length === 0) return;
+            const runKey = '__normalizeBPID_run_v1';
+            const lastAt = Number(this.data[runKey] || 0);
+            const now = Date.now();
+            const batches = this.data.batches;
+            let changed = 0;
+            let firstActiveOwnerProject = null;
+            for (const p of this.data.projects) {
+                if (!p || p.archived) continue;
+                if (this.isProjectOwner(p) || this.isProjectManager(p)) { firstActiveOwnerProject = p; break; }
+            }
+            if (!firstActiveOwnerProject) firstActiveOwnerProject = this.data.projects.find(p => p && !p.archived) || this.data.projects[0] || null;
+            for (let i = 0; i < batches.length; i++) {
+                const b = batches[i];
+                if (!b) continue;
+                const bpidRaw = String(b?.projectId || '').trim();
+                let matchedProject = null;
+                if (bpidRaw) {
+                    matchedProject = this.data.projects.find(p => this.batchBelongsToProject(b, p)) || null;
+                }
+                const finalProject = matchedProject || firstActiveOwnerProject;
+                if (!finalProject) continue;
+                const targetPid = String(this.getProjectRouteId(finalProject) || finalProject.id || '').trim();
+                if (!targetPid) continue;
+                if (!matchedProject && !bpidRaw) {
+                    try {
+                        const actor = this.getCurrentActorInfo();
+                        this.appendBatchActivity(b, 'batch_project_auto_assigned',
+                            `Auto-assigned orphan batch to project: ${finalProject.projectName || finalProject.name || targetPid}`,
+                            { autoAssignedFrom: bpidRaw || '(none)', targetProjectId: targetPid, autoAssignedBy: actor.name || actor.email || 'system' });
+                        this.appendProjectActivityBatchAware(finalProject, 'batch_assigned_into_project',
+                            `Auto-assigned orphan batch: ${b.batchId || b.id || 'Batch'}`,
+                            { batchId: b.batchId || b.id || '', fromProjectId: bpidRaw || '(none)', auto: true }, b);
+                    } catch (e) {}
+                }
+                if (bpidRaw !== targetPid) {
+                    b.projectId = targetPid;
+                    changed += 1;
+                }
+            }
+            this.data[runKey] = now;
+            if (changed > 0) {
+                try { this.saveData(); } catch (e) {}
+                try { this.syncDirtyBatchesToCloud(); } catch (e) {}
+            }
+        } catch (outer) {
+            try { console.error('[normalizeAllBatchProjectIdsOnce] error', outer); } catch (e) {}
+        }
     },
 
     findProjectByRouteId(projectId) {
@@ -5155,18 +5395,45 @@ const App = {
     },
 
     navigateOriginal(page, params = {}) {
-        this.cleanupOverlays();
-        this.data.currentPage = page;
-        if (params.batchId) {
-            this.data.currentBatch = this.findBatchByRouteId(params.batchId);
+        try {
+            this.cleanupOverlays();
+            this.data.currentPage = page;
+            let batchNotFoundMsg = '';
+            if (params.batchId) {
+                const b = this.findBatchByRouteId(params.batchId);
+                if (b) {
+                    this.data.currentBatch = b;
+                } else {
+                    this.data.currentBatch = null;
+                    batchNotFoundMsg = String(params.batchId);
+                }
+            }
+            if (params.recordId != null) {
+                this.data.editingRecord = String(params.recordId);
+            } else {
+                this.data.editingRecord = null;
+            }
+            this.render();
+            if (batchNotFoundMsg && !['landing', 'register', 'login', 'dashboard', 'projectsOverview'].includes(String(page || ''))) {
+                try { console.warn('[navigate] Batch not found for id=', batchNotFoundMsg); } catch (e) {}
+                setTimeout(() => {
+                    alert(`⚠️ Batch not found (ID: ${batchNotFoundMsg}). It may have been deleted, or the URL is outdated. Redirecting to Projects Overview.`);
+                    this.navigate('dashboard');
+                }, 50);
+            }
+            window.scrollTo(0, 0);
+        } catch (e) {
+            try { console.error('[navigateOriginal] error', { page, params, error: e, stack: e?.stack || '' }); } catch (ee) {}
+            alert(`⚠️ Page rendering error (${page || '(empty)'}): ${e?.message || String(e)}\n\nRedirecting to Projects Overview.`);
+            try {
+                this.data.currentPage = 'dashboard';
+                this.data.currentBatch = null;
+                this.render();
+            } catch (eee) {
+                try { window.location.reload(); } catch (aaaa) {}
+            }
+            window.scrollTo(0, 0);
         }
-        if (params.recordId != null) {
-            this.data.editingRecord = String(params.recordId);
-        } else {
-            this.data.editingRecord = null;
-        }
-        this.render();
-        window.scrollTo(0, 0);
     },
 
     formatDate(dateStr) {
@@ -5468,9 +5735,22 @@ const App = {
     calculateRecordTotalMaterialInput(record) {
         return this.calculateRecordMaterialBreakdown(record).totalMaterialInput;
     },
+    calculateRecordTotalStructuralInput(record) {
+        const b = this.calculateRecordMaterialBreakdown(record);
+        return Math.max(0, (b.totalMaterialInput || 0) - (b.totalOrganicWaste || 0));
+    },
 
     calculateRecordTotalOrganicInput(record) {
         return this.calculateRecordMaterialBreakdown(record).totalOrganicWaste;
+    },
+    calculateRecordOrganicInput(record) {
+        return this.calculateRecordTotalOrganicInput(record);
+    },
+    calculateRecordStructuralInput(record) {
+        return this.calculateRecordTotalStructuralInput(record);
+    },
+    calculateRecordMaterialInput(record) {
+        return this.calculateRecordTotalMaterialInput(record);
     },
 
     calculateAvgTemperature(record) {
@@ -6154,7 +6434,7 @@ const App = {
             }).join('');
             const dayLabel = pt.label || '';
             return `<div style="display:flex;flex-direction:column;align-items:center;flex:1;min-width:22px;">
-                <div style="display:flex;flex-direction:column-reverse;justify-content:flex-start;width:58%;height:180px;background:rgba(15,118,110,.04);border:1px solid #E2E8F0;border-radius:5px 5px 2px 2px;overflow:hidden;">${bars || '<div style="height:1px;"></div>'}</div>
+                <div style="display:flex;flex-direction:column-reverse;justify-content:flex-start;width:58%;height:180px;background:rgba(15,118,110,.04);border:1px solid #E2E8F0;border-radius:5px 5px 2px 2px;overflow:hidden;">${stackHtml || '<div style="height:1px;"></div>'}</div>
                 <div style="margin-top:5px;font-size:0.68rem;font-weight:600;color:#64748B;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:48px;">${this.escapeHtml(dayLabel)}</div>
             </div>`;
         }).join('');
@@ -6189,10 +6469,46 @@ const App = {
     },
 
     render() {
+        try { this.normalizeAllBatchProjectIdsOnce(); } catch (e) { try { console.error('[render] normalize error', e); } catch (ee) {} }
         const app = document.getElementById('app');
-        if (this.data.currentUser === null && this.data.currentPage !== 'login' && this.data.currentPage !== 'register' && this.data.currentPage !== 'landing') {
-            this.navigate('login');
-            return;
+        const page = String(this.data.currentPage || '').trim();
+        const isAuthPage = page === 'login' || page === 'register' || page === 'landing';
+        if (this.data.currentUser === null && !isAuthPage) {
+            try {
+                const remember = localStorage.getItem('compostRememberMe') === 'true';
+                const lastEmail = String(localStorage.getItem('compostLastKnownUserEmail') || '').trim();
+                const hasProfile = !!(this.data.currentProfile && (this.data.currentProfile.email || this.data.currentProfile.fullName));
+                const hasOrg = !!String(this.data.currentOrganization || '').trim();
+                const clearlyLoggedIn = remember || lastEmail || hasProfile || hasOrg;
+                if (clearlyLoggedIn) {
+                    try { console.warn('[render] SKIP auth guard kick: clearly logged in state detected', { remember, lastEmail, hasProfile, hasOrg, page }); } catch (e) {}
+                    if (!this.data.__loginGuardBackoffRan__) {
+                        try { this.data.__loginGuardBackoffRan__ = true; } catch (e) {}
+                        try {
+                            setTimeout(() => {
+                                try {
+                                    if (this.data.currentUser === null && this.data.currentPage !== 'login' && this.data.currentPage !== 'register' && this.data.currentPage !== 'landing') {
+                                        const remember2 = localStorage.getItem('compostRememberMe') === 'true';
+                                        const last2 = String(localStorage.getItem('compostLastKnownUserEmail') || '').trim();
+                                        if (!remember2 && !last2) {
+                                            try { console.warn('[render] Backoff kick: currentUser still null after 450ms, lastKnown gone → navigate login'); } catch (e) {}
+                                            this.navigate('login');
+                                        }
+                                    }
+                                } catch (late) {}
+                            }, 450);
+                        } catch (e) {}
+                    }
+                } else {
+                    try { console.warn('[render] Auth guard kick: no logged-in indicators → navigate login', { page }); } catch (e) {}
+                    this.navigate('login');
+                    return;
+                }
+            } catch (outerGuard) {
+                try { console.error('[render] auth guard outer error', outerGuard); } catch (e) {}
+                this.navigate('login');
+                return;
+            }
         }
         switch (this.data.currentPage) {
             case 'landing':
@@ -6248,6 +6564,7 @@ const App = {
                 app.innerHTML = this.renderLogin();
         }
         this.attachEventListeners();
+        try { this.syncUrlRouteFromState(); } catch (e) {}
     },
 
     renderLanding() {
@@ -6769,8 +7086,9 @@ const App = {
 
     renderProjectCard(project) {
         if (!project) return '';
-        const projectRouteId = this.getProjectRouteId(project);
-        const allBatches = this.data.batches.filter(b => !projectRouteId || String(b.projectId || this.GLOBAL_DEFAULT_PROJECT_ID) === projectRouteId || (project?.id && String(b.projectId || '') === String(project.id)));
+        const projectRouteId = String(this.getProjectRouteId(project) || '');
+        const projectLocalId = String(project?.id || '');
+        const allBatches = this.data.batches.filter(b => this.batchBelongsToProject(b, project));
         const activeBatches = allBatches.filter(b => b.status === 'active');
         const finishedBatches = allBatches.filter(b => b.status === 'finished');
         const archived = !!project.archived;
@@ -6956,23 +7274,43 @@ const App = {
     _pm_deleteProject(routeId) {
         const p = this.findProjectByRouteId(routeId);
         if (!p || !this.isProjectOwner(p)) { alert('Only the project owner can delete.'); return; }
-        const allBatches = this.data.batches.filter(b => String(b.projectId || '') === String(p.id || '') || String(b.projectId || '') === String(routeId));
+        const pId = String(p.id || '').trim();
+        const pRoute = String(this.getProjectRouteId(p) || routeId || '').trim();
+        const allBatches = this.data.batches.filter(b => {
+            if (!b) return false;
+            const bpid = String(b.projectId || '').trim();
+            if (!bpid) return false;
+            if (pId && bpid === pId) return true;
+            if (pRoute && bpid === pRoute) return true;
+            try {
+                const decBp = decodeURIComponent(bpid);
+                if ((pId && decBp === pId) || (pRoute && decBp === pRoute)) return true;
+            } catch (e) {}
+            return false;
+        });
+        const pName = p.projectName || p.name || 'Project';
         if (allBatches.length > 0) {
-            const body = '<div style="margin-bottom:16px;"><strong style="font-size:1.02rem;">Project Cannot Be Deleted</strong></div>' +
-                '<div style="background:#FEF2F2;border:1px solid #FECACA;border-radius:10px;padding:12px 14px;color:#991B1B;font-size:0.9rem;line-height:1.7;">' +
-                    '<div>This Project contains <strong>' + allBatches.length + ' Batch' + (allBatches.length === 1 ? '' : 'es') + '</strong>.</div>' +
-                    '<div style="margin-top:6px;">Projects with existing Batch records cannot be permanently deleted because they contain operational history.</div>' +
-                    '<div style="margin-top:6px;">You can archive this Project instead — data remain accessible, but new operations are disabled.</div>' +
+            const batchList = allBatches.length <= 10
+                ? allBatches.map(b => `<li style="margin:2px 0;">🧪 ${this.escapeHtml(b.batchId || b.id || 'Unnamed Batch')} <span style="color:#6B7280;">(${b.status === 'finished' ? 'Finished' : 'Active'})</span></li>`).join('')
+                : (allBatches.slice(0, 8).map(b => `<li style="margin:2px 0;">🧪 ${this.escapeHtml(b.batchId || b.id || 'Unnamed Batch')}</li>`).join('') + `<li style="margin:2px 0;color:#6B7280;">…and ${allBatches.length - 8} more</li>`);
+            const body = '<div style="margin-bottom:16px;"><strong style="font-size:1.02rem;">Project Has Existing Batches</strong></div>' +
+                '<div style="background:#FFF7ED;border:1px solid #FED7AA;border-radius:10px;padding:12px 14px;color:#7C2D12;font-size:0.9rem;line-height:1.7;">' +
+                    '<div>This Project contains <strong style="font-size:0.95rem;color:#9A3412;">' + allBatches.length + ' Batch' + (allBatches.length === 1 ? '' : 'es') + '</strong>.</div>' +
+                    '<div style="margin-top:6px;">Option A (safe, recommended): <strong>Archive</strong> the Project — all data remain accessible for history/export, but new operational recording is disabled. Data loss = 0.</div>' +
+                    '<div style="margin-top:6px;">Option B (destructive, cannot be undone): <strong>Permanently delete</strong> the Project <em>together with ALL ' + allBatches.length + ' batches and every single Daily Record, photo, Final Assessment, and Carbon calculation inside them.</strong> This destroys operational history completely.</div>' +
                 '</div>' +
-                '<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px;">' +
+                '<details style="margin-top:10px;border:1px solid #F3F4F6;border-radius:8px;padding:8px 10px;background:#F9FAFB;"><summary style="cursor:pointer;font-weight:700;color:#374151;font-size:0.85rem;">📋 Batches that will also be deleted (' + allBatches.length + ')</summary>' +
+                    '<ul style="margin:6px 0 0;padding-left:18px;font-size:0.84rem;color:#374151;">' + batchList + '</ul>' +
+                '</details>' +
+                '<div style="display:flex;flex-direction:column;align-items:stretch;gap:6px;margin-top:18px;">' +
                     '<button type="button" class="btn btn-secondary" onclick="app.closeInfoModal()">Cancel</button>' +
-                    '<button type="button" class="btn btn-primary" style="background:#92400E;border-color:#92400E;font-weight:700;" onclick="app.closeInfoModal(); app._pm_archiveProject(\'' + this.escapeAttr(routeId) + '\')">📦 Archive Project</button>' +
+                    '<button type="button" class="btn btn-primary" style="background:#92400E;border-color:#92400E;font-weight:700;" onclick="app.closeInfoModal(); app._pm_archiveProject(\'' + this.escapeAttr(routeId) + '\')">📦 Option A · Archive Project (safe, keeps data)</button>' +
+                    '<button type="button" class="btn btn-primary" style="background:#991B1B;border-color:#991B1B;font-weight:800;" onclick="app._pm_openCascadeDelete(\'' + this.escapeAttr(routeId) + '\')">🗑️ Option B · DELETE PROJECT + ALL ' + allBatches.length + ' BATCHES (destructive)</button>' +
                 '</div>';
-            this.showInfoModal('Delete Project', body);
+            this.showInfoModal('Delete Project — ' + this.escapeHtml(pName), body);
             return;
         }
-        const confirmHtml = this.showInfoModal ? true : false;
-        const body = '<div style="margin-bottom:16px;"><strong style="font-size:1.02rem;">' + this.escapeHtml(p.projectName || 'Project') + '</strong></div>' +
+        const body = '<div style="margin-bottom:16px;"><strong style="font-size:1.02rem;">' + this.escapeHtml(pName) + '</strong></div>' +
             '<div style="background:#FFFBEB;border:1px solid #FDE68A;border-radius:10px;padding:12px 14px;color:#92400E;font-size:0.9rem;line-height:1.7;">' +
                 '<div>This Project contains no Batches.</div>' +
                 '<div style="margin-top:6px;">Deleting the Project will permanently remove its Project settings and collaborator configuration.</div>' +
@@ -6980,7 +7318,7 @@ const App = {
             '</div>' +
             '<div style="margin-top:14px;">' +
                 '<label class="form-label required">Type the Project name to confirm:</label>' +
-                '<input type="text" class="form-input" id="pm_deleteConfirmText" placeholder="' + this.escapeAttr(p.projectName || '') + '">' +
+                '<input type="text" class="form-input" id="pm_deleteConfirmText" placeholder="' + this.escapeAttr(pName) + '">' +
             '</div>' +
             '<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px;">' +
                 '<button type="button" class="btn btn-secondary" onclick="app.closeInfoModal()">Cancel</button>' +
@@ -6988,11 +7326,67 @@ const App = {
             '</div>';
         this.showInfoModal('Delete Project?', body);
     },
+    _pm_openCascadeDelete(routeId) {
+        const p = this.findProjectByRouteId(routeId);
+        if (!p || !this.isProjectOwner(p)) { this.closeInfoModal(); return; }
+        const pId = String(p.id || '').trim();
+        const pRoute = String(this.getProjectRouteId(p) || routeId || '').trim();
+        const allBatches = this.data.batches.filter(b => {
+            if (!b) return false;
+            const bpid = String(b.projectId || '').trim();
+            if (!bpid) return false;
+            if (pId && bpid === pId) return true;
+            if (pRoute && bpid === pRoute) return true;
+            try {
+                const decBp = decodeURIComponent(bpid);
+                if ((pId && decBp === pId) || (pRoute && decBp === pRoute)) return true;
+            } catch (e) {}
+            return false;
+        });
+        const totalRecords = allBatches.reduce((n, b) => n + (Array.isArray(b.records) ? b.records.length : 0), 0);
+        const pName = p.projectName || p.name || 'Project';
+        const magicWord = 'DELETE EVERYTHING';
+        const body = '<div style="margin-bottom:16px;"><strong style="font-size:1.08rem;color:#991B1B;">⚠️ PERMANENTLY DESTROY ALL DATA</strong></div>' +
+            '<div style="background:#FEF2F2;border:1px solid #FECACA;border-radius:12px;padding:14px 16px;color:#7F1D1D;font-size:0.9rem;line-height:1.8;">' +
+                '<div style="font-weight:800;margin-bottom:6px;">About to DELETE ALL of the following:</div>' +
+                '<div>🗂️ Project itself: <strong>' + this.escapeHtml(pName) + '</strong> (settings, context, collaborators, all audit logs)</div>' +
+                '<div>🧪 All ' + allBatches.length + ' Batches inside this Project</div>' +
+                '<div>📝 All ' + totalRecords + ' Daily Records (temperature, moisture, operations)</div>' +
+                '<div>📷 All photos, evidence, Final Assessments, Carbon calculations, Activity logs</div>' +
+                '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #FECACA;"><strong style="color:#991B1B;">NONE of this can be recovered. There is no undo. There is no Recycle Bin. This is final.</strong></div>' +
+            '</div>' +
+            '<div style="margin-top:16px;">' +
+                '<label class="form-label required" style="color:#991B1B;">To confirm, type exactly: <code style="background:#F3F4F6;padding:2px 6px;border-radius:4px;">' + magicWord + '</code></label>' +
+                '<input type="text" class="form-input" id="pm_cascadeDeleteConfirmText" placeholder="Type: ' + magicWord + '" style="border:2px solid #991B1B;font-weight:700;">' +
+            '</div>' +
+            '<div style="margin-top:8px;">' +
+                '<label class="form-label required" style="color:#991B1B;">Then type the Project name to double confirm:</label>' +
+                '<input type="text" class="form-input" id="pm_cascadeDeleteProjectText" placeholder="' + this.escapeAttr(pName) + '">' +
+            '</div>' +
+            '<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:20px;">' +
+                '<button type="button" class="btn btn-secondary" onclick="app.closeInfoModal()">Cancel · Keep everything</button>' +
+                '<button type="button" class="btn btn-primary" style="background:#991B1B;border-color:#991B1B;font-weight:800;padding:10px 16px;font-size:0.98rem;" onclick="app._pm_confirmDeleteProjectAndAllBatches(\'' + this.escapeAttr(routeId) + '\')">🗑️ Yes, DELETE EVERYTHING permanently</button>' +
+            '</div>';
+        this.showInfoModal('⚠️ FINAL CONFIRMATION · Delete ' + this.escapeHtml(pName) + ' + ' + allBatches.length + ' batches', body);
+    },
     _pm_confirmDeleteProject(routeId) {
         const p = this.findProjectByRouteId(routeId);
         if (!p || !this.isProjectOwner(p)) { this.closeInfoModal(); return; }
-        const allBatches = this.data.batches.filter(b => String(b.projectId || '') === String(p.id || '') || String(b.projectId || '') === String(routeId));
-        if (allBatches.length > 0) { alert('Project contains Batches and cannot be deleted. Archive it instead.'); return; }
+        const pId = String(p.id || '').trim();
+        const pRoute = String(this.getProjectRouteId(p) || routeId || '').trim();
+        const allBatches = this.data.batches.filter(b => {
+            if (!b) return false;
+            const bpid = String(b.projectId || '').trim();
+            if (!bpid) return false;
+            if (pId && bpid === pId) return true;
+            if (pRoute && bpid === pRoute) return true;
+            try {
+                const decBp = decodeURIComponent(bpid);
+                if ((pId && decBp === pId) || (pRoute && decBp === pRoute)) return true;
+            } catch (e) {}
+            return false;
+        });
+        if (allBatches.length > 0) { alert('Project contains Batches and cannot be deleted directly. Choose Option B cascade delete in the menu.'); return; }
         const typed = ((document.getElementById('pm_deleteConfirmText') || {}).value || '').trim();
         const expected = (p.projectName || '').trim();
         if (typed !== expected) {
@@ -7006,6 +7400,69 @@ const App = {
         if (String(this.data.currentProjectRouteId || '') === String(routeId)) this.data.currentProjectRouteId = '';
         this.closeInfoModal();
         this.saveData();
+        this.navigate('dashboard');
+    },
+    _pm_confirmDeleteProjectAndAllBatches(routeId) {
+        const p = this.findProjectByRouteId(routeId);
+        if (!p || !this.isProjectOwner(p)) { this.closeInfoModal(); return; }
+        const pId = String(p.id || '').trim();
+        const pRoute = String(this.getProjectRouteId(p) || routeId || '').trim();
+        const allBatches = this.data.batches.filter(b => {
+            if (!b) return false;
+            const bpid = String(b.projectId || '').trim();
+            if (!bpid) return false;
+            if (pId && bpid === pId) return true;
+            if (pRoute && bpid === pRoute) return true;
+            try {
+                const decBp = decodeURIComponent(bpid);
+                if ((pId && decBp === pId) || (pRoute && decBp === pRoute)) return true;
+            } catch (e) {}
+            return false;
+        });
+        const totalRecords = allBatches.reduce((n, b) => n + (Array.isArray(b.records) ? b.records.length : 0), 0);
+        const magicWord = 'DELETE EVERYTHING';
+        const typedMagic = ((document.getElementById('pm_cascadeDeleteConfirmText') || {}).value || '').trim();
+        const typedName = ((document.getElementById('pm_cascadeDeleteProjectText') || {}).value || '').trim();
+        const expectedName = (p.projectName || p.name || '').trim();
+        if (typedMagic !== magicWord) {
+            alert('First confirmation mismatch: you must type exactly the text DELETE EVERYTHING (case-sensitive). Nothing was deleted.');
+            return;
+        }
+        if (typedName !== expectedName) {
+            alert('Second confirmation mismatch: you must type the exact Project name: ' + (expectedName || '(empty)') + '. You typed: ' + (typedName || '(empty)') + '. Nothing was deleted.');
+            return;
+        }
+        const batchRouteIds = allBatches.map(b => String(this.getBatchRouteId(b) || ''));
+        try {
+            try {
+                const rawBatches = (this.data.batches || []).map(b => String(b?.projectId || '')).filter(Boolean);
+                if (rawBatches.includes(String(this.GLOBAL_DEFAULT_PROJECT_ID)) === false && (pId === String(this.GLOBAL_DEFAULT_PROJECT_ID) || pRoute === String(this.GLOBAL_DEFAULT_PROJECT_ID))) {
+                    this._markGlobalDefaultProjectAsDeleted();
+                }
+            } catch (e) {}
+            if (pId === String(this.GLOBAL_DEFAULT_PROJECT_ID) || pRoute === String(this.GLOBAL_DEFAULT_PROJECT_ID)) {
+                this._markGlobalDefaultProjectAsDeleted();
+            }
+        } catch (e) {}
+        const batchRouteIdSet = new Set(batchRouteIds.filter(Boolean));
+        this.data.batches = (this.data.batches || []).filter(b => {
+            const br = String(this.getBatchRouteId(b) || '');
+            if (br && batchRouteIdSet.has(br)) return false;
+            if (pId && String(b?.projectId || '') === pId) return false;
+            if (pRoute && String(b?.projectId || '') === pRoute) return false;
+            return true;
+        });
+        this.data.projects = (this.data.projects || []).filter(x => x !== p);
+        if (this.data.currentProject === p) this.data.currentProject = null;
+        if (String(this.data.currentProjectRouteId || '') === String(routeId)) this.data.currentProjectRouteId = '';
+        const cbMatch = (this.data.currentBatch && batchRouteIdSet.has(String(this.getBatchRouteId(this.data.currentBatch) || '')));
+        if (cbMatch) this.data.currentBatch = null;
+        try { localStorage.setItem('compostopia_deleteAudit_' + Date.now(), JSON.stringify({ project: pId || pRoute, deletedBatches: batchRouteIds, totalRecords, by: this.data.currentUser?.email || 'owner', at: new Date().toISOString() })); } catch (e) {}
+        this.closeInfoModal();
+        this.saveData();
+        try { this.syncDirtyProjectsToCloud(); } catch (e) {}
+        try { this.syncDirtyBatchesToCloud(); } catch (e) {}
+        alert(`✅ Project permanently deleted:\n• Project: ${expectedName}\n• Batches deleted: ${allBatches.length}\n• Daily records deleted: ${totalRecords}\nNo undo. Redirecting to Projects Overview.`);
         this.navigate('dashboard');
     },
 
@@ -8715,11 +9172,21 @@ const App = {
         if (!project) return this.renderProjectsOverview();
         this.data.currentProject = project;
         const escapedProjectRoute = this.escapeAttr(this.getProjectRouteId(project));
-        const allBatches = this.data.batches.filter(b => {
-            const bpid = String(b.projectId || '');
-            const ppid = String(project.id || '');
-            return bpid === ppid || bpid === escapedProjectRoute;
+        const projectIdSet = new Set();
+        (this.data.projects || []).forEach(p => {
+            if (!p) return;
+            const localId = String(p.id || '').trim();
+            const routeId = String(this.getProjectRouteId(p) || '').trim();
+            if (localId) projectIdSet.add(localId);
+            if (routeId) projectIdSet.add(routeId);
         });
+        const orphanBatches = this.data.batches.filter(b => {
+            if (!b) return false;
+            const bpid = String(b.projectId || '').trim();
+            if (!bpid) return true;
+            return !projectIdSet.has(bpid);
+        });
+        const allBatches = this.data.batches.filter(b => this.batchBelongsToProject(b, project));
         const activeBatches = allBatches.filter(b => b.status === 'active');
         const finishedBatches = allBatches.filter(b => b.status === 'finished');
         const today = new Date();
@@ -8875,6 +9342,43 @@ const App = {
                                 this.renderProjectActivityTimeline(project, { scope: 'all', limit: 5 }) +
                             '</div>' +
                         '</div>' +
+                        (orphanBatches.length === 0 ? '' : (() => {
+                            const canReassign = this.isProjectOwner(project) || this.isProjectManager(project);
+                            const orphanItems = orphanBatches.map(b => {
+                                const routeId = this.escapeAttr(this.getBatchRouteId(b));
+                                const start = b.startDate ? this.formatDate(b.startDate) : '-';
+                                const status = b.status === 'finished' ? '🟢 Finished' : '🟡 Active';
+                                const records = Array.isArray(b.records) ? b.records.length : 0;
+                                const oldPid = String(b.projectId || '').trim() || '(no project set)';
+                                const btn = canReassign
+                                    ? `<button class="btn btn-secondary btn-sm" style="padding:5px 10px;font-size:0.82rem;" onclick="app._assignOrphanBatchToProject('${routeId}','${escapedProjectRoute}',false)">📌 Assign to this project</button>`
+                                    : '<span style="color:#6B7280;font-size:0.82rem;">🔒 Owner/Manager only</span>';
+                                return `<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:10px 12px;border:1px solid #E5E7EB;border-radius:10px;background:#F9FAFB;margin-bottom:8px;">
+                                    <div style="flex:1;min-width:200px;">
+                                        <div style="font-weight:700;color:#111827;font-size:0.95rem;">🧪 ${this.escapeHtml(b.batchId || b.id || 'Unnamed Batch')} <span style="font-size:0.8rem;font-weight:500;margin-left:6px;">${status}</span></div>
+                                        <div style="font-size:0.82rem;color:#6B7280;margin-top:2px;">📅 Start: ${this.escapeHtml(String(start))} · 📝 ${records} records · 👤 Manager: ${this.escapeHtml(b.manager || '-')}</div>
+                                        <div style="font-size:0.78rem;color:#9CA3AF;margin-top:2px;">Previous projectId: <code style="background:#F3F4F6;padding:1px 4px;border-radius:4px;">${this.escapeHtml(oldPid)}</code> (not found)</div>
+                                    </div>
+                                    <div>${btn}</div>
+                                </div>`;
+                            }).join('');
+                            const allBtn = (canReassign && orphanBatches.length > 1)
+                                ? `<div style="margin-top:10px;text-align:right;"><button class="btn btn-primary btn-sm" style="font-weight:700;" onclick="app._assignOrphanBatchToProject('','${escapedProjectRoute}',true)">📌 Assign ALL ${orphanBatches.length} orphan batches into this project</button></div>`
+                                : '';
+                            return `<div class="card" style="border-color:#F59E0B;background:#FFFBEB;">
+                                <div class="card-header" style="background:#FEF3C7;border-bottom:1px solid #FDE68A;">
+                                    <h3 class="card-title" style="margin:0;color:#92400E;">📋 Orphan Batches — Recoverable (${orphanBatches.length})</h3>
+                                </div>
+                                <div style="padding:12px 14px;">
+                                    <div style="font-size:0.86rem;color:#78350F;margin-bottom:10px;line-height:1.6;">
+                                        <strong>What are these?</strong> These batches were successfully created but lost their Project assignment (most often because the previous project they were attached to was deleted).
+                                        They are <strong>NOT deleted</strong> — all daily records, photos and data are intact. Use the buttons below to assign them into this project so they show up in the Batches list above.
+                                    </div>
+                                    ${orphanItems}
+                                    ${allBtn}
+                                </div>
+                            </div>`;
+                        })()) +
                     '</div>' +
                 '</div>' +
             '</div>';
@@ -8911,15 +9415,68 @@ const App = {
         try { this.syncDirtyProjectsToCloud(); } catch (e) {}
         this.render();
     },
+    _assignOrphanBatchToProject(batchRouteId, targetProjectRouteId, assignAll = false) {
+        const targetProject = this.findProjectByRouteId(targetProjectRouteId);
+        if (!targetProject) { alert('Target project not found.'); return; }
+        const targetId = String(targetProject.id || '');
+        if (!targetId) return;
+        const canWrite = this.isProjectOwner(targetProject) || this.isProjectManager(targetProject);
+        if (!canWrite) { alert('Only project owner or manager can reassign orphan batches to this project.'); return; }
+        const actor = this.getCurrentActorInfo();
+        let count = 0;
+        this.data.batches.forEach(batch => {
+            if (!batch) return;
+            if (!assignAll) {
+                const batchRoute = this.getBatchRouteId(batch);
+                if (String(batchRoute || '') !== String(batchRouteId || '')) return;
+            }
+            const bpid = String(batch.projectId || '').trim();
+            const exists = (this.data.projects || []).some(p => String(p?.id || '') === bpid);
+            if ((!bpid) || (!exists)) {
+                const oldPid = bpid || '(none)';
+                batch.projectId = targetId;
+                this.appendBatchActivity(batch, 'batch_project_reassigned',
+                    `Reassigned orphan batch to project: ${targetProject.projectName || targetProject.name || targetId}`,
+                    { oldProjectId: oldPid, newProjectId: targetId, reassignedBy: actor.name || actor.email || 'system' });
+                this.appendProjectActivityBatchAware(targetProject, 'batch_assigned_into_project',
+                    `Reassigned orphan batch into project: ${batch.batchId || batch.id || 'Batch'}`,
+                    { batchId: batch.batchId || batch.id || '', oldProjectId: oldPid }, batch);
+                count += 1;
+            }
+        });
+        this.saveData();
+        try { this.syncDirtyBatchesToCloud(); } catch (e) {}
+        try { this.syncDirtyProjectsToCloud(); } catch (e) {}
+        this.render();
+        if (count > 0) alert(`✅ Successfully reassigned ${count} orphan batch${count === 1 ? '' : 'es'} into this project.`);
+    },
     handleDeleteProject(projectRouteId) {
         const project = this.findProjectByRouteId(projectRouteId);
         if (!project) return;
         if (!this.isProjectOwner(project)) { alert('Only the project owner can delete.'); return; }
-        const hasBatches = this.data.batches.some(b => String(b.projectId || '') === String(project.id || '') || String(b.projectId || '') === projectRouteId);
-        if (hasBatches) { alert('Cannot delete a project with batches. Archive it instead, or delete all its batches first.'); return; }
+        const pId = String(project.id || '').trim();
+        const pRoute = String(this.getProjectRouteId(project) || projectRouteId || '').trim();
+        const hasBatches = this.data.batches.some(b => {
+            const bpid = String(b?.projectId || '').trim();
+            if (!bpid) return false;
+            if (pId && bpid === pId) return true;
+            if (pRoute && bpid === pRoute) return true;
+            try {
+                const dec = decodeURIComponent(bpid);
+                if ((pId && dec === pId) || (pRoute && dec === pRoute)) return true;
+            } catch (e) {}
+            return false;
+        });
+        if (hasBatches) {
+            this._pm_deleteProject(projectRouteId);
+            return;
+        }
         if (!confirm('Permanently DELETE this project? This cannot be undone.')) return;
+        const isGlobal = String(project?.id || '') === String(this.GLOBAL_DEFAULT_PROJECT_ID);
         this.data.projects = this.data.projects.filter(p => p !== project);
+        if (isGlobal) this._markGlobalDefaultProjectAsDeleted();
         if (this.data.currentProject === project) this.data.currentProject = null;
+        if (String(this.data.currentProjectRouteId || '') === String(projectRouteId)) this.data.currentProjectRouteId = '';
         this.saveData(); this.navigate('dashboard');
     },
 
@@ -9014,22 +9571,46 @@ const App = {
     },
 
     navigate(page, params) {
-        if (page === 'dashboard' || page === 'projectsOverview' || page === 'login' || page === 'landing' || page === 'register') {
-            this.data.currentProject = null;
-            if (page !== 'login') this.data.currentProjectRouteId = null;
-        }
-        if (page === 'login' || page === 'landing' || page === 'register') {
-            this.data.currentBatch = null;
-        }
-        if (params?.projectId) this.data.currentProjectRouteId = String(params.projectId);
-        if (params?.batchId) {
-            const b = this.findBatchByRouteId(params.batchId);
-            if (b) {
-                this.data.currentBatch = b;
-                this.data.currentProjectRouteId = String(b.projectId || this.GLOBAL_DEFAULT_PROJECT_ID);
+        try {
+            if (page === 'dashboard' || page === 'projectsOverview' || page === 'login' || page === 'landing' || page === 'register') {
+                this.data.currentProject = null;
+                if (page !== 'login') this.data.currentProjectRouteId = null;
             }
+            if (page === 'login' || page === 'landing' || page === 'register') {
+                this.data.currentBatch = null;
+            }
+            if (params?.projectId) {
+                this.data.currentProjectRouteId = String(params.projectId);
+                const p = this.findProjectByRouteId(params.projectId);
+                if (p) this.data.currentProject = p;
+            }
+            if (params?.batchId) {
+                const b = this.findBatchByRouteId(params.batchId);
+                if (b) {
+                    this.data.currentBatch = b;
+                    const proj = this.getProjectByBatch(b);
+                    if (proj) {
+                        const prid = String(this.getProjectRouteId(proj) || proj.id || b.projectId || '').trim();
+                        if (prid) this.data.currentProjectRouteId = prid;
+                        if (typeof proj === 'object' && proj.id) this.data.currentProject = proj;
+                    } else if (b.projectId) {
+                        this.data.currentProjectRouteId = String(b.projectId);
+                    }
+                }
+            }
+            return this.navigateOriginal(page, params);
+        } catch (e) {
+            try { console.error('[navigate] error', { page, params, error: e, stack: e?.stack || '' }); } catch (ee) {}
+            alert(`⚠️ Navigation error (page: ${page || '(empty)'}): ${e?.message || String(e)}\n\nRedirecting to Projects Overview.`);
+            try {
+                this.cleanupOverlays();
+                this.data.currentPage = 'dashboard';
+                this.data.currentBatch = null;
+                this.render();
+                window.scrollTo(0, 0);
+            } catch (eee) {}
+            return null;
         }
-        return this.navigateOriginal(page, params);
     },
 
     renderProjectsOverview() {
@@ -9114,10 +9695,76 @@ const App = {
                    </details>
                    <script>(function(){const d=document.getElementById('${archivedToggleId}'); if(!d) return; const sum=d; sum.addEventListener('click',function(e){e.preventDefault();const el=sum.parentElement; if(el.tagName!=='DETAILS') return; if(el.hasAttribute('open')){el.removeAttribute('open');} else {el.setAttribute('open','open');}});})();</script>`
                 : '';
+            const globalProjectIdSet = new Set();
+            projects.forEach(p => {
+                if (!p) return;
+                const lid = String(p.id || '').trim();
+                const rid = String(this.getProjectRouteId(p) || '').trim();
+                if (lid) globalProjectIdSet.add(lid);
+                if (rid) globalProjectIdSet.add(rid);
+            });
+            const globalOrphanBatches = (this.data.batches || []).filter(b => {
+                if (!b) return false;
+                const bpid = String(b.projectId || '').trim();
+                if (!bpid) return true;
+                return !globalProjectIdSet.has(bpid);
+            });
             const allActiveBatches = visibleProjects
-                .flatMap(p => this.data.batches.filter(b => String(b.projectId || '') === String(p.id) && b.status === 'active'));
+                .flatMap(p => this.data.batches.filter(b => b && b.status === 'active' && this.batchBelongsToProject(b, p)));
             const totalActiveBatches = allActiveBatches.length;
             const totalCollabs = visibleProjects.reduce((sum, p) => sum + (Array.isArray(p.collaboratorEmails) ? p.collaboratorEmails.length : 0), 0);
+            const firstActive = visibleProjects.find(p => p && !p.archived) || visibleProjects[0] || userProjects[0] || null;
+            const orphanWarningHTML = (globalOrphanBatches.length === 0) ? '' : (() => {
+                const canAnyWrite = visibleProjects.some(p => this.isProjectOwner(p) || this.isProjectManager(p));
+                const orphanItems = globalOrphanBatches.map(b => {
+                    const routeId = this.escapeAttr(this.getBatchRouteId(b));
+                    const start = b.startDate ? this.formatDate(b.startDate) : '-';
+                    const status = b.status === 'finished' ? '🟢 Finished' : '🟡 Active';
+                    const records = Array.isArray(b.records) ? b.records.length : 0;
+                    const oldPid = String(b.projectId || '').trim() || '(no project set)';
+                    let buttonsHTML = '';
+                    if (canAnyWrite && visibleProjects.length > 0) {
+                        const perProjectBtns = visibleProjects.map(p => {
+                            const pRoute = this.escapeAttr(this.getProjectRouteId(p));
+                            const pName = this.escapeHtml(String(p.projectName || p.name || 'Project').slice(0, 24));
+                            const canW = this.isProjectOwner(p) || this.isProjectManager(p);
+                            if (!canW) return '';
+                            return `<button class="btn btn-secondary btn-sm" style="padding:4px 10px;font-size:0.78rem;margin:2px;" onclick="app._assignOrphanBatchToProject('${routeId}','${pRoute}',false)">📌 ${pName}</button>`;
+                        }).filter(Boolean).join('');
+                        buttonsHTML = `<div style="display:flex;flex-wrap:wrap;gap:2px;justify-content:flex-end;margin-top:4px;">${perProjectBtns}</div>`;
+                    }
+                    return `<div style="padding:10px 12px;border:1px solid #E5E7EB;border-radius:10px;background:#F9FAFB;margin-bottom:8px;">
+                        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+                            <div style="flex:1;min-width:200px;">
+                                <div style="font-weight:700;color:#111827;font-size:0.95rem;">🧪 ${this.escapeHtml(b.batchId || b.id || 'Unnamed Batch')} <span style="font-size:0.8rem;font-weight:500;margin-left:6px;">${status}</span></div>
+                                <div style="font-size:0.82rem;color:#6B7280;margin-top:2px;">📅 Start: ${this.escapeHtml(String(start))} · 📝 ${records} records · 👤 Manager: ${this.escapeHtml(b.manager || '-')}</div>
+                                <div style="font-size:0.78rem;color:#9CA3AF;margin-top:2px;">Previous projectId: <code style="background:#F3F4F6;padding:1px 4px;border-radius:4px;">${this.escapeHtml(oldPid)}</code> (not found)</div>
+                            </div>
+                        </div>
+                        ${buttonsHTML}
+                    </div>`;
+                }).join('');
+                let allBtn = '';
+                if (canAnyWrite && firstActive && globalOrphanBatches.length > 1) {
+                    const fRoute = this.escapeAttr(this.getProjectRouteId(firstActive));
+                    const fName = this.escapeHtml(String(firstActive.projectName || firstActive.name || 'Project'));
+                    allBtn = `<div style="margin-top:10px;text-align:right;"><button class="btn btn-primary btn-sm" style="font-weight:700;" onclick="app._assignOrphanBatchToProject('','${fRoute}',true)">📌 Assign ALL ${globalOrphanBatches.length} into: ${fName}</button></div>`;
+                }
+                return `<div style="margin-bottom: 22px;border:1px solid #F59E0B;border-radius:12px;overflow:hidden;background:#FFFBEB;">
+                    <div style="padding:12px 16px;background:#FEF3C7;border-bottom:1px solid #FDE68A;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+                        <div>
+                            <h3 style="margin:0;color:#92400E;font-size:1.05rem;">⚠️ Recoverable Batches — Lost Project Assignment (${globalOrphanBatches.length})</h3>
+                            <div style="font-size:0.84rem;color:#78350F;margin-top:2px;line-height:1.6;">
+                                These batches were created successfully but lost their Project link. They are <strong>NOT deleted</strong> — all data are intact! Click a button below to assign them into a project so they show up.
+                            </div>
+                        </div>
+                    </div>
+                    <div style="padding:12px 16px;">
+                        ${orphanItems}
+                        ${allBtn}
+                    </div>
+                </div>`;
+            })();
             const summaryStrip = (visibleProjects.length > 0)
                 ? `<div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:20px;">
                         <div style="background:#FFF7ED;border:1px solid #FED7AA;border-radius:10px;padding:14px;">
@@ -9141,6 +9788,7 @@ const App = {
             mainBody = `
                 ${toolbar}
                 ${summaryStrip}
+                ${orphanWarningHTML}
                 <div>
                     <h3 style="margin: 4px 4px 14px; font-size:1.15rem;">🟢 Active Composting Projects</h3>
                     ${activeProjectsHTML}
@@ -10700,12 +11348,19 @@ const App = {
         const batchInputsDisabled = isEdit ? 'disabled style="background:#F9FAFB;color:#6B7280;opacity:0.95;"' : '';
         const inputMethodLockMsg = '';
         let autoBatchCounter = 1;
+        const currentYearStr = String(new Date().getFullYear());
         try {
             const pr = project ? String(this.getProjectRouteId(project) || '') : '';
-            autoBatchCounter = (Array.isArray(this.data.batches)
-                ? this.data.batches.filter(b => !pr || String(this.getProjectRouteId(this.getProjectByBatch(b)) || '') === String(pr)).length
-                : 0) + 1;
-        } catch (e) { autoBatchCounter = (Array.isArray(this.data.batches) ? this.data.batches.length : 0) + 1; }
+            const projectYearBatches = (Array.isArray(this.data.batches) ? this.data.batches : [])
+                .filter(b => {
+                    if (pr && String(this.getProjectRouteId(this.getProjectByBatch(b)) || '') !== String(pr)) return false;
+                    const rawId = String(b.id || b.batchId || b.cloudId || '');
+                    const p1 = `B${currentYearStr}/`;
+                    const p2 = `B${currentYearStr}-`;
+                    return rawId.startsWith(p1) || rawId.startsWith(p2);
+                });
+            autoBatchCounter = projectYearBatches.length + 1;
+        } catch (e) { autoBatchCounter = ((this.data.batches || []).length) + 1; }
         const autoBatchId = 'B' + new Date().getFullYear() + '-' + String(autoBatchCounter).padStart(2, '0');
         const step1Body = `
             <div class="form-row" style="gap:14px;">
@@ -11032,8 +11687,37 @@ const App = {
         const breadcrumbBar = this.renderHierarchyBreadcrumb();
         const batch = this.data.currentBatch;
         if (!batch) {
-
-            return breadcrumbBar + `<div class="container"><p>Batch not found</p></div>`;
+            try {
+                setTimeout(() => {
+                    try {
+                        if (this.data.currentPage === 'batchDetail' && !this.data.currentBatch) {
+                            this.navigate('dashboard');
+                        }
+                    } catch (e) {}
+                }, 3000);
+            } catch (e) {}
+            const rawId = this.data.currentProjectRouteId || this.data.editingBatch || this.parseRouteFromUrl()?.batchId || '';
+            return breadcrumbBar + `
+            <div class="container" style="max-width:860px;margin:20px auto;">
+                <div style="background:#FEF2F2;border:2px solid #FECACA;border-radius:14px;padding:20px 22px;box-shadow:0 2px 8px rgba(127,29,29,0.08);">
+                    <div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:10px;">
+                        <div style="flex:0 0 auto;width:44px;height:44px;border-radius:12px;background:#FEE2E2;display:flex;align-items:center;justify-content:center;font-size:1.5rem;">⚠️</div>
+                        <div style="flex:1;min-width:0;">
+                            <h3 style="margin:0 0 6px;color:#7F1D1D;font-size:1.15rem;font-weight:800;">Batch not found</h3>
+                            <div style="font-size:0.92rem;color:#991B1B;line-height:1.65;margin-bottom:12px;">
+                                The Batch you tried to open could not be loaded. It may have been deleted, its Project was deleted, or the URL/link is outdated.<br>
+                                Searched ID: <code style="background:#FFFFFF;padding:2px 6px;border-radius:6px;border:1px solid #FECACA;">${this.escapeHtml(String(rawId || '(empty)'))}</code>
+                            </div>
+                            <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+                                <div style="font-size:0.84rem;color:#B91C1C;font-weight:600;">⏱️ Auto-redirecting to Projects Overview in 3 seconds…</div>
+                                <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                                    <button class="btn btn-secondary" onclick="try{app.closeInfoModal();}catch(e){} app.navigate('dashboard');">← Back to All Projects (now)</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
         }
         const routeId = this.getBatchRouteId(batch);
         const escapedRouteId = this.escapeAttr(routeId);
@@ -17440,9 +18124,23 @@ const App = {
 
     async logoutUser() {
         try {
-            await firebaseAuth.signOut();
-        } catch (error) {
-            alert(error.message || 'Logout failed');
+            try { localStorage.removeItem('compostLastKnownUserEmail'); } catch (e) {}
+            try { localStorage.removeItem('compostRememberMe'); } catch (e) {}
+            try {
+                await firebaseAuth.signOut();
+            } catch (error) {
+                alert(error.message || 'Logout failed');
+            }
+            this.data.batches = [];
+            this.data.projects = [];
+            this.data.currentBatch = null;
+            this.data.currentProject = null;
+            this.data.currentOrganization = '';
+            this.data.currentProfile = null;
+            try { delete this.data.__loginGuardBackoffRan__; } catch (e) {}
+            this.navigate('landing');
+        } catch (outerLogout) {
+            try { console.error('[logoutUser] outer error', outerLogout); } catch (e) {}
         }
     },
 
@@ -17811,9 +18509,26 @@ const App = {
         }
 
         const previousBatch = this.data.editingBatch !== null ? this.data.batches[this.data.editingBatch] : null;
-        const projectId = inheritedProject
-            ? String(inheritedProject.id || '')
-            : (previousBatch?.projectId || '');
+        let projectId = inheritedProject
+            ? String(this.getProjectRouteId(inheritedProject) || inheritedProject.id || '')
+            : (String(previousBatch?.projectId || '') || '');
+        if (!projectId) {
+            try {
+                const urlParams = new URLSearchParams(window.location.search || '');
+                const urlProjectId = String(urlParams.get('projectId') || '').trim();
+                if (urlProjectId) {
+                    const urlProject = this.findProjectByRouteId(urlProjectId);
+                    if (urlProject) projectId = String(this.getProjectRouteId(urlProject) || urlProject.id || '');
+                }
+            } catch (e) {}
+        }
+        if (!projectId && this.data.currentProject) {
+            projectId = String(this.getProjectRouteId(this.data.currentProject) || this.data.currentProject.id || '');
+        }
+        if (!projectId && Array.isArray(this.data.projects)) {
+            const firstExisting = this.data.projects.find(p => p && !p.archived) || this.data.projects[0];
+            if (firstExisting) projectId = String(this.getProjectRouteId(firstExisting) || firstExisting.id || '');
+        }
 
         let foodWasteLibrary;
         if (Array.isArray(previousBatch?.foodWasteLibrary) && previousBatch.foodWasteLibrary.length > 0) {
@@ -17899,7 +18614,7 @@ const App = {
             status: 'active',
             records: [],
             output: null,
-            projectId: projectId || undefined,
+            projectId: (projectId && String(projectId).trim()) || '',
             operationalTemplate: inheritedOperationalTemplate || undefined,
             operationalProfile: inheritedOperationalProfile || undefined,
             monitoringProtocol: finalMonitoringProtocol,
@@ -17983,6 +18698,55 @@ const App = {
                     batch
                 );
             }
+        }
+
+        const existingProjectIdsSafe = new Set();
+        (this.data.projects || []).forEach(p => {
+            if (!p) return;
+            const localId = String(p.id || '').trim();
+            const routeId = String(this.getProjectRouteId(p) || '').trim();
+            if (localId) existingProjectIdsSafe.add(localId);
+            if (routeId) existingProjectIdsSafe.add(routeId);
+        });
+        let finalProjectIdRaw = String(batch.projectId || '').trim();
+        if (!finalProjectIdRaw || !existingProjectIdsSafe.has(finalProjectIdRaw)) {
+            let fallback = '';
+            if (inheritedProject) {
+                const ihId = String(this.getProjectRouteId(inheritedProject) || inheritedProject.id || '').trim();
+                if (ihId && existingProjectIdsSafe.has(ihId)) fallback = ihId;
+            }
+            if (!fallback && this.data.currentProject) {
+                const cpId = String(this.getProjectRouteId(this.data.currentProject) || this.data.currentProject.id || '').trim();
+                if (cpId && existingProjectIdsSafe.has(cpId)) fallback = cpId;
+            }
+            if (!fallback) {
+                try {
+                    const up = new URLSearchParams(window.location.search || '');
+                    const uId = String(up.get('projectId') || '').trim();
+                    if (uId) {
+                        const uProj = this.findProjectByRouteId(uId);
+                        if (uProj) {
+                            const uPid = String(this.getProjectRouteId(uProj) || uProj.id || '').trim();
+                            if (uPid && existingProjectIdsSafe.has(uPid)) fallback = uPid;
+                        }
+                    }
+                } catch (e) {}
+            }
+            if (!fallback && Array.isArray(this.data.projects)) {
+                const firstOk = this.data.projects.find(p => {
+                    if (!p) return false;
+                    const id1 = String(p.id || '').trim();
+                    const id2 = String(this.getProjectRouteId(p) || '').trim();
+                    return !p.archived && ((id1 && existingProjectIdsSafe.has(id1)) || (id2 && existingProjectIdsSafe.has(id2)));
+                }) || this.data.projects.find(p => {
+                    if (!p) return false;
+                    const id1 = String(p.id || '').trim();
+                    const id2 = String(this.getProjectRouteId(p) || '').trim();
+                    return (id1 && existingProjectIdsSafe.has(id1)) || (id2 && existingProjectIdsSafe.has(id2));
+                });
+                if (firstOk) fallback = String(this.getProjectRouteId(firstOk) || firstOk.id || '');
+            }
+            batch.projectId = fallback || '';
         }
 
         if (this.data.editingBatch !== null) {
@@ -20016,27 +20780,66 @@ const App = {
     async deleteBatch(batchId) {
         const batch = this.findBatchByRouteId(batchId);
         const index = batch ? this.data.batches.findIndex((item) => this.getBatchRouteId(item) === this.getBatchRouteId(batch)) : -1;
-        if (index < 0) return;
+        if (index < 0) {
+            alert('Batch not found.');
+            return;
+        }
         if (!this.canDeleteBatch(batch)) {
             alert('Only the batch owner can delete this shared batch.');
             return;
         }
-
-        if (!confirm(`Delete batch ${batch.id}? This action cannot be undone.`)) {
-            return;
-        }
-
-        this.data.batches.splice(index, 1);
-        if (this.data.currentBatch && this.getBatchRouteId(this.data.currentBatch) === this.getBatchRouteId(batch)) {
-            this.data.currentBatch = null;
-        }
-        this.saveData();
-        try {
-            await this.deleteBatchFromCloud(batch);
-        } catch (error) {
-            alert('Batch deleted locally, but cloud delete failed. Please refresh and try again.');
-        }
-        this.navigate('dashboard');
+        const project = this.getProjectByBatch(batch);
+        const projectRouteId = project ? String(this.getProjectRouteId(project) || '').trim() : '';
+        const displayId = String(batch.batchId || batch.id || 'Batch');
+        const recordCount = Array.isArray(batch.records) ? batch.records.length : 0;
+        const summary = [
+            `🧪 Batch <strong>${this.escapeHtml(displayId)}</strong> (${batch.status === 'finished' ? 'Finished' : 'Active'})`,
+            `📝 Daily records: <strong>${recordCount}</strong>`,
+            `🗓️ Start date: <strong>${this.escapeHtml(batch.startDate || '-')}</strong>`,
+            project ? `🏢 Project: <strong>${this.escapeHtml(project.projectName || project.name || projectRouteId)}</strong>` : ''
+        ].filter(Boolean).join('<br>');
+        this.showConfirmModal({
+            title: `🗑️ Delete Batch ${displayId}?`,
+            message: `
+            <div style="background:#FEF2F2;border:1px solid #FECACA;border-radius:10px;padding:14px 16px;color:#991B1B;font-size:0.92rem;line-height:1.7;margin-bottom:12px;">
+                <div style="font-weight:800;margin-bottom:6px;">This action CANNOT be undone.</div>
+                <div>All Daily Records, photos, monitoring data, operational history and final assessment attached to this Batch will be permanently deleted.</div>
+            </div>
+            <div style="font-size:0.9rem;line-height:1.8;color:#111827;">${summary}</div>`,
+            confirmText: `🗑️ Yes, permanently delete this batch`,
+            cancelText: `Cancel · Keep this batch`,
+            confirmClass: 'btn btn-danger',
+            cancelClass: 'btn btn-secondary',
+            onConfirm: async () => {
+                try {
+                    const stillHere = this.findBatchByRouteId(batchId);
+                    const idx2 = stillHere ? this.data.batches.findIndex((item) => this.getBatchRouteId(item) === this.getBatchRouteId(stillHere)) : -1;
+                    if (idx2 < 0) return;
+                    this.data.batches.splice(idx2, 1);
+                    if (this.data.currentBatch && this.getBatchRouteId(this.data.currentBatch) === this.getBatchRouteId(stillHere)) {
+                        this.data.currentBatch = null;
+                    }
+                    this.saveData();
+                    try {
+                        await this.deleteBatchFromCloud(stillHere);
+                    } catch (error) {
+                        try { console.error('[deleteBatch] cloud delete failed', error); } catch (e) {}
+                    }
+                    try { this.syncDirtyBatchesToCloud(); } catch (e) {}
+                    setTimeout(() => {
+                        alert(`✅ Batch permanently deleted:\n• ${displayId}\n• ${recordCount} daily record(s) removed.\nNo undo.`);
+                        if (projectRouteId) {
+                            this.navigate('projectDashboard', { projectId: projectRouteId });
+                        } else {
+                            this.navigate('dashboard');
+                        }
+                    }, 40);
+                } catch (innerErr) {
+                    try { console.error('[deleteBatch.onConfirm] error', innerErr); } catch (e) {}
+                    alert(`Delete failed: ${innerErr?.message || String(innerErr)}`);
+                }
+            }
+        });
     },
 
     exportData() {
