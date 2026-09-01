@@ -235,6 +235,21 @@ const App = {
         return (value || '').trim().toLowerCase();
     },
 
+    capitalizeFirst(value) {
+        const s = value == null ? '' : String(value);
+        const t = s.trim();
+        if (!t) return s;
+        return t.charAt(0).toUpperCase() + t.slice(1);
+    },
+
+    capitalizeFirstLetter(...args) { return this.capitalizeFirst(...args); },
+    capitaliseFirst(...args) { return this.capitalizeFirst(...args); },
+    capitalise(...args) { return this.capitalizeFirst(...args); },
+    capitalize(...args) { return this.capitalizeFirst(...args); },
+    firstLetterUpper(...args) { return this.capitalizeFirst(...args); },
+    toTitleFirst(...args) { return this.capitalizeFirst(...args); },
+    ucFirst(...args) { return this.capitalizeFirst(...args); },
+
     bindAuthState() {
         firebaseAuth.onAuthStateChanged(async (user) => {
             if (user && user.email) {
@@ -6235,26 +6250,55 @@ const App = {
             const lastNonEmpty = (() => { for (let i = combined.length - 1; i >= 0; i--) if (combined[i].value != null) return i; return -1; })();
             if (firstNonEmpty < 0) return '';
             const legend = series.map((s) => `<div style="display:inline-flex;align-items:center;gap:6px;font-weight:700;font-size:0.8rem;color:#374151;margin-right:12px;"><span style="display:inline-block;width:10px;height:10px;border-radius:999px;background:${s.color};"></span>${this.escapeHtml(s.label)}</span>`).join('');
-            return `
-                <div style="margin-top:10px;">
-                    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin-bottom:10px;">${legend}</div>
-                    ${this.renderMultiSeriesLineChart({
+            return this.renderMultiSeriesLineChart({
                         basePoints: combined,
                         series,
                         title,
                         subtitle,
                         yAxisLabel: 'Temperature (°C)'
-                    })}
-                </div>
-            `;
+                    });
         };
-        const tempContent = tempHasAny ? multiSeries(tempSeries, 'Temperature Profile', 'Recorded compost temperature measurements over time.') + `
-            <div style="margin-top:10px;border:1px solid #E2E8F0;border-radius:10px;background:#F8FAFC;padding:10px 14px;">
-                <div style="font-weight:750;color:#0F172A;font-size:0.82rem;margin-bottom:6px;">Latest recorded values</div>
-                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:6px 14px;">
-                    ${tempLatest.core ? `<div><div style="font-size:0.75rem;color:#64748B;font-weight:700;">Core</div><div style="font-weight:800;color:#0F172A;font-size:0.92rem;">${this.formatNumber(tempLatest.core.v,1)}°C</div></div>` : ''}
-                    ${isICTA && tempLatest.transition ? `<div><div style="font-size:0.75rem;color:#64748B;font-weight:700;">Transition</div><div style="font-weight:800;color:#0F172A;font-size:0.92rem;">${this.formatNumber(tempLatest.transition.v,1)}°C</div></div>` : ''}
-                    ${isICTA && tempLatest.outer ? `<div><div style="font-size:0.75rem;color:#64748B;font-weight:700;">Outer</div><div style="font-weight:800;color:#0F172A;font-size:0.92rem;">${this.formatNumber(tempLatest.outer.v,1)}°C</div></div>` : ''}
+        const leftLegendRows = tempSeries.map((s) => {
+            const key = (s.label || '').toLowerCase().includes('core') ? 'core'
+                : (s.label || '').toLowerCase().includes('transition') ? 'transition'
+                : (s.label || '').toLowerCase().includes('outer') ? 'outer' : '';
+            const lat = key ? tempLatest[key] : null;
+            const rightHtml = lat
+                ? `<div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;">
+                        <div style="text-align:right;">
+                            <div style="font-size:0.74rem;color:#64748B;font-weight:700;margin-bottom:3px;">${this.escapeHtml(key === 'core' ? 'Core' : key === 'transition' ? 'Transition' : 'Outer')}${lat.d ? ` · ${this.escapeHtml(lat.d)}` : ''}</div>
+                            <div style="font-weight:850;color:#0F172A;font-size:1.12rem;line-height:1;">${this.formatNumber(lat.v,1)}°C</div>
+                        </div>
+                   </div>`
+                : `<div style="text-align:right;"><div style="font-size:0.74rem;color:#94A3B8;font-weight:700;">No recorded value</div></div>`;
+            return {
+                left: `<div style="display:inline-flex;align-items:center;gap:8px;font-weight:750;font-size:0.86rem;color:#1F2937;">
+                    <span style="display:inline-block;width:14px;height:14px;border-radius:999px;background:${s.color};box-shadow:0 0 0 2px rgba(255,255,255,0.75), 0 0 0 3px ${s.color}33;flex-shrink:0;"></span>
+                    ${this.escapeHtml(s.label)}
+                </div>`,
+                right: rightHtml
+            };
+        });
+        const leftColRows = leftLegendRows.map(r => `<div style="padding:10px 4px;border-bottom:1px dashed #E2E8F0;display:flex;align-items:center;">${r.left}</div>`).join('')
+            + `<div style="padding:10px 4px;display:flex;align-items:center;justify-content:flex-start;">
+                 <div style="font-size:0.74rem;color:#64748B;font-weight:700;display:inline-flex;align-items:center;gap:4px;">📘 Legend</div>
+               </div>`;
+        const rightColRows = leftLegendRows.map(r => `<div style="padding:10px 4px;border-bottom:1px dashed #E2E8F0;display:flex;align-items:center;justify-content:flex-end;">${r.right}</div>`).join('')
+            + `<div style="padding:10px 4px;display:flex;align-items:center;justify-content:flex-end;">
+                 <div style="font-size:0.74rem;color:#64748B;font-weight:700;display:inline-flex;align-items:center;gap:4px;">🌡 Latest recorded values</div>
+               </div>`;
+        const tempContent = tempHasAny ? `
+            <div style="margin-top:10px;border:1px solid #E2E8F0;border-radius:14px;background:#F8FAFC;padding:16px 18px;box-shadow:0 1px 2px rgba(15,23,42,0.04);">
+                <div style="display:grid;grid-template-columns:220px 1fr 260px;gap:20px 26px;align-items:start;">
+                    <div style="display:flex;flex-direction:column;gap:0;">
+                        ${leftColRows}
+                    </div>
+                    <div style="display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;">
+                        ${multiSeries(tempSeries, 'Temperature Profile', 'Recorded compost temperature measurements over time.')}
+                    </div>
+                    <div style="display:flex;flex-direction:column;gap:0;">
+                        ${rightColRows}
+                    </div>
                 </div>
             </div>
         ` : tempEmptyMsg;
